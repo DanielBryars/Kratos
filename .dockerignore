@@ -1,0 +1,13 @@
+.git
+.github
+.devcontainer
+.vscode
+target
+node_modules
+apps/web/node_modules
+apps/web/dist
+docs
+requirements
+infrastructure
+*.tfstate
+*.tfplan

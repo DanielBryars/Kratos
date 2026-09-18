@@ -1,0 +1,6 @@
+bootstrap_project_id   = "replace-with-bootstrap-project-id"
+development_project_id = "replace-with-development-project-id"
+state_bucket_name      = "replace-with-globally-unique-state-bucket"
+region                 = "europe-west2"
+github_owner           = "DanielBryars"
+github_repository      = "Kratos"

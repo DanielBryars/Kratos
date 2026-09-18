@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "API",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/kratos-control-plane",
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "api: build",
+      "env": { "PORT": "8080", "RUST_LOG": "kratos_control_plane=debug" }
+    },
+    {
+      "name": "Web",
+      "type": "pwa-msedge",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/apps/web/src",
+      "preLaunchTask": "web: dev"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Kratos",
+      "configurations": ["API", "Web"],
+      "stopAll": true
+    }
+  ]
+}
