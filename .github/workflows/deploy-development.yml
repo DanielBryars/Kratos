@@ -24,7 +24,8 @@ jobs:
           vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' &&
           vars.GCP_DEPLOYMENT_SERVICE_ACCOUNT != '' &&
           vars.GCP_DEVELOPMENT_PROJECT_ID != '' &&
-          vars.GCP_REGION != '' }}
+          vars.GCP_REGION != '' &&
+          vars.KRATOS_DOMAIN_NAME != '' }}
     runs-on: ubuntu-latest
     environment: development
 
@@ -81,8 +82,11 @@ jobs:
             -var="project_id=${{ vars.GCP_DEVELOPMENT_PROJECT_ID }}" \
             -var="region=${{ vars.GCP_REGION }}" \
             -var="container_image=${{ steps.image.outputs.reference }}" \
-            -var="runtime_service_account=${{ steps.platform.outputs.runtime_service_account }}"
+            -var="runtime_service_account=${{ steps.platform.outputs.runtime_service_account }}" \
+            -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}"
 
-      - name: Report service URL
+      - name: Report deployment addresses
         working-directory: infrastructure/application
-        run: terraform output service_url
+        run: |
+          terraform output public_url
+          terraform output required_dns_record

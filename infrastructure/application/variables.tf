@@ -19,8 +19,18 @@ variable "runtime_service_account" {
   type        = string
 }
 
+variable "domain_name" {
+  description = "Public DNS name served by the HTTPS load balancer."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$", var.domain_name))
+    error_message = "domain_name must be a lowercase fully qualified DNS name without a trailing dot."
+  }
+}
+
 variable "allow_unauthenticated" {
-  description = "Temporary public ingress for the scaffold; application authentication is required before worker data is exposed."
+  description = "Allow public requests through the HTTPS load balancer; application authentication is required before worker data is exposed."
   type        = bool
   default     = true
 }

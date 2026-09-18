@@ -2,8 +2,11 @@ locals {
   github_repository = "${var.github_owner}/${var.github_repository}"
   development_roles = toset([
     "roles/artifactregistry.admin",
+    "roles/compute.instanceAdmin.v1",
+    "roles/compute.networkAdmin",
     "roles/iam.serviceAccountAdmin",
     "roles/iam.serviceAccountUser",
+    "roles/iam.securityAdmin",
     "roles/resourcemanager.projectIamAdmin",
     "roles/run.admin",
     "roles/serviceusage.serviceUsageAdmin",
