@@ -94,6 +94,13 @@ The remaining critical path is:
 The authenticated fleet API and console now show every registered machine, its current capabilities,
 last heartbeat, derived `online`, `stale`, `offline` or `never_seen` connectivity, durable worker state
 and compute-group memberships. An operator can approve a worker and place it into a named group in one
-audited transaction, quarantine it, or revoke it and its active credential. THESHED2 can therefore be
+audited transaction, quarantine it, or revoke it and its active credential. The first home worker can be
 placed into the Home group from the deployed console; the remaining R0.1 hardware task is registering
 the second home machine and recording the two-host acceptance evidence.
+
+The first home worker has now passed the real disconnect and reconnect check. The console showed `stale` after
+the 90-second boundary and `offline` after five minutes, retained its `idle` state and Home-group
+membership, and returned to `online` after its container was recreated from the same identity volume.
+The second-host installer is checked in and pins the public image to its immutable digest after
+verifying GPU visibility. The remaining hardware work is the second registration and the final
+revocation exercise.

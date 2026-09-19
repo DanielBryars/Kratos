@@ -17,6 +17,20 @@ The normal first-run flow requires no copied credential. The agent generates its
 persistent state volume, radios in, and prints a short code. Compare that code with the pending
 machine in the authenticated operator console before approving it:
 
+On a Windows GPU host with Docker Desktop and NVIDIA GPU support, run the checked-in installer from
+the repository root in PowerShell:
+
+```powershell
+.\workers\agent\install-windows.ps1 -DisplayName "Home GPU 2" -AgentHostname "HOME-GPU-02"
+```
+
+The installer checks Docker, refuses to replace an existing agent, pulls the public image, resolves
+the mutable `edge` tag to its immutable digest, verifies that an NVIDIA GPU is visible inside the
+Linux container, creates the persistent state volume, starts the agent and prints its radio-in code.
+It does not create, copy or accept a Kratos secret.
+
+The equivalent manual command is:
+
 ```shell
 docker run --detach --restart unless-stopped --gpus all \
   --name kratos-agent \
@@ -68,6 +82,25 @@ docker run --rm \
 Docker Desktop currently presents the socket as group `0`; a PowerShell launch can therefore use
 `--group-add 0`. Native Linux installation must use the actual socket group rather than assuming a
 fixed identifier.
+
+## Manual Windows update
+
+The identity volume is independent of the replaceable agent container. Confirm that the volume is
+present, resolve the new image to a digest, then replace only the container:
+
+```powershell
+docker volume inspect kratos-agent-state
+docker pull ghcr.io/danielbryars/kratos-agent:edge
+$agentImage = docker image inspect ghcr.io/danielbryars/kratos-agent:edge --format "{{index .RepoDigests 0}}"
+docker stop kratos-agent
+docker rm kratos-agent
+.\workers\agent\install-windows.ps1 -Image $agentImage -DisplayName "Home GPU 2" -AgentHostname "HOME-GPU-02"
+```
+
+The installer reuses `kratos-agent-state`; it SHALL NOT delete or recreate that volume. A successful
+replacement resumes heartbeats under the existing worker identity and does not require operator
+approval. If startup fails, rerun the installer with the previous immutable digest and the same
+parameters.
 
 The executor disables networking, uses a read-only root filesystem, drops Linux capabilities,
 applies CPU, memory and process limits, assigns only the requested GPU and always removes the health
