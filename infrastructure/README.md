@@ -16,13 +16,17 @@ Run these commands inside the development container after authenticating with `g
 cp infrastructure/bootstrap/terraform.tfvars.example infrastructure/bootstrap/terraform.tfvars
 # Edit the three project/bucket values locally. The file is ignored by Git.
 
-terraform -chdir=infrastructure/bootstrap init -backend=false
+terraform -chdir=infrastructure/bootstrap init -reconfigure
 terraform -chdir=infrastructure/bootstrap apply
 
+cp infrastructure/bootstrap/backend_override.tf.example \
+  infrastructure/bootstrap/backend_override.tf
 terraform -chdir=infrastructure/bootstrap init -migrate-state \
   -backend-config="bucket=YOUR_STATE_BUCKET" \
   -backend-config="prefix=bootstrap"
 ```
+
+The bootstrap root deliberately starts with Terraform's local backend because the GCS bucket does not exist yet. The ignored `backend_override.tf` switches that same root to GCS only after the first apply, allowing Terraform to migrate the newly created local state. Keep the override file in the working copy for later bootstrap changes.
 
 Copy the three bootstrap outputs into GitHub repository **Actions variables**:
 
