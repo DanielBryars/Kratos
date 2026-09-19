@@ -17,7 +17,7 @@
     "8080": { "label": "Kratos API" },
     "5432": { "label": "PostgreSQL", "onAutoForward": "silent" }
   },
-  "postCreateCommand": "pnpm install --frozen-lockfile && cargo fetch && cd workers/agent && uv sync --locked",
+  "postCreateCommand": "pnpm install --frozen-lockfile && cargo fetch && cd workers/agent && uv sync --locked && cd ../gpu-health-check && uv sync --locked --python 3.12",
   "customizations": {
     "vscode": {
       "extensions": [

@@ -20,7 +20,7 @@ R0.5 SHALL complete the mandatory single-worker platform requirements in Chapter
 | R0.4 — Recovery and demand-based pricing | Recover interrupted work and make time/cost trade-offs visible. | Checkpoint resume, offline reconciliation, historical contention rates, rate locking and improved estimates. | R0.3 |
 | R0.5 — Evaluation and model delivery | Produce comparable, validated model artefacts. | Evaluation gates, comparison, registry, ONNX checks, latency benchmarks and remaining single-worker operational acceptance. | R0.4 |
 | R0.6 — Distributed LAN training | Run one training job across the two-machine compute group. | DDP, verified peer networking, atomic multi-worker allocation, failure recovery and performance comparison. | R0.5 |
-| R0.7 — Bounded cloud GPU expansion | Add provisioned cloud capacity with interruption recovery. | Cloud GPU registration, provisioning ownership, Spot fault tolerance, spend limits and teardown. | R0.4 minimum; follows R0.6 in the planned sequence. |
+| R0.7 — Bounded cloud GPU expansion | Add provisioned cloud capacity with interruption recovery. | Cloud GPU registration, SkyPilot provider evaluation, provisioning ownership, Spot fault tolerance, spend limits and teardown. | R0.4 minimum; follows R0.6 in the planned sequence. |
 
 ## R0.1 — Foundation and worker registration
 
@@ -38,6 +38,7 @@ R0.5 SHALL complete the mandatory single-worker platform requirements in Chapter
 - Provision GCP resources with Terraform, including environment separation, remote state and bootstrap instructions.
 - Build immutable images and promote verified image identities through test and production.
 - Configure scoped deployment identities, runtime secrets, health checks, rollback and deployment history.
+- Deploy the authenticated Grafana, Prometheus, Loki, Tempo, OpenTelemetry gateway and MLflow service foundations in GCP.
 - Provide durable registry storage, basic backup/restore evidence, cloud budget alerts and operational logs.
 - Document ownership of image updates, migrations and Terraform-managed settings.
 - Keep privileged deployment credentials unavailable to untrusted builds and GPU test jobs.
@@ -48,6 +49,7 @@ R0.5 SHALL complete the mandatory single-worker platform requirements in Chapter
 - Enrol each worker using a single-use bootstrap credential and approved, revocable identity.
 - Advertise CPU, RAM, GPU model/count/memory, runtime versions and available capacity.
 - Perform a real container GPU health check; display unsupported or unhealthy capability accurately.
+- Retain the GPU computation result, image identity, host/runtime versions and observed device as acceptance evidence.
 - Create one approved home compute group and list its two individual members.
 - Show online, offline, unapproved and unhealthy states with last contact and stale-data indicators.
 - Support heartbeat reconnect, duplicate-enrolment handling and worker revocation.
@@ -106,7 +108,7 @@ Exit: execute training across the two home machines using LAN collectives, recov
 
 ### R0.7 — Bounded cloud GPU expansion
 
-This release expands the previous exclusion of automatic cloud GPU provisioning. Detailed provisioning requirements and the tool decision SHALL be reviewed before implementation.
+This release expands the previous exclusion of automatic cloud GPU provisioning. SkyPilot SHALL be evaluated behind the provider boundary defined by ADR-010 before implementation; adoption remains subject to provisioning, recovery, security and cost evidence.
 
 - Provision and enrol cloud GPU workers with explicit quotas and cloud spend limits.
 - Assign one owner to each provisioned resource to prevent Terraform and an orchestrator fighting over its lifecycle.

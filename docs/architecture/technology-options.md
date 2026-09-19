@@ -19,6 +19,9 @@ GCP, Terraform, Rust/Axum for the control plane, and the VS Code dev-container w
 | Agent implementation — accepted | Python; Go; .NET | Python for GPU/runtime inspection and ML tooling proximity; [ADR-007](decisions/007-python-worker-agent.md). | The wire protocol remains language-neutral. |
 | Windows execution | WSL2 Linux runtime; another supported Linux container stack | Validate WSL2-based GPU execution on the actual two hosts before choosing packaging. | Startup, device access, container-to-container LAN reachability and updates must be tested; no compatibility assumed. |
 | Agent packaging | Linux service inside the execution environment; container with constrained runtime access | Select after a host smoke test and privilege review. | Container packaging does not make access to the container-management socket low privilege. |
+| Worker execution — accepted | Docker Engine API; host supervisor; Kubernetes | Agent-controlled sibling containers for the initial trusted hosts; [ADR-008](decisions/008-worker-job-execution.md). | Docker socket access makes the agent a host-administrative component. |
+| Observability — accepted | Self-hosted Grafana stack; Grafana Cloud; provider-native tools | Grafana, Prometheus, Loki, Tempo and an OTel gateway on a GCE VM; [ADR-009](decisions/009-observability-and-mlflow.md). | A single VM is operationally simple but initially a single point of failure. |
+| Experiment tracking — accepted | MLflow; custom tracking; provider service | Self-hosted MLflow correlated with OTel; [ADR-009](decisions/009-observability-and-mlflow.md). | MLflow tracking metrics and general operational telemetry use different ingestion paths. |
 
 ## Decide when the dependent release approaches
 
@@ -26,11 +29,11 @@ GCP, Terraform, Rust/Axum for the control plane, and the VS Code dev-container w
 |---|---|---|
 | Scheduler runtime | Separate persistent process, initially on Cloud Run worker pools or a small VM; choose based on actual lease and coordination requirements. | R0.2 |
 | Work queue | PostgreSQL-backed queue first versus a separate broker; decide from concurrency and delivery requirements. | R0.2 |
-| Experiment tracking | MLflow proposed; compare built-in tracking against integration and maintenance effort. | R0.2 |
+| Experiment tracking | MLflow is selected by ADR-009; define workload integration, retention and model promotion policy. | R0.2 |
 | Artefacts | Cloud Storage proposed; local caches plus resumable, scoped transfers. | R0.2 |
 | Pricing/ETA | Transparent rule-based pricing and historical throughput estimates first; keep assumptions visible. | R0.3–R0.4 |
 | Distributed training | PyTorch DDP first; introduce FSDP when workload memory requirements justify it. | R0.6 |
-| Cloud GPU provisioning | Evaluate SkyPilot versus direct Terraform/API orchestration; avoid dual ownership of provisioned workers. | R0.7 |
+| Cloud GPU provisioning | Evaluate SkyPilot behind the provider boundary in ADR-010; avoid dual ownership of provisioned workers. | R0.7 |
 
 ## Discussion order
 
