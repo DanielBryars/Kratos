@@ -3,6 +3,7 @@
 import base64
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,7 +11,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kratos_agent.capabilities import collect_capabilities
-from kratos_agent.models import WorkerCapabilities
+from kratos_agent.executor import DockerExecutor, ExecutorError
+from kratos_agent.models import JobExecutionResult, WorkerCapabilities
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 
@@ -23,12 +25,14 @@ class AgentRunner:
         state_path: Path,
         enrolment_credential_path: Path | None,
         capability_collector: Callable[[], WorkerCapabilities] = collect_capabilities,
+        executor: DockerExecutor | None = None,
     ) -> None:
         self._client = client
         self._display_name = display_name
         self._state_path = state_path
         self._enrolment_credential_path = enrolment_credential_path
         self._collect = capability_collector
+        self._executor = executor
 
     def ensure_enrolled(self) -> AgentState:
         existing = load_state(self._state_path)
@@ -170,6 +174,31 @@ class AgentRunner:
             heartbeat_interval_seconds=response.next_heartbeat_seconds,
         )
         save_state(self._state_path, updated)
+        if response.assignment is not None:
+            if self._executor is None:
+                raise ExecutorError("job assignment received without a configured executor")
+            assignment = response.assignment
+            if datetime.now(UTC) >= assignment.lease_expires_at:
+                result = JobExecutionResult(
+                    exit_code=124,
+                    timed_out=True,
+                    stdout="",
+                    stderr="",
+                    failure_message="assignment lease expired before execution",
+                )
+            else:
+                result = self._executor.run_job(assignment)
+            acknowledgement = self._client.report_job_result(
+                state.worker_id,
+                state.worker_credential,
+                assignment.attempt_id,
+                result,
+            )
+            if acknowledgement.attempt_id != assignment.attempt_id:
+                raise ControlPlaneError(
+                    200, "invalid_response", "job result acknowledgement is inconsistent"
+                )
+            self._executor.remove_job_container(assignment)
         return updated
 
     def run(self) -> None:

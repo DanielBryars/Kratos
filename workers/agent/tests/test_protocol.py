@@ -10,7 +10,14 @@ import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from kratos_agent.models import GpuHealth, GpuHealthStatus, WorkerCapabilities
+from kratos_agent.executor import DockerExecutor
+from kratos_agent.models import (
+    GpuHealth,
+    GpuHealthStatus,
+    JobAssignment,
+    JobExecutionResult,
+    WorkerCapabilities,
+)
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.runner import AgentRunner, _confirmation_code
 from kratos_agent.state import AgentState, load_state, save_state
@@ -197,3 +204,78 @@ def test_state_is_written_atomically_and_credential_repr_is_redacted(tmp_path: P
 def test_rejects_unsafe_control_plane_urls(url: str) -> None:
     with pytest.raises(ValueError, match="HTTPS origin"):
         WorkerProtocolClient(url)
+
+
+class FakeJobExecutor(DockerExecutor):
+    def __init__(self) -> None:
+        self.executed: JobAssignment | None = None
+        self.removed: JobAssignment | None = None
+
+    def run_job(self, assignment: JobAssignment) -> JobExecutionResult:
+        self.executed = assignment
+        return JobExecutionResult(
+            exit_code=0, timed_out=False, stdout="done\n", stderr="", failure_message=None
+        )
+
+    def remove_job_container(self, assignment: JobAssignment) -> None:
+        self.removed = assignment
+
+
+def test_assignment_is_executed_reported_and_removed_after_acknowledgement(tmp_path: Path) -> None:
+    worker_secret = "kwc_identifier_scoped-secret"
+    attempt_id = UUID("33333333-3333-4333-8333-333333333333")
+    job_id = UUID("44444444-4444-4444-8444-444444444444")
+    reported: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "worker_id": str(WORKER_ID),
+                    "state": "busy",
+                    "accepted_sequence": payload["sequence"],
+                    "next_heartbeat_seconds": 30,
+                    "assignment": {
+                        "attempt_id": str(attempt_id),
+                        "job_id": str(job_id),
+                        "name": "Matrix check",
+                        "image_reference": "example.test/work@sha256:" + ("a" * 64),
+                        "gpu_index": 0,
+                        "timeout_seconds": 120,
+                        "lease_expires_at": "2099-09-19T13:00:00Z",
+                    },
+                },
+            )
+        reported.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"attempt_id": str(attempt_id), "job_id": str(job_id), "status": "succeeded"},
+        )
+
+    state_path = tmp_path / "agent.json"
+    state = AgentState(
+        agent_instance_id=UUID(int=1),
+        worker_id=WORKER_ID,
+        worker_credential=worker_secret,
+    )
+    save_state(state_path, state)
+    executor = FakeJobExecutor()
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        updated = AgentRunner(
+            client,
+            "GPU host",
+            state_path,
+            None,
+            capability_collector=capabilities,
+            executor=executor,
+        ).heartbeat_once(state)
+
+    assert updated.next_sequence == 1
+    assert executor.executed is not None and executor.executed.attempt_id == attempt_id
+    assert executor.removed is not None and executor.removed.attempt_id == attempt_id
+    assert reported["exit_code"] == 0
+    assert reported["stdout"] == "done\n"
