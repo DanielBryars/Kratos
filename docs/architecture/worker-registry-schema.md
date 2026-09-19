@@ -25,6 +25,22 @@ The schema constrains worker states, protocol versions, heartbeat ordering, acti
 group membership. Capability reports remain JSON because they are versioned protocol documents,
 while identity, ownership and lifecycle state remain relational.
 
+The second migration adds `workers.last_observed_at`. `last_seen_at` records when the control plane
+accepted a heartbeat, while `last_observed_at` records when the worker says it collected the report.
+Keeping both prevents clock skew on a home machine from changing the server-side liveness decision.
+
+## Runtime operations
+
+The enrolment exchange SHALL lock the bootstrap row, create the worker and scoped credential, mark
+the bootstrap credential as consumed, and write the audit event in one transaction. The heartbeat
+update SHALL change capabilities only when its sequence is newer. Repeating the accepted sequence
+is idempotent; sending an older sequence returns a conflict.
+
+The service SHALL look up a credential by its non-secret random identifier before running Argon2id.
+Known identifiers are rate limited and share a bounded verification pool. Missing identifiers are
+rejected without running the expensive password hash. Neither logs nor error responses include the
+credential supplied by the caller.
+
 ## Migration operation
 
 `kratos-migrate` is a separate binary in the control-plane image. It reads the same non-secret
