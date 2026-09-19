@@ -32,7 +32,25 @@ fn capabilities() -> Value {
             "memory_total_bytes": 8_589_934_592_u64,
             "driver_version": "560.35"
         }],
-        "gpu_health": { "status": "healthy", "detail": "matrix test passed" }
+        "gpu_health": {
+            "status": "healthy",
+            "detail": "GPU computation passed on Test GPU in 10.000 ms",
+            "evidence": {
+                "schema_version": "1.0",
+                "status": "healthy",
+                "checked_at": "2026-09-19T07:59:59Z",
+                "image_reference": concat!("example.test/health@sha256:",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                "device_index": 0,
+                "device_name": "Test GPU",
+                "operation": "matrix multiplication",
+                "matrix_size": 512,
+                "max_absolute_error": 0.0,
+                "duration_ms": 10.0,
+                "cuda_driver_api_version": "13.3",
+                "cuda_runtime_version": "12.9"
+            }
+        }
     })
 }
 

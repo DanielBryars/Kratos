@@ -11,6 +11,6 @@ docker build --file workers/gpu-health-check/Dockerfile --tag kratos-gpu-health-
 docker run --rm --gpus device=0 kratos-gpu-health-check
 ```
 
-The worker agent will eventually invoke this image by immutable digest and attach its structured JSON
-result to the worker capability report.
-
+GitHub Actions publishes `edge`, `sha-<commit>` and `health-v*` tags with provenance and an SBOM. The
+worker agent accepts only an immutable digest, invokes the image as a constrained sibling container
+and attaches its structured JSON result to every subsequent capability heartbeat.

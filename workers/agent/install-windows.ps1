@@ -16,10 +16,16 @@ param(
     [string]$ContainerName = "kratos-agent",
 
     [ValidateNotNullOrEmpty()]
-    [string]$StateVolume = "kratos-agent-state"
+    [string]$StateVolume = "kratos-agent-state",
+
+    [string]$HealthCheckImage = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($HealthCheckImage -and $HealthCheckImage -notmatch "^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$") {
+    throw "The health-check image must use an immutable sha256 digest."
+}
 
 function Invoke-Docker {
     param([Parameter(Mandatory)][string[]]$Arguments)
@@ -43,7 +49,6 @@ if ($LASTEXITCODE -ne 0) {
 if ($existingContainer) {
     throw "Container '$ContainerName' already exists. This installer will not replace it or its state."
 }
-
 Write-Host "Pulling $Image ..."
 Invoke-Docker -Arguments @("pull", $Image) | Out-Host
 
@@ -64,20 +69,35 @@ if (-not $capabilities.gpus -or $capabilities.gpus.Count -eq 0) {
 }
 Write-Host "Detected: $($capabilities.gpus.name -join ', ')"
 
-Invoke-Docker -Arguments @("volume", "create", $StateVolume) | Out-Null
-Invoke-Docker -Arguments @(
+$runArguments = @(
     "run",
     "--detach",
     "--restart", "unless-stopped",
     "--gpus", "all",
     "--name", $ContainerName,
-    "--hostname", $AgentHostname,
+    "--hostname", $AgentHostname
+)
+if ($HealthCheckImage) {
+    Write-Host "Pulling immutable GPU health check $HealthCheckImage ..."
+    Invoke-Docker -Arguments @("pull", $HealthCheckImage) | Out-Host
+    $runArguments += @(
+        "--group-add", "0",
+        "--mount", "type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock"
+    )
+}
+$runArguments += @(
     "--mount", "type=volume,source=$StateVolume,target=/var/lib/kratos-agent",
     $resolvedImage,
     "run",
     "--control-plane", $ControlPlane,
     "--display-name", $DisplayName
-) | Out-Null
+)
+if ($HealthCheckImage) {
+    $runArguments += @("--health-check-image", $HealthCheckImage)
+}
+
+Invoke-Docker -Arguments @("volume", "create", $StateVolume) | Out-Null
+Invoke-Docker -Arguments $runArguments | Out-Null
 
 $running = & docker inspect $ContainerName --format "{{.State.Running}}"
 if ($LASTEXITCODE -ne 0 -or $running -ne "true") {

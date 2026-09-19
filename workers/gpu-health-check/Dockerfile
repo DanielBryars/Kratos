@@ -5,6 +5,7 @@ FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04@sha256:ebef3c171eeef0298e4eb2e4be843
 COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         ca-certificates \
         python3.12 \
@@ -14,7 +15,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY workers/gpu-health-check/pyproject.toml workers/gpu-health-check/uv.lock ./
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev \
+    && rm -f /bin/uv /bin/uvx \
+    && rm -rf /root/.cache/uv
 COPY workers/gpu-health-check/health_check.py ./
 
 ENV HOME=/var/lib/kratos-health

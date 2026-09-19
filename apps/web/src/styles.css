@@ -51,6 +51,9 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .worker-heading, .worker-badges, .worker-groups, .worker-controls { display: flex; align-items: center; gap: 8px; }
 .worker-heading { justify-content: space-between; }
 .worker-hardware { color: #c9d9e9; }
+.gpu-health { padding-left: 10px; border-left: 2px solid #526174; }
+.gpu-health--healthy { border-color: #3fba7c; color: #8ce3b7; }
+.gpu-health--unhealthy, .gpu-health--unavailable { border-color: #b34d4d; color: #ff9e9e; }
 .worker-badges, .worker-groups { flex-wrap: wrap; }
 .badge { padding: 5px 8px; border: 1px solid #3b4a5d; border-radius: 999px; color: #aab9c9; font-size: 0.7rem; text-transform: uppercase; }
 .badge--online { border-color: #245d48; color: #66d19e; }

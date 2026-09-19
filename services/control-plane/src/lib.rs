@@ -30,9 +30,9 @@ use operator::{
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
-    GpuHealth, GpuHealthStatus, HeartbeatRequest, HeartbeatResponse, RegistrationCreatedResponse,
-    RegistrationRequest, RegistrationState, RegistrationStatusResponse, VerificationGate,
-    WorkerCapabilities, WorkerState,
+    GpuHealth, GpuHealthEvidence, GpuHealthStatus, HeartbeatRequest, HeartbeatResponse,
+    RegistrationCreatedResponse, RegistrationRequest, RegistrationState,
+    RegistrationStatusResponse, VerificationGate, WorkerCapabilities, WorkerState,
 };
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -83,7 +83,7 @@ pub(crate) struct AppState {
     components(schemas(
         HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
         EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
-        WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState,
+        WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthEvidence, GpuHealthStatus, WorkerState,
         CreateEnrolmentRequest, CreateEnrolmentResponse, RegistrationRequest,
         RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
         ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,

@@ -23,6 +23,11 @@ type PendingRegistration = {
     logical_cpu_count: number;
     memory_total_bytes: number;
     gpus: Array<{ name: string; memory_total_bytes: number }>;
+    gpu_health: {
+      status: "unavailable" | "unverified" | "healthy" | "unhealthy";
+      detail: string;
+      evidence?: { checked_at: string; image_reference: string; duration_ms?: number } | null;
+    };
   };
 };
 type Worker = {
@@ -266,6 +271,7 @@ export function App() {
                       </div>
                       <p className="worker-hardware">{worker.capabilities.gpus.map((gpu) => `${gpu.name} · ${formatBytes(gpu.memory_total_bytes)}`).join(", ") || "No GPU detected"}</p>
                       <p>{worker.capabilities.logical_cpu_count} CPUs · {formatBytes(worker.capabilities.memory_total_bytes)} RAM</p>
+                      <p className={`gpu-health gpu-health--${worker.capabilities.gpu_health.status}`}>GPU check: {worker.capabilities.gpu_health.detail}</p>
                       <p>Last heartbeat: {worker.last_seen_at ? new Date(worker.last_seen_at).toLocaleString() : "never"}</p>
                       <div className="worker-groups">{worker.compute_groups.map((group) => <span className="badge" key={group.id}>{group.name}</span>)}</div>
                       {worker.state !== "revoked" && (
