@@ -18,6 +18,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub mod credentials;
 pub mod database;
 pub mod human_auth;
+pub mod migration;
 mod operator;
 mod registry;
 

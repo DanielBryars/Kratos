@@ -4,6 +4,7 @@ Terraform is separated into three independently applied roots:
 
 - `bootstrap`: state bucket and GitHub workload identity. It begins with local state, then migrates itself to GCS.
 - `platform`: project APIs, Artifact Registry and the runtime identity.
+- `migration`: the separately deployed and executed schema migration job.
 - `application`: the Cloud Run service for one immutable image.
 
 This separation lets CI create the image repository before an application image exists. It also prevents routine application releases from refreshing bootstrap identity resources.
@@ -57,11 +58,14 @@ deployment identity receives its Cloud SQL administrator role. To remove an inst
 with `database_deletion_protection=false`; only then set `GCP_ENABLE_DATABASE=false` and apply again.
 
 When enabled, Terraform creates the zonal development PostgreSQL instance, database, IAM database
-user and the two narrow Cloud SQL IAM grants for the Cloud Run service account. The application root
-then adds a digest-pinned Cloud SQL Auth Proxy v2 sidecar and supplies non-secret connection metadata
-to the Rust container. It does not create or store a database password. Schema migrations and the
-Rust persistence layer are tested in CI. The deployment workflow does not yet apply migrations to
-the persistent instance, so the cost gate SHALL remain off until that migration job is added.
+users and narrow Cloud SQL IAM grants. The migration identity alone receives the PostgreSQL
+`cloudsqlsuperuser` role. The deployment creates and executes its Cloud Run job before applying the
+application revision. After applying versioned migrations, the job grants the runtime identity
+connect, schema usage, table data and sequence access without schema ownership or alteration rights.
+
+The application root adds a digest-pinned Cloud SQL Auth Proxy v2 sidecar and supplies non-secret
+connection metadata to the Rust container. The migration image contains the same pinned proxy and
+runs it only for the job's lifetime. Neither path creates or stores a database password.
 
 ## Human authentication and the first operator
 

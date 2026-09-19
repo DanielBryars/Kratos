@@ -42,6 +42,7 @@ jobs:
           KRATOS_DATABASE_PORT: "5432"
           KRATOS_DATABASE_NAME: kratos
           KRATOS_DATABASE_USER: postgres
+          KRATOS_APPLICATION_DATABASE_USER: postgres
         run: cargo run --locked --bin kratos-migrate
 
   web:
@@ -104,6 +105,8 @@ jobs:
       - run: terraform -chdir=infrastructure/bootstrap validate
       - run: terraform -chdir=infrastructure/platform init -backend=false -input=false
       - run: terraform -chdir=infrastructure/platform validate
+      - run: terraform -chdir=infrastructure/migration init -backend=false -input=false
+      - run: terraform -chdir=infrastructure/migration validate
       - run: terraform -chdir=infrastructure/application init -backend=false -input=false
       - run: terraform -chdir=infrastructure/application validate
 

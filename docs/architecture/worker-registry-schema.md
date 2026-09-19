@@ -45,8 +45,15 @@ credential supplied by the caller.
 
 `kratos-migrate` is a separate binary in the control-plane image. It reads the same non-secret
 database connection settings as the service and applies embedded, checksummed SQLx migrations.
-Application startup SHALL NOT alter the schema. A later deployment increment will run this binary
-under a dedicated migration identity before routing a database-enabled revision.
+Application startup SHALL NOT alter the schema. The deployment pipeline runs this binary as a
+single-task Cloud Run job under a dedicated migration identity before applying a database-enabled
+application revision. A failed migration stops the deployment before the service is changed.
+
+The migration identity receives the PostgreSQL `cloudsqlsuperuser` role; the runtime identity does
+not. After every migration, the job transactionally grants the runtime identity only database
+connect, public-schema usage, table `SELECT`/`INSERT`/`UPDATE`/`DELETE`, and sequence usage. Default
+privileges apply the same data access to objects created by later migrations. PostgreSQL performs
+identifier quoting for the IAM database usernames before any grant statement is constructed.
 
 CI applies every migration to a disposable PostgreSQL 16 service. That test service explicitly uses
 PostgreSQL `trust` host authentication, meaning any process able to reach its runner-local port can
