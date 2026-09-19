@@ -16,6 +16,7 @@ permissions:
 env:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
+  TF_VAR_enable_database: ${{ vars.GCP_ENABLE_DATABASE || 'false' }}
 
 jobs:
   deploy:
@@ -70,7 +71,17 @@ jobs:
         id: platform
         working-directory: infrastructure/platform
         shell: bash
-        run: echo "runtime_service_account=$(terraform output -raw runtime_service_account)" >> "$GITHUB_OUTPUT"
+        run: |
+          database_enabled="$(terraform output -raw database_enabled)"
+          echo "runtime_service_account=$(terraform output -raw runtime_service_account)" >> "$GITHUB_OUTPUT"
+          echo "database_enabled=$database_enabled" >> "$GITHUB_OUTPUT"
+          if [[ "$database_enabled" == "true" ]]; then
+            echo "database_connection_name=$(terraform output -raw database_connection_name)" >> "$GITHUB_OUTPUT"
+            echo "database_iam_username=$(terraform output -raw database_iam_username)" >> "$GITHUB_OUTPUT"
+          else
+            echo "database_connection_name=" >> "$GITHUB_OUTPUT"
+            echo "database_iam_username=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Apply application infrastructure
         working-directory: infrastructure/application
@@ -83,7 +94,10 @@ jobs:
             -var="region=${{ vars.GCP_REGION }}" \
             -var="container_image=${{ steps.image.outputs.reference }}" \
             -var="runtime_service_account=${{ steps.platform.outputs.runtime_service_account }}" \
-            -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}"
+            -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}" \
+            -var="database_enabled=${{ steps.platform.outputs.database_enabled }}" \
+            -var="database_connection_name=${{ steps.platform.outputs.database_connection_name }}" \
+            -var="database_iam_username=${{ steps.platform.outputs.database_iam_username }}"
 
       - name: Report deployment addresses
         working-directory: infrastructure/application
