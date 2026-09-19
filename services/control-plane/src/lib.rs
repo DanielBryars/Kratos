@@ -17,8 +17,12 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub mod credentials;
 pub mod database;
+pub mod human_auth;
+mod operator;
 mod registry;
 
+use human_auth::HumanAuth;
+use operator::{CreateEnrolmentRequest, CreateEnrolmentResponse};
 use registry::{
     EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability, GpuHealth, GpuHealthStatus,
     HeartbeatRequest, HeartbeatResponse, VerificationGate, WorkerCapabilities, WorkerState,
@@ -44,19 +48,29 @@ pub struct ReadinessResponse {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) database: Option<PgPool>,
+    pub(crate) human_auth: Option<HumanAuth>,
     pub(crate) verification_gate: VerificationGate,
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, readiness, version, registry::enrol_worker, registry::heartbeat),
+    paths(
+        health,
+        readiness,
+        version,
+        operator::create_worker_enrolment,
+        registry::enrol_worker,
+        registry::heartbeat
+    ),
     components(schemas(
         HealthResponse, ReadinessResponse, VersionResponse, EnrolmentRequest,
         EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
-        WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState
+        WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState,
+        CreateEnrolmentRequest, CreateEnrolmentResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
+        (name = "operator", description = "Human-authorised administration"),
         (name = "workers", description = "Worker enrolment and liveness")
     ),
     modifiers(&SecurityAddon)
@@ -74,6 +88,15 @@ impl Modify for SecurityAddon {
                     HttpBuilder::new()
                         .scheme(HttpAuthScheme::Bearer)
                         .bearer_format("Kratos opaque credential")
+                        .build(),
+                ),
+            );
+            components.add_security_scheme(
+                "human_bearer",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("Identity Platform ID token")
                         .build(),
                 ),
             );
@@ -146,10 +169,22 @@ async fn version() -> Json<VersionResponse> {
 }
 
 pub fn app(web_root: Option<PathBuf>, database: Option<PgPool>) -> Router {
+    app_with_human_auth(web_root, database, None)
+}
+
+pub fn app_with_human_auth(
+    web_root: Option<PathBuf>,
+    database: Option<PgPool>,
+    human_auth: Option<HumanAuth>,
+) -> Router {
     let router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/api/v1/version", get(version))
+        .route(
+            "/api/v1/operator/worker-enrolments",
+            post(operator::create_worker_enrolment),
+        )
         .route("/api/v1/worker-enrolments", post(registry::enrol_worker))
         .route(
             "/api/v1/workers/{worker_id}/heartbeat",
@@ -158,6 +193,7 @@ pub fn app(web_root: Option<PathBuf>, database: Option<PgPool>) -> Router {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(AppState {
             database,
+            human_auth,
             verification_gate: VerificationGate::default(),
         });
 

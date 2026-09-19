@@ -30,6 +30,16 @@ Hardware detection SHALL NOT be treated as a successful computation check. Detec
 
 ## Enrolment exchange
 
+An operator SHALL obtain a short-lived Identity Platform ID token through the web login and call
+`POST /api/v1/operator/worker-enrolments`. The control plane SHALL ask Identity Platform to validate
+the token and SHALL separately require the stored Kratos identity to have the `operator` role. The
+first operator MAY be established only when its verified provider email matches the deployment's
+bootstrap email; that match SHALL bind the role to the stable provider subject.
+
+The operator endpoint SHALL create a credential lasting between five and sixty minutes, with a
+fifteen-minute default. It SHALL return the plaintext only once, store only its Argon2id verifier,
+and write an audit event without secret material.
+
 `POST /api/v1/worker-enrolments` SHALL accept a single-use bootstrap credential in the
 `Authorization` header and a request containing:
 

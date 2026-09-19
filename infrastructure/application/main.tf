@@ -36,6 +36,18 @@ resource "google_cloud_run_v2_service" "control_plane" {
       }
 
       dynamic "env" {
+        for_each = var.identity_platform_api_key == "" ? {} : {
+          KRATOS_IDENTITY_PLATFORM_API_KEY = var.identity_platform_api_key
+          KRATOS_BOOTSTRAP_OPERATOR_EMAIL  = var.bootstrap_operator_email
+        }
+
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
+      dynamic "env" {
         for_each = var.database_enabled ? {
           KRATOS_DATABASE_HOST = "127.0.0.1"
           KRATOS_DATABASE_PORT = "5432"

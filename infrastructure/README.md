@@ -60,6 +60,26 @@ When enabled, Terraform creates the zonal development PostgreSQL instance, datab
 user and the two narrow Cloud SQL IAM grants for the Cloud Run service account. The application root
 then adds a digest-pinned Cloud SQL Auth Proxy v2 sidecar and supplies non-secret connection metadata
 to the Rust container. It does not create or store a database password. Schema migrations and the
-Rust persistence layer must be ready before the cost gate is turned on.
+Rust persistence layer are tested in CI. The deployment workflow does not yet apply migrations to
+the persistent instance, so the cost gate SHALL remain off until that migration job is added.
 
-The application is temporarily public while it exposes only scaffold health, version and documentation routes. Application authentication SHALL be added before worker registration or any private data endpoint is deployed.
+## Human authentication and the first operator
+
+Configure Google sign-in in Identity Platform for the development project and add the deployed
+domain as an authorised domain. Set these GitHub Actions variables together:
+
+| Variable | Value |
+|---|---|
+| `KRATOS_IDENTITY_PLATFORM_API_KEY` | The development project's browser API key. This identifies the project and is not treated as a secret. |
+| `KRATOS_BOOTSTRAP_OPERATOR_EMAIL` | The verified Google account allowed to establish the first operator identity. |
+
+The browser sends its short-lived Identity Platform ID token to the Rust API. The API submits that
+token to Identity Platform's account lookup endpoint and accepts only one enabled account with a
+verified email. On the first successful operator request, the configured bootstrap email is bound
+to the provider's stable subject and stored with the `operator` role. Subsequent authorisation uses
+that stored subject and role. Changing the configured email does not transfer an existing role.
+
+`POST /api/v1/operator/worker-enrolments` returns a 15-minute, single-use worker credential by
+default. The plaintext is returned only in that response; PostgreSQL stores its Argon2id verifier.
+Human authentication and persistence both fail closed with `503` while their configuration is
+absent.
