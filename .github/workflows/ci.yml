@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
   push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -95,15 +96,21 @@ jobs:
           file: services/control-plane/Dockerfile
           push: false
           tags: kratos-control-plane:ci
+          cache-from: type=gha,scope=control-plane
+          cache-to: type=gha,mode=max,scope=control-plane
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: workers/agent/Dockerfile
           push: false
           tags: kratos-agent:ci
+          cache-from: type=gha,scope=worker-agent
+          cache-to: type=gha,mode=max,scope=worker-agent
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: workers/gpu-health-check/Dockerfile
           push: false
           tags: kratos-gpu-health-check:ci
+          cache-from: type=gha,scope=gpu-health-check
+          cache-to: type=gha,mode=max,scope=gpu-health-check
