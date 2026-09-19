@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "ms-vscode-remote.remote-containers",
+    "rust-lang.rust-analyzer",
+    "vadimcn.vscode-lldb",
+    "hashicorp.terraform"
+  ]
+}

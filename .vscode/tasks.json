@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "api: build",
+      "type": "shell",
+      "command": "cargo build --package kratos-control-plane",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "web: dev",
+      "type": "shell",
+      "command": "pnpm web:dev",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "^(.*)$", "message": 1 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*VITE.*",
+          "endsPattern": ".*Local:.*"
+        }
+      }
+    }
+  ]
+}

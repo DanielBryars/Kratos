@@ -1,0 +1,16 @@
+/target/
+/node_modules/
+/apps/web/node_modules/
+/apps/web/dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+*.auto.tfvars
+/infrastructure/bootstrap/backend_override.tf
+.DS_Store

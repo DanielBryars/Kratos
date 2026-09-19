@@ -1,0 +1,14 @@
+[workspace]
+members = ["services/control-plane"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.90"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
