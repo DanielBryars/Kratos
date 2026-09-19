@@ -275,7 +275,7 @@ mod tests {
 
     use crate::{
         app_with_human_auth, credentials,
-        human_auth::{HumanAuth, HumanIdentity, IdentityVerifier, VerifyError},
+        human_auth::{ClientAuthConfig, HumanAuth, HumanIdentity, IdentityVerifier, VerifyError},
     };
 
     use super::bearer_token;
@@ -319,7 +319,15 @@ mod tests {
                 display_name: "Test Operator".to_owned(),
             },
         };
-        let auth = HumanAuth::new(Arc::new(verifier), "operator@example.com");
+        let auth = HumanAuth::new(
+            Arc::new(verifier),
+            "operator@example.com",
+            ClientAuthConfig {
+                api_key: "test-api-key".to_owned(),
+                auth_domain: "example.test".to_owned(),
+                project_id: "test-project".to_owned(),
+            },
+        );
         let response = app_with_human_auth(None, Some(pool.clone()), Some(auth))
             .oneshot(
                 Request::post("/api/v1/operator/worker-enrolments")

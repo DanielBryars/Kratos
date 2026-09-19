@@ -67,3 +67,24 @@ The remaining critical path is:
 6. Exercise disconnect, reconnect and revocation acceptance checks.
 
 Visual polish and automatic agent updates are outside the cut line. Production remains unapplied.
+
+## Control-plane checkpoint
+
+The development Cloud SQL instance is enabled and healthy. The deployment pipeline now applies the
+schema through the dedicated migration job before releasing the application, and the live readiness
+probe reports `database: ready`.
+
+Identity Platform is initialised for the development project, the deployed domain is authorised,
+and the browser configuration plus bootstrap operator email are supplied through environment-scoped
+GitHub Actions variables. The operator console obtains a Google ID token, while the Rust API
+independently validates the token and the Kratos operator role before issuing a short-lived,
+single-use worker enrolment credential.
+
+The remaining critical path is:
+
+1. Create the Google OAuth web client and enable the Google Identity Platform provider.
+2. Deploy the operator console and exercise one real operator sign-in.
+3. Publish and install the agent on both GPU machines.
+4. Create and approve the home compute group and both memberships.
+5. Add the fleet query and UI, including honest stale and offline states.
+6. Exercise disconnect, reconnect and revocation acceptance checks.

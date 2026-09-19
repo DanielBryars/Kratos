@@ -3,6 +3,7 @@ use std::{env, fmt, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 const LOOKUP_URL: &str = "https://identitytoolkit.googleapis.com/v1/accounts:lookup";
 
@@ -11,6 +12,14 @@ pub(crate) struct HumanIdentity {
     pub(crate) subject: String,
     pub(crate) email: String,
     pub(crate) display_name: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientAuthConfig {
+    pub api_key: String,
+    pub auth_domain: String,
+    pub project_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +39,7 @@ pub(crate) trait IdentityVerifier: Send + Sync {
 pub struct HumanAuth {
     verifier: Arc<dyn IdentityVerifier>,
     bootstrap_operator_email: Arc<str>,
+    client_config: ClientAuthConfig,
 }
 
 impl fmt::Debug for HumanAuth {
@@ -43,11 +53,20 @@ impl fmt::Debug for HumanAuth {
 }
 
 impl HumanAuth {
-    pub(crate) fn new(verifier: Arc<dyn IdentityVerifier>, bootstrap_operator_email: &str) -> Self {
+    pub(crate) fn new(
+        verifier: Arc<dyn IdentityVerifier>,
+        bootstrap_operator_email: &str,
+        client_config: ClientAuthConfig,
+    ) -> Self {
         Self {
             verifier,
             bootstrap_operator_email: Arc::from(normalize_email(bootstrap_operator_email)),
+            client_config,
         }
+    }
+
+    pub(crate) fn client_config(&self) -> ClientAuthConfig {
+        self.client_config.clone()
     }
 
     pub(crate) async fn verify(&self, id_token: &str) -> Result<HumanIdentity, VerifyError> {
@@ -78,7 +97,8 @@ pub enum HumanAuthConfigError {
 pub fn human_auth_from_environment() -> Result<Option<HumanAuth>, HumanAuthConfigError> {
     let api_key = env::var("KRATOS_IDENTITY_PLATFORM_API_KEY").ok();
     let operator_email = env::var("KRATOS_BOOTSTRAP_OPERATOR_EMAIL").ok();
-    if api_key.is_none() && operator_email.is_none() {
+    let project_id = env::var("KRATOS_IDENTITY_PLATFORM_PROJECT_ID").ok();
+    if api_key.is_none() && operator_email.is_none() && project_id.is_none() {
         return Ok(None);
     }
     let api_key =
@@ -92,6 +112,9 @@ pub fn human_auth_from_environment() -> Result<Option<HumanAuth>, HumanAuthConfi
         .ok_or(HumanAuthConfigError::Missing(
             "KRATOS_BOOTSTRAP_OPERATOR_EMAIL",
         ))?;
+    let project_id = project_id.filter(|value| !value.trim().is_empty()).ok_or(
+        HumanAuthConfigError::Missing("KRATOS_IDENTITY_PLATFORM_PROJECT_ID"),
+    )?;
     if !operator_email.contains('@') {
         return Err(HumanAuthConfigError::InvalidEmail);
     }
@@ -102,8 +125,16 @@ pub fn human_auth_from_environment() -> Result<Option<HumanAuth>, HumanAuthConfi
         .build()
         .map_err(|_| HumanAuthConfigError::Client)?;
     Ok(Some(HumanAuth::new(
-        Arc::new(IdentityPlatformClient { client, api_key }),
+        Arc::new(IdentityPlatformClient {
+            client,
+            api_key: api_key.clone(),
+        }),
         &operator_email,
+        ClientAuthConfig {
+            api_key,
+            auth_domain: format!("{project_id}.firebaseapp.com"),
+            project_id,
+        },
     )))
 }
 

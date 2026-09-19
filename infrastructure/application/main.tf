@@ -37,8 +37,9 @@ resource "google_cloud_run_v2_service" "control_plane" {
 
       dynamic "env" {
         for_each = var.identity_platform_api_key == "" ? {} : {
-          KRATOS_IDENTITY_PLATFORM_API_KEY = var.identity_platform_api_key
-          KRATOS_BOOTSTRAP_OPERATOR_EMAIL  = var.bootstrap_operator_email
+          KRATOS_IDENTITY_PLATFORM_API_KEY    = var.identity_platform_api_key
+          KRATOS_IDENTITY_PLATFORM_PROJECT_ID = var.project_id
+          KRATOS_BOOTSTRAP_OPERATOR_EMAIL     = var.bootstrap_operator_email
         }
 
         content {

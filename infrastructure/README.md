@@ -77,6 +77,11 @@ domain as an authorised domain. Set these GitHub Actions variables together:
 | `KRATOS_IDENTITY_PLATFORM_API_KEY` | The development project's browser API key. This identifies the project and is not treated as a secret. |
 | `KRATOS_BOOTSTRAP_OPERATOR_EMAIL` | The verified Google account allowed to establish the first operator identity. |
 
+Terraform derives `KRATOS_IDENTITY_PLATFORM_PROJECT_ID` from `GCP_DEVELOPMENT_PROJECT_ID`; it does
+not require another GitHub variable. The public `GET /api/v1/auth/config` endpoint exposes only the
+browser API key, auth domain and project ID needed by the Firebase browser SDK. It returns `503`
+when human authentication is not completely configured.
+
 The browser sends its short-lived Identity Platform ID token to the Rust API. The API submits that
 token to Identity Platform's account lookup endpoint and accepts only one enabled account with a
 verified email. On the first successful operator request, the configured bootstrap email is bound
@@ -87,3 +92,6 @@ that stored subject and role. Changing the configured email does not transfer an
 default. The plaintext is returned only in that response; PostgreSQL stores its Argon2id verifier.
 Human authentication and persistence both fail closed with `503` while their configuration is
 absent.
+
+The web console supports 15, 30 and 60 minute enrolments. It displays the credential once and keeps
+it only in browser memory; reloading the page requires the operator to issue a replacement.

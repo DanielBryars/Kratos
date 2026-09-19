@@ -22,7 +22,7 @@ pub mod migration;
 mod operator;
 mod registry;
 
-use human_auth::HumanAuth;
+use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{CreateEnrolmentRequest, CreateEnrolmentResponse};
 use registry::{
     EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability, GpuHealth, GpuHealthStatus,
@@ -59,12 +59,13 @@ pub(crate) struct AppState {
         health,
         readiness,
         version,
+        auth_config,
         operator::create_worker_enrolment,
         registry::enrol_worker,
         registry::heartbeat
     ),
     components(schemas(
-        HealthResponse, ReadinessResponse, VersionResponse, EnrolmentRequest,
+        HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
         EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
         WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState,
         CreateEnrolmentRequest, CreateEnrolmentResponse
@@ -169,6 +170,32 @@ async fn version() -> Json<VersionResponse> {
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/config",
+    tag = "system",
+    responses(
+        (status = 200, description = "Public Identity Platform browser configuration", body = ClientAuthConfig),
+        (status = 503, description = "Human authentication is not configured", body = ErrorResponse)
+    )
+)]
+async fn auth_config(
+    State(state): State<AppState>,
+) -> Result<Json<ClientAuthConfig>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .human_auth
+        .map(|auth| Json(auth.client_config()))
+        .ok_or({
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    code: "authentication_unavailable",
+                    message: "Human authentication is unavailable.",
+                }),
+            )
+        })
+}
+
 pub fn app(web_root: Option<PathBuf>, database: Option<PgPool>) -> Router {
     app_with_human_auth(web_root, database, None)
 }
@@ -182,6 +209,7 @@ pub fn app_with_human_auth(
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/api/v1/version", get(version))
+        .route("/api/v1/auth/config", get(auth_config))
         .route(
             "/api/v1/operator/worker-enrolments",
             post(operator::create_worker_enrolment),
