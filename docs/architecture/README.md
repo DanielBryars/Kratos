@@ -11,7 +11,10 @@ Status distinguishes a selected direction from a recommendation still under disc
 | VS Code and Linux dev container | Accepted | [ADR-005](decisions/005-developer-workflow.md) |
 | Public HTTPS edge and custom domain | Accepted | [ADR-006](decisions/006-public-edge-and-domain.md) |
 | Python worker agent and outbound HTTPS | Accepted | [ADR-007](decisions/007-python-worker-agent.md) |
-| Frontend details, database, identity and worker packaging | Open | [Technology options](technology-options.md) |
+| Worker-controlled sibling job containers | Accepted | [ADR-008](decisions/008-worker-job-execution.md) |
+| Self-hosted Grafana stack, OpenTelemetry and MLflow | Accepted | [ADR-009](decisions/009-observability-and-mlflow.md) |
+| SkyPilot as a later cloud-capacity provider | Accepted | [ADR-010](decisions/010-skypilot-boundary.md) |
+| Frontend details, database and identity | Open | [Technology options](technology-options.md) |
 
 Each decision record SHALL state its status, context, alternatives, rationale, consequences and conditions for reconsideration. Proposed decisions SHALL NOT be treated as approved implementation constraints.
 

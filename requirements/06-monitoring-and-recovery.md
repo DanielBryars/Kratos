@@ -16,6 +16,12 @@
 | MON-008 | The platform SHOULD support filtering by status, owner, project, dataset, configuration and date. |
 | MON-009 | Run views SHALL include predicted completion, accrued cost, authorised budget and any scheduling blockers. |
 | MON-010 | Simulated measurements SHALL be labelled and SHALL NOT be presented as actual training evidence. |
+| MON-014 | Platform services, worker agents and supported workloads SHALL emit OpenTelemetry metrics, logs and traces through a local or environment-level collector. |
+| MON-015 | The cloud deployment SHALL provide an authenticated Grafana instance backed by Prometheus for metrics, Loki for logs and Tempo for traces. |
+| MON-016 | Training parameters, scalar metrics, artefacts and models SHALL be recorded in MLflow with Kratos job and attempt identifiers. Metrics required for operational dashboards SHALL also be emitted through OpenTelemetry. |
+| MON-017 | Supported traces MAY be exported to both Tempo and MLflow. The platform SHALL NOT depend on MLflow as a general OTLP metrics backend. |
+| MON-018 | Telemetry records SHALL carry stable project, job, attempt, worker and MLflow run identifiers where applicable, without including secret values. |
+| MON-019 | Collector queues, telemetry retention and metric-label cardinality SHALL have documented limits and exhaustion behaviour. |
 
 ## Checkpointing and recovery
 

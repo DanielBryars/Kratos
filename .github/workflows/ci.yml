@@ -53,6 +53,22 @@ jobs:
       - run: uv run mypy src tests
       - run: uv run pytest
 
+  gpu-health-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/gpu-health-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.19"
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - run: uv run --python 3.12 ruff format --check .
+      - run: uv run --python 3.12 ruff check .
+      - run: uv run --python 3.12 mypy health_check.py
+
   infrastructure:
     runs-on: ubuntu-latest
     steps:
@@ -85,3 +101,9 @@ jobs:
           file: workers/agent/Dockerfile
           push: false
           tags: kratos-agent:ci
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: workers/gpu-health-check/Dockerfile
+          push: false
+          tags: kratos-gpu-health-check:ci
