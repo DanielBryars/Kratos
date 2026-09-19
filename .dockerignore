@@ -6,6 +6,11 @@ target
 node_modules
 apps/web/node_modules
 apps/web/dist
+**/.venv
+**/__pycache__
+**/.mypy_cache
+**/.pytest_cache
+**/.ruff_cache
 docs
 requirements
 infrastructure

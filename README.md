@@ -24,3 +24,10 @@ The initial endpoints are:
 - Web interface: <http://localhost:5173>
 - API health: <http://localhost:8080/healthz>
 - Swagger UI: <http://localhost:8080/swagger-ui/>
+
+Inspect the capabilities visible to the Python worker agent with:
+
+```shell
+cd workers/agent
+uv run kratos-agent inspect
+```

@@ -9,7 +9,9 @@ Status distinguishes a selected direction from a recommendation still under disc
 | Infrastructure in the Kratos repository | Accepted for the weekend MVP | [ADR-003](decisions/003-repository-boundaries.md) |
 | Rust control plane with Axum | Accepted | [ADR-004](decisions/004-rust-control-plane.md) |
 | VS Code and Linux dev container | Accepted | [ADR-005](decisions/005-developer-workflow.md) |
-| Runtime, frontend details, agent language, database, identity and worker packaging | Open | [Technology options](technology-options.md) |
+| Public HTTPS edge and custom domain | Accepted | [ADR-006](decisions/006-public-edge-and-domain.md) |
+| Python worker agent and outbound HTTPS | Accepted | [ADR-007](decisions/007-python-worker-agent.md) |
+| Frontend details, database, identity and worker packaging | Open | [Technology options](technology-options.md) |
 
 Each decision record SHALL state its status, context, alternatives, rationale, consequences and conditions for reconsideration. Proposed decisions SHALL NOT be treated as approved implementation constraints.
 
