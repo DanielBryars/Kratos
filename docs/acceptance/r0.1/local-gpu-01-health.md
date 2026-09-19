@@ -1,7 +1,7 @@
 # R0.1 GPU health evidence — local-gpu-01
 
 **Observed:** 2026-09-19  
-**Status:** Partial R0.1 evidence; agent-to-control-plane reporting remains outstanding
+**Status:** GPU health passed on the first home worker; second-host evidence remains outstanding
 
 ## Requirements
 
@@ -87,3 +87,7 @@ health-check container. No managed health-check container remained after collect
 - Publish the health image by immutable registry digest.
 - Attach the structured result and image digest to the capability heartbeat.
 - Repeat the same evidence on `local-gpu-02`.
+
+Agent-to-control-plane registration and live capability reporting are now complete for this worker.
+See [the liveness evidence](local-gpu-01-liveness.md) for its registered identity, Home-group membership,
+stale/offline transitions and credential-preserving reconnect.
