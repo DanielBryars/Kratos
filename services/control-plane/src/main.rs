@@ -5,6 +5,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use kratos_control_plane::database::DatabaseSettings;
+use kratos_control_plane::human_auth::human_auth_from_environment;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,11 +27,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(settings) => Some(settings.connect().await?),
         None => None,
     };
+    let human_auth = human_auth_from_environment()?;
 
-    info!(%address, database_enabled = database.is_some(), "Kratos control plane listening");
-    axum::serve(listener, kratos_control_plane::app(web_root, database))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    info!(
+        %address,
+        database_enabled = database.is_some(),
+        human_auth_enabled = human_auth.is_some(),
+        "Kratos control plane listening"
+    );
+    axum::serve(
+        listener,
+        kratos_control_plane::app_with_human_auth(web_root, database, human_auth),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }

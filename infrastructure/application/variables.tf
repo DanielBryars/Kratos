@@ -35,6 +35,28 @@ variable "allow_unauthenticated" {
   default     = true
 }
 
+variable "identity_platform_api_key" {
+  description = "Public browser API key identifying the Identity Platform project; empty disables human authentication."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = (var.identity_platform_api_key == "") == (var.bootstrap_operator_email == "")
+    error_message = "identity_platform_api_key and bootstrap_operator_email must be set together."
+  }
+}
+
+variable "bootstrap_operator_email" {
+  description = "Verified Google email allowed to create the first stable operator identity; empty disables human authentication."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.bootstrap_operator_email == "" || can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.bootstrap_operator_email))
+    error_message = "bootstrap_operator_email must be empty or a valid email address."
+  }
+}
+
 variable "database_enabled" {
   description = "Attach the passwordless Cloud SQL Auth Proxy sidecar and database connection metadata."
   type        = bool

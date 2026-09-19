@@ -95,6 +95,8 @@ jobs:
             -var="container_image=${{ steps.image.outputs.reference }}" \
             -var="runtime_service_account=${{ steps.platform.outputs.runtime_service_account }}" \
             -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}" \
+            -var="identity_platform_api_key=${{ vars.KRATOS_IDENTITY_PLATFORM_API_KEY }}" \
+            -var="bootstrap_operator_email=${{ vars.KRATOS_BOOTSTRAP_OPERATOR_EMAIL }}" \
             -var="database_enabled=${{ steps.platform.outputs.database_enabled }}" \
             -var="database_connection_name=${{ steps.platform.outputs.database_connection_name }}" \
             -var="database_iam_username=${{ steps.platform.outputs.database_iam_username }}"

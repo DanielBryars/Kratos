@@ -179,8 +179,8 @@ impl WorkerState {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ErrorResponse {
-    code: &'static str,
-    message: &'static str,
+    pub(crate) code: &'static str,
+    pub(crate) message: &'static str,
 }
 
 pub(crate) struct ApiError {

@@ -58,7 +58,8 @@ mounted one-time credential file and send periodic heartbeats.
 The remaining critical path is:
 
 1. Enable the development database and run its migrations.
-2. Add the authenticated operator path that creates one-time enrolment credentials.
+2. Configure Identity Platform and deploy the implemented operator path that creates one-time
+   enrolment credentials.
 3. Publish and install the agent on both GPU machines.
 4. Create and approve the home compute group and both memberships.
 5. Add the fleet query and UI, including honest stale and offline states.
