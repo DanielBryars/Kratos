@@ -38,6 +38,8 @@ Copy the three bootstrap outputs into GitHub repository **Actions variables**:
 
 Also create `GCP_DEVELOPMENT_PROJECT_ID`, `GCP_REGION` and `KRATOS_DOMAIN_NAME` repository variables. These are identifiers, not secret keys. Do not create or upload a service-account JSON key.
 
+The workload identity provider accepts GitHub OIDC tokens only when both the repository and `refs/heads/main` match. Feature branches and pull-request workflows cannot impersonate the deployment service account even if they request GitHub's `id-token: write` permission.
+
 The application deployment reserves a global IPv4 address, provisions a Google-managed certificate, and places an external HTTPS load balancer in front of Cloud Run. After the first application apply, copy the `required_dns_record` output to the DNS provider for the domain. Certificate activation begins after that record resolves to the load balancer address.
 
 Cloud Run accepts internet traffic only through the load balancer. Direct public requests to its default URI are rejected by its ingress policy. Port 80 redirects to HTTPS; the HTTPS frontend requires TLS 1.2 or newer.
