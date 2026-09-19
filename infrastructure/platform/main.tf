@@ -63,6 +63,7 @@ resource "google_sql_database_instance" "kratos" {
   deletion_protection = var.database_deletion_protection
 
   settings {
+    edition           = "ENTERPRISE"
     tier              = "db-f1-micro"
     availability_type = "ZONAL"
     disk_type         = "PD_SSD"
