@@ -43,3 +43,25 @@ If time is lost, cut in this order:
 4. PostgreSQL persistence only if an explicitly labelled temporary store can survive the demonstration; durable identity remains the preferred requirement.
 
 Do not cut worker authentication, actual GPU detection, immutable build identity, secret hygiene or honest offline/stale status. A simulated worker may aid development but does not satisfy acceptance.
+
+## Saturday 14:41 checkpoint
+
+The Friday foundation and Saturday deployment exits are complete. The development service is live at
+`https://kratos.bryars.com`, merges deploy through Workload Identity Federation, and all build,
+analysis, migration and container checks run in CI.
+
+The server half of Sunday worker registration is also complete: the durable registry schema,
+single-use enrolment exchange, scoped worker credentials, capability reports and replay-safe
+heartbeats are implemented. The Python agent can now persist its identity securely, enrol from a
+mounted one-time credential file and send periodic heartbeats.
+
+The remaining critical path is:
+
+1. Enable the development database and run its migrations.
+2. Add the authenticated operator path that creates one-time enrolment credentials.
+3. Publish and install the agent on both GPU machines.
+4. Create and approve the home compute group and both memberships.
+5. Add the fleet query and UI, including honest stale and offline states.
+6. Exercise disconnect, reconnect and revocation acceptance checks.
+
+Visual polish and automatic agent updates are outside the cut line. Production remains unapplied.

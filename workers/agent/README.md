@@ -14,8 +14,24 @@ it deliberately reports GPU computation health as `unverified`. A later controll
 container must execute a real GPU computation before the control plane can mark the worker healthy.
 
 No enrolment credential is accepted on the command line because command arguments can be exposed
-by process inspection. Enrolment and credential storage will be added with the authenticated worker
-API.
+by process inspection. The agent reads the one-time credential from a mounted file and writes the
+issued worker identity and scoped credential atomically to a mode-`0600` state file.
+
+Start the long-running agent with persistent state and a read-only enrolment secret mount:
+
+```shell
+docker run --detach --restart unless-stopped --gpus all \
+  --name kratos-agent \
+  --mount type=volume,source=kratos-agent-state,target=/var/lib/kratos-agent \
+  --mount type=bind,source=/secure/path/enrolment,target=/run/secrets/kratos-enrolment,readonly \
+  kratos-agent run \
+  --display-name "Home GPU 1" \
+  --enrolment-credential-file /run/secrets/kratos-enrolment
+```
+
+After enrolment, the bootstrap credential is consumed and the mounted file may be removed. Restarts
+load the worker credential from the persistent state volume. Heartbeat sequence numbers are advanced
+only after the control plane accepts them, so a network retry cannot replace a newer observation.
 
 Build and run the Linux GPU container from the repository root:
 

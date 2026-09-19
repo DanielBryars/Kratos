@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import StrEnum
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -82,3 +83,31 @@ class WorkerCapabilities(StrictModel):
     python_version: str = Field(min_length=1)
     gpus: tuple[GpuCapability, ...]
     gpu_health: GpuHealth
+
+
+class EnrolmentRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[0-9]+$")
+    agent_instance_id: UUID
+    display_name: str = Field(min_length=1, max_length=100)
+    capabilities: WorkerCapabilities
+
+
+class EnrolmentResponse(StrictModel):
+    worker_id: UUID
+    worker_credential: str = Field(pattern=r"^kwc_")
+    state: str
+    heartbeat_interval_seconds: int = Field(gt=0)
+
+
+class HeartbeatRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[0-9]+$")
+    sequence: int = Field(ge=0)
+    observed_at: datetime
+    capabilities: WorkerCapabilities
+
+
+class HeartbeatResponse(StrictModel):
+    worker_id: UUID
+    state: str
+    accepted_sequence: int = Field(ge=0)
+    next_heartbeat_seconds: int = Field(gt=0)
