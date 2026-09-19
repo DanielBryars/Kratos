@@ -125,6 +125,18 @@ The initial heartbeat interval is 30 seconds. A worker becomes `stale` after 90 
 accepted heartbeat and `offline` after five minutes. The UI SHALL show the last accepted contact and
 the age of displayed capabilities.
 
+## Operator fleet controls
+
+Authenticated operators SHALL retrieve the worker inventory from `GET /api/v1/operator/workers`.
+The response SHALL include the durable worker state, derived connectivity, last accepted heartbeat,
+latest capabilities and compute-group memberships. Connectivity is a presentation of heartbeat age;
+it SHALL NOT overwrite the durable worker state.
+
+`POST /api/v1/operator/workers/{worker_id}/approve` SHALL change an eligible worker to `idle` and MAY
+add it to a named compute group in the same database transaction. The control plane, rather than the
+agent, SHALL own that membership decision. The quarantine and revoke endpoints SHALL record audited
+state changes. Revocation SHALL also revoke every active credential for the worker atomically.
+
 ## Compute groups
 
 An agent MAY report network observations, but it cannot grant itself membership of a compute group.

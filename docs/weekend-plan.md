@@ -62,9 +62,9 @@ The remaining critical path is:
 2. Configure Identity Platform and deploy the implemented operator path that creates one-time
    enrolment credentials.
 3. Publish and install the agent on both GPU machines.
-4. Create and approve the home compute group and both memberships.
-5. Add the fleet query and UI, including honest stale and offline states.
-6. Exercise disconnect, reconnect and revocation acceptance checks.
+4. Use the fleet console to approve each home worker and add it to the Home compute group.
+5. Register the second home machine with the public agent image.
+6. Exercise disconnect, reconnect and revocation acceptance checks against both machines.
 
 Visual polish and automatic agent updates are outside the cut line. Production remains unapplied.
 
@@ -85,6 +85,15 @@ The remaining critical path is:
 1. Create the Google OAuth web client and enable the Google Identity Platform provider.
 2. Deploy the operator console and exercise one real operator sign-in.
 3. Publish and install the agent on both GPU machines.
-4. Create and approve the home compute group and both memberships.
-5. Add the fleet query and UI, including honest stale and offline states.
-6. Exercise disconnect, reconnect and revocation acceptance checks.
+4. Use the fleet console to approve each home worker and add it to the Home compute group.
+5. Register the second home machine with the public agent image.
+6. Exercise disconnect, reconnect and revocation acceptance checks against both machines.
+
+## Fleet-console checkpoint
+
+The authenticated fleet API and console now show every registered machine, its current capabilities,
+last heartbeat, derived `online`, `stale`, `offline` or `never_seen` connectivity, durable worker state
+and compute-group memberships. An operator can approve a worker and place it into a named group in one
+audited transaction, quarantine it, or revoke it and its active credential. THESHED2 can therefore be
+placed into the Home group from the deployed console; the remaining R0.1 hardware task is registering
+the second home machine and recording the two-host acceptance evidence.

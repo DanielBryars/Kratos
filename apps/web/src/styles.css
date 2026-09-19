@@ -8,7 +8,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, select { font: inherit; }
+button, select, input { font: inherit; }
 body::before {
   position: fixed;
   inset: 0;
@@ -45,6 +45,19 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .registration p { margin-top: 6px; color: #9babbc; font-size: 0.9rem; }
 .registration .registration-code { color: #8ce3b7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1rem; letter-spacing: 0.08em; }
 .registration-actions { display: flex; gap: 10px; }
+.worker-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.worker { display: grid; gap: 12px; padding: 18px; border: 1px solid #334154; border-radius: 10px; background: #111a26; color: #9babbc; font-size: 0.9rem; }
+.worker strong { color: #eef4fa; font-size: 1.05rem; }
+.worker-heading, .worker-badges, .worker-groups, .worker-controls { display: flex; align-items: center; gap: 8px; }
+.worker-heading { justify-content: space-between; }
+.worker-hardware { color: #c9d9e9; }
+.worker-badges, .worker-groups { flex-wrap: wrap; }
+.badge { padding: 5px 8px; border: 1px solid #3b4a5d; border-radius: 999px; color: #aab9c9; font-size: 0.7rem; text-transform: uppercase; }
+.badge--online { border-color: #245d48; color: #66d19e; }
+.badge--stale { border-color: #7c6838; color: #e4c56e; }
+.badge--offline { border-color: #713737; color: #ff8585; }
+.worker-controls { flex-wrap: wrap; padding-top: 4px; }
+.worker-controls input { min-width: 120px; flex: 1; min-height: 42px; border: 1px solid #334154; border-radius: 8px; padding: 0 12px; color: #eef4fa; background: #151f2c; }
 .operator-action { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .form-row { flex-wrap: wrap; gap: 12px; }
 .form-row label { color: #9babbc; }
@@ -54,6 +67,7 @@ button:hover:not(:disabled) { background: #8cc0ff; }
 button:disabled { cursor: wait; opacity: 0.62; }
 select { color: #eef4fa; background: #151f2c; border-color: #334154; }
 .button-secondary { color: #b9c8d8; background: transparent; border-color: #334154; }
+.button-danger { color: #ffb1b1; background: transparent; border-color: #713737; }
 .credential { flex-wrap: wrap; gap: 16px; padding: 18px; border: 1px solid #245d48; border-radius: 10px; background: rgba(36, 93, 72, 0.13); }
 .credential > div { min-width: 0; flex: 1; }
 .credential code { display: block; overflow-wrap: anywhere; margin-top: 8px; color: #8ce3b7; }
@@ -68,5 +82,6 @@ select { color: #eef4fa; background: #151f2c; border-color: #334154; }
   .operator-action, .card-heading { align-items: flex-start; flex-direction: column; }
   .registration { align-items: stretch; flex-direction: column; }
   .registration-actions { flex-direction: column; }
+  .worker-heading { align-items: flex-start; flex-direction: column; }
   .form-row { align-items: stretch; flex-direction: column; }
 }

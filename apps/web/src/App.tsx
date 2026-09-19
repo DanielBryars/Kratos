@@ -25,7 +25,20 @@ type PendingRegistration = {
     gpus: Array<{ name: string; memory_total_bytes: number }>;
   };
 };
+type Worker = {
+  worker_id: string;
+  display_name: string;
+  state: string;
+  connectivity: "never_seen" | "online" | "stale" | "offline";
+  last_seen_at: string | null;
+  capabilities: PendingRegistration["capabilities"];
+  compute_groups: Array<{ id: string; name: string }>;
+};
 type ApiError = { message?: string };
+
+function formatBytes(bytes: number) {
+  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
 
 export function App() {
   const [service, setService] = useState<Version | null>(null);
@@ -40,6 +53,9 @@ export function App() {
   const [copied, setCopied] = useState(false);
   const [pending, setPending] = useState<PendingRegistration[]>([]);
   const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [workers, setWorkers] = useState<Worker[]>([]);
+  const [groupNames, setGroupNames] = useState<Record<string, string>>({});
+  const [workerActionId, setWorkerActionId] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/v1/version")
@@ -57,16 +73,20 @@ export function App() {
   useEffect(() => {
     if (!user) {
       setPending([]);
+      setWorkers([]);
       return;
     }
     let cancelled = false;
     async function refresh() {
       const idToken = await user!.getIdToken();
-      const response = await fetch("/api/v1/operator/worker-registration-requests", {
-        headers: { Authorization: `Bearer ${idToken}` },
-      });
-      if (response.ok && !cancelled) {
-        setPending((await response.json()) as PendingRegistration[]);
+      const headers = { Authorization: `Bearer ${idToken}` };
+      const [pendingResponse, workersResponse] = await Promise.all([
+        fetch("/api/v1/operator/worker-registration-requests", { headers }),
+        fetch("/api/v1/operator/workers", { headers }),
+      ]);
+      if (!cancelled) {
+        if (pendingResponse.ok) setPending((await pendingResponse.json()) as PendingRegistration[]);
+        if (workersResponse.ok) setWorkers((await workersResponse.json()) as Worker[]);
       }
     }
     void refresh();
@@ -170,6 +190,35 @@ export function App() {
     }
   }
 
+  async function updateWorker(workerId: string, actionName: "approve" | "quarantine" | "revoke") {
+    if (!user) return;
+    if (actionName === "revoke" && !window.confirm("Revoke this worker and its credential? It will need to register again.")) return;
+    setWorkerActionId(workerId);
+    setMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(`/api/v1/operator/workers/${workerId}/${actionName}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: actionName === "approve" ? JSON.stringify({ compute_group_name: groupNames[workerId] ?? "Home" }) : undefined,
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      const result = (await response.json()) as { state: string };
+      setWorkers((current) => current.map((worker) => worker.worker_id === workerId
+        ? { ...worker, state: result.state }
+        : worker));
+      const refreshed = await fetch("/api/v1/operator/workers", { headers: { Authorization: `Bearer ${idToken}` } });
+      if (refreshed.ok) setWorkers((await refreshed.json()) as Worker[]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The worker could not be updated.");
+    } finally {
+      setWorkerActionId(null);
+    }
+  }
+
   return (
     <main>
       <header>
@@ -205,6 +254,32 @@ export function App() {
           )}
           {authStatus === "ready" && user && (
             <>
+              <div className="registration-section">
+                <div><p className="label">Fleet</p><h3>Registered machines</h3></div>
+                {workers.length === 0 && <p className="muted compact">No machines have registered yet.</p>}
+                <div className="worker-grid">
+                  {workers.map((worker) => (
+                    <div className="worker" key={worker.worker_id}>
+                      <div className="worker-heading">
+                        <div><strong>{worker.display_name}</strong><p>{worker.capabilities.hostname}</p></div>
+                        <div className="worker-badges"><span className={`badge badge--${worker.connectivity}`}>{worker.connectivity.replace("_", " ")}</span><span className="badge">{worker.state}</span></div>
+                      </div>
+                      <p className="worker-hardware">{worker.capabilities.gpus.map((gpu) => `${gpu.name} · ${formatBytes(gpu.memory_total_bytes)}`).join(", ") || "No GPU detected"}</p>
+                      <p>{worker.capabilities.logical_cpu_count} CPUs · {formatBytes(worker.capabilities.memory_total_bytes)} RAM</p>
+                      <p>Last heartbeat: {worker.last_seen_at ? new Date(worker.last_seen_at).toLocaleString() : "never"}</p>
+                      <div className="worker-groups">{worker.compute_groups.map((group) => <span className="badge" key={group.id}>{group.name}</span>)}</div>
+                      {worker.state !== "revoked" && (
+                        <div className="worker-controls">
+                          <input aria-label={`Compute group for ${worker.display_name}`} value={groupNames[worker.worker_id] ?? "Home"} maxLength={100} onChange={(event) => setGroupNames((current) => ({ ...current, [worker.worker_id]: event.target.value }))} />
+                          <button type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "approve")}>{worker.state === "unapproved" || worker.state === "quarantined" ? "Approve and add" : "Add group"}</button>
+                          {worker.state !== "quarantined" && <button className="button-secondary" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "quarantine")}>Quarantine</button>}
+                          <button className="button-danger" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "revoke")}>Revoke</button>
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
               <div className="registration-section">
                 <div><p className="label">Requests</p><h3>Machines waiting for approval</h3></div>
                 {pending.length === 0 && <p className="muted compact">No machines are waiting.</p>}
