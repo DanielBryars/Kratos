@@ -2,7 +2,9 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
+use ed25519_dalek::{Signer, SigningKey};
 use kratos_control_plane::{
     app,
     credentials::{CredentialKind, issue},
@@ -202,4 +204,100 @@ async fn enrolment_and_heartbeat_are_transactional_and_replay_safe(pool: PgPool)
         .await
         .unwrap();
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn approved_radio_in_requires_device_key_signature(pool: PgPool) {
+    let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+    let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+    let agent_instance_id = Uuid::new_v4();
+    let response = app(None, Some(pool.clone()))
+        .oneshot(
+            Request::post("/api/v1/worker-registration-requests")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "protocol_version": "1.0",
+                        "agent_instance_id": agent_instance_id,
+                        "display_name": "Rented GPU",
+                        "public_key": public_key,
+                        "capabilities": capabilities()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created = response_json(response).await;
+    let registration_id = Uuid::parse_str(created["registration_id"].as_str().unwrap()).unwrap();
+    assert_eq!(created["confirmation_code"].as_str().unwrap().len(), 9);
+
+    let operator_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities (id, provider, provider_subject, display_name, role) \
+         VALUES ($1, 'test', $2, 'Operator', 'operator')",
+    )
+    .bind(operator_id)
+    .bind(Uuid::new_v4().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let challenge = [9_u8; 32];
+    sqlx::query(
+        "UPDATE worker_registration_requests SET approved_at = now(), \
+         approved_by_identity_id = $2, claim_challenge = $3 WHERE id = $1",
+    )
+    .bind(registration_id)
+    .bind(operator_id)
+    .bind(challenge.as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let challenge_encoded = URL_SAFE_NO_PAD.encode(challenge);
+    let message = format!("kratos-worker-claim-v1\n{registration_id}\n{challenge_encoded}");
+    let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(message.as_bytes()).to_bytes());
+    let claimed = app(None, Some(pool.clone()))
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/worker-registration-requests/{registration_id}/claim"
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "signature": signature }).to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.status(), StatusCode::CREATED);
+    let body = response_json(claimed).await;
+    assert_eq!(body["state"], "idle");
+    let worker_credential = body["worker_credential"].as_str().unwrap().to_owned();
+    assert!(worker_credential.starts_with("kwc_"));
+
+    let retried = app(None, Some(pool.clone()))
+        .oneshot(
+            Request::post(format!(
+                "/api/v1/worker-registration-requests/{registration_id}/claim"
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "signature": signature }).to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.status(), StatusCode::OK);
+    let retried_body = response_json(retried).await;
+    assert_eq!(retried_body["worker_credential"], worker_credential);
+
+    let status: String = sqlx::query_scalar(
+        "SELECT w.status FROM workers w JOIN worker_registration_requests r \
+         ON r.worker_id = w.id WHERE r.id = $1",
+    )
+    .bind(registration_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "idle");
 }

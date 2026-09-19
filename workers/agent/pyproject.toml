@@ -5,6 +5,7 @@ description = "Kratos GPU worker agent"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=50,<51",
     "docker>=7.1,<8",
     "httpx>=0.28,<1",
     "pydantic>=2.11,<3",

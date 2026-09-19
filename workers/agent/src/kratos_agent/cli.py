@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import socket
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ def _parser() -> argparse.ArgumentParser:
     health.add_argument("--gpu-index", type=int, default=0)
     run = commands.add_parser("run", help="enrol if needed and send periodic heartbeats")
     run.add_argument("--control-plane", default="https://kratos.bryars.com")
-    run.add_argument("--display-name", required=True)
+    run.add_argument("--display-name", default=socket.gethostname())
     run.add_argument("--state-file", type=Path, default=Path("/var/lib/kratos-agent/state.json"))
     run.add_argument("--enrolment-credential-file", type=Path)
     return parser

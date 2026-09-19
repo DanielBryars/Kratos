@@ -9,14 +9,24 @@ import httpx
 from pydantic import ValidationError
 
 from kratos_agent.models import (
+    ClaimRegistrationRequest,
     EnrolmentRequest,
     EnrolmentResponse,
     HeartbeatRequest,
     HeartbeatResponse,
+    RegistrationCreatedResponse,
+    RegistrationRequest,
+    RegistrationStatusResponse,
     WorkerCapabilities,
 )
 
-ResponseModel = TypeVar("ResponseModel", EnrolmentResponse, HeartbeatResponse)
+ResponseModel = TypeVar(
+    "ResponseModel",
+    EnrolmentResponse,
+    HeartbeatResponse,
+    RegistrationCreatedResponse,
+    RegistrationStatusResponse,
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,38 @@ class WorkerProtocolClient:
         response = self._client.post(
             "/api/v1/worker-enrolments",
             headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, EnrolmentResponse)
+
+    def request_registration(
+        self,
+        agent_instance_id: UUID,
+        display_name: str,
+        public_key: str,
+        capabilities: WorkerCapabilities,
+    ) -> RegistrationCreatedResponse:
+        request = RegistrationRequest(
+            protocol_version=capabilities.protocol_version,
+            agent_instance_id=agent_instance_id,
+            display_name=display_name,
+            public_key=public_key,
+            capabilities=capabilities,
+        )
+        response = self._client.post(
+            "/api/v1/worker-registration-requests",
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, RegistrationCreatedResponse)
+
+    def registration_status(self, registration_id: UUID) -> RegistrationStatusResponse:
+        response = self._client.get(f"/api/v1/worker-registration-requests/{registration_id}")
+        return self._parse(response, RegistrationStatusResponse)
+
+    def claim_registration(self, registration_id: UUID, signature: str) -> EnrolmentResponse:
+        request = ClaimRegistrationRequest(signature=signature)
+        response = self._client.post(
+            f"/api/v1/worker-registration-requests/{registration_id}/claim",
             json=request.model_dump(mode="json"),
         )
         return self._parse(response, EnrolmentResponse)

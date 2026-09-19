@@ -68,6 +68,22 @@ pub fn issue(kind: CredentialKind) -> Result<IssuedCredential, CredentialError> 
     let id = Uuid::new_v4();
     let mut secret = [0_u8; SECRET_BYTES];
     OsRng.fill_bytes(&mut secret);
+    from_secret(kind, id, &secret)
+}
+
+/// Creates a reproducible credential from high-entropy secret material.
+///
+/// This is used for replay-safe device-key claims. Callers must derive `secret` from an
+/// authenticated cryptographic operation and must never log it.
+///
+/// # Errors
+///
+/// Returns [`CredentialError::Hash`] if the verifier cannot be produced.
+pub fn from_secret(
+    kind: CredentialKind,
+    id: Uuid,
+    secret: &[u8; SECRET_BYTES],
+) -> Result<IssuedCredential, CredentialError> {
     let encoded = URL_SAFE_NO_PAD.encode(secret);
     let plaintext = PlaintextCredential(format!("{}_{}_{}", kind.prefix(), id.simple(), encoded));
     let salt = SaltString::generate(&mut SaltOsRng);

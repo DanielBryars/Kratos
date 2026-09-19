@@ -23,10 +23,15 @@ mod operator;
 mod registry;
 
 use human_auth::{ClientAuthConfig, HumanAuth};
-use operator::{CreateEnrolmentRequest, CreateEnrolmentResponse};
+use operator::{
+    CreateEnrolmentRequest, CreateEnrolmentResponse, PendingRegistrationResponse,
+    RegistrationDecisionResponse,
+};
 use registry::{
-    EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability, GpuHealth, GpuHealthStatus,
-    HeartbeatRequest, HeartbeatResponse, VerificationGate, WorkerCapabilities, WorkerState,
+    ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
+    GpuHealth, GpuHealthStatus, HeartbeatRequest, HeartbeatResponse, RegistrationCreatedResponse,
+    RegistrationRequest, RegistrationState, RegistrationStatusResponse, VerificationGate,
+    WorkerCapabilities, WorkerState,
 };
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -61,14 +66,22 @@ pub(crate) struct AppState {
         version,
         auth_config,
         operator::create_worker_enrolment,
+        operator::list_worker_registration_requests,
+        operator::approve_worker_registration,
+        operator::reject_worker_registration,
         registry::enrol_worker,
+        registry::request_registration,
+        registry::registration_status,
+        registry::claim_registration,
         registry::heartbeat
     ),
     components(schemas(
         HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
         EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
         WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState,
-        CreateEnrolmentRequest, CreateEnrolmentResponse
+        CreateEnrolmentRequest, CreateEnrolmentResponse, RegistrationRequest,
+        RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
+        ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -214,7 +227,31 @@ pub fn app_with_human_auth(
             "/api/v1/operator/worker-enrolments",
             post(operator::create_worker_enrolment),
         )
+        .route(
+            "/api/v1/operator/worker-registration-requests",
+            get(operator::list_worker_registration_requests),
+        )
+        .route(
+            "/api/v1/operator/worker-registration-requests/{registration_id}/approve",
+            post(operator::approve_worker_registration),
+        )
+        .route(
+            "/api/v1/operator/worker-registration-requests/{registration_id}/reject",
+            post(operator::reject_worker_registration),
+        )
         .route("/api/v1/worker-enrolments", post(registry::enrol_worker))
+        .route(
+            "/api/v1/worker-registration-requests",
+            post(registry::request_registration),
+        )
+        .route(
+            "/api/v1/worker-registration-requests/{registration_id}",
+            get(registry::registration_status),
+        )
+        .route(
+            "/api/v1/worker-registration-requests/{registration_id}/claim",
+            post(registry::claim_registration),
+        )
         .route(
             "/api/v1/workers/{worker_id}/heartbeat",
             put(registry::heartbeat),

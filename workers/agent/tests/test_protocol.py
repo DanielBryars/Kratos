@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import stat
@@ -7,13 +8,15 @@ from uuid import UUID
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from kratos_agent.models import GpuHealth, GpuHealthStatus, WorkerCapabilities
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
-from kratos_agent.runner import AgentRunner
+from kratos_agent.runner import AgentRunner, _confirmation_code
 from kratos_agent.state import AgentState, load_state, save_state
 
 WORKER_ID = UUID("11111111-1111-4111-8111-111111111111")
+REGISTRATION_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 
 def capabilities() -> WorkerCapabilities:
@@ -107,6 +110,69 @@ def test_structured_error_does_not_include_supplied_credential() -> None:
         client.enrol(supplied, UUID(int=1), "GPU host", capabilities())
 
     assert supplied not in str(raised.value)
+
+
+def test_radio_in_registration_proves_key_possession(tmp_path: Path) -> None:
+    challenge = bytes(range(32))
+    challenge_encoded = base64.urlsafe_b64encode(challenge).rstrip(b"=").decode()
+    worker_secret = "kwc_identifier_scoped-secret"
+    public_key: bytes | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal public_key
+        if request.url.path == "/api/v1/worker-registration-requests":
+            payload = json.loads(request.content)
+            public_key = base64.urlsafe_b64decode(payload["public_key"] + "=")
+            return httpx.Response(
+                201,
+                json={
+                    "registration_id": str(REGISTRATION_ID),
+                    "confirmation_code": _confirmation_code(public_key),
+                    "expires_at": "2026-09-19T13:00:00Z",
+                    "poll_interval_seconds": 1,
+                },
+            )
+        if request.url.path.endswith("/claim"):
+            assert public_key is not None
+            signature = json.loads(request.content)["signature"]
+            signature_bytes = base64.urlsafe_b64decode(signature + "==")
+            message = (f"kratos-worker-claim-v1\n{REGISTRATION_ID}\n{challenge_encoded}").encode()
+            Ed25519PublicKey.from_public_bytes(public_key).verify(signature_bytes, message)
+            return httpx.Response(
+                201,
+                json={
+                    "worker_id": str(WORKER_ID),
+                    "worker_credential": worker_secret,
+                    "state": "idle",
+                    "heartbeat_interval_seconds": 30,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "registration_id": str(REGISTRATION_ID),
+                "state": "approved",
+                "claim_challenge": challenge_encoded,
+                "poll_interval_seconds": 1,
+            },
+        )
+
+    state_path = tmp_path / "agent.json"
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        enrolled = AgentRunner(
+            client,
+            "Rented GPU",
+            state_path,
+            None,
+            capability_collector=capabilities,
+        ).ensure_enrolled()
+
+    assert enrolled.worker_id == WORKER_ID
+    assert enrolled.worker_credential == worker_secret
+    assert enrolled.private_key is not None
+    assert enrolled.private_key not in repr(enrolled)
 
 
 def test_state_is_written_atomically_and_credential_repr_is_redacted(tmp_path: Path) -> None:

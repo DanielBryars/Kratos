@@ -5,6 +5,7 @@ FROM nvidia/cuda:12.8.1-base-ubuntu24.04@sha256:133c78a0575303be34164d0b90137a04
 COPY --from=uv /uv /uvx /bin/
 
 RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
         ca-certificates \
         python3.12 \
@@ -15,10 +16,12 @@ RUN apt-get update \
 WORKDIR /app
 COPY workers/agent/pyproject.toml workers/agent/uv.lock workers/agent/README.md ./
 COPY workers/agent/src ./src
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --no-dev \
+    && rm -f /bin/uv /bin/uvx \
+    && rm -rf /root/.cache/uv
 
 ENV PATH="/app/.venv/bin:${PATH}"
 USER kratos
 
 ENTRYPOINT ["kratos-agent"]
-CMD ["inspect"]
+CMD ["run"]
