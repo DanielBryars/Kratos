@@ -24,6 +24,8 @@
 | GPU memory reported by `nvidia-smi` | 34,190,917,632 bytes |
 | NVIDIA driver | `610.88` |
 | Health image local identity | `sha256:bac3c52d80e3a7d4ab12b13d74c747349f1a5cc49567887aa2f38bb810bab1a8` |
+| Published health image | `ghcr.io/danielbryars/kratos-gpu-health-check@sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9` |
+| Deployed agent image | `ghcr.io/danielbryars/kratos-agent@sha256:33ac7674395978a0c85638e8373ad6ac21b5d705a2211fd6a82f10d582b54c68` |
 | Python | `3.12.3` |
 | CuPy | `13.6.0` |
 
@@ -82,10 +84,15 @@ supplementary group. It launched the immutable local image identity through the 
 The agent received and validated healthy structured evidence for the RTX 5090, then removed the
 health-check container. No managed health-check container remained after collection.
 
+The published images passed their CI vulnerability gates and were anonymously pullable from GHCR.
+After the compatible control plane was deployed, the installed agent was upgraded in place while
+retaining worker identity `f6681ff0-c6f8-4e1f-b61c-55ec6779900f` and agent instance identity
+`e10cb854-7aaf-4dd4-8fff-2dabbefd6b45`. Its next signed capability heartbeat reported the cached
+startup check as healthy. On 2026-09-19, the live fleet UI displayed `GPU computation passed on
+NVIDIA GeForce RTX 5090 in 276.578 ms` while the worker was online, idle and assigned to `Home`.
+
 ## Remaining work
 
-- Publish the health image by immutable registry digest and record the deployed digest.
-- Enable that digest on the installed agent and confirm the structured evidence reaches the fleet UI.
 - Repeat the same evidence on `local-gpu-02`.
 
 Agent-to-control-plane registration and live capability reporting are now complete for this worker.
