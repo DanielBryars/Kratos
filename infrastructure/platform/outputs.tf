@@ -8,6 +8,11 @@ output "runtime_service_account" {
   value       = google_service_account.control_plane.email
 }
 
+output "migration_service_account" {
+  description = "Cloud Run identity used only by the schema migration job."
+  value       = google_service_account.database_migration.email
+}
+
 output "database_enabled" {
   description = "Whether this platform state manages a billable Cloud SQL instance."
   value       = var.enable_database
@@ -21,4 +26,9 @@ output "database_connection_name" {
 output "database_iam_username" {
   description = "Passwordless PostgreSQL IAM username, or null while the cost gate is disabled."
   value       = var.enable_database ? google_sql_user.control_plane[0].name : null
+}
+
+output "migration_database_iam_username" {
+  description = "Passwordless PostgreSQL migration username, or null while the cost gate is disabled."
+  value       = var.enable_database ? google_sql_user.database_migration[0].name : null
 }

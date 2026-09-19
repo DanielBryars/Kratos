@@ -44,6 +44,14 @@ resource "google_service_account" "control_plane" {
   depends_on = [google_project_service.platform]
 }
 
+resource "google_service_account" "database_migration" {
+  project      = var.project_id
+  account_id   = "kratos-db-migration"
+  display_name = "Kratos database migration"
+
+  depends_on = [google_project_service.platform]
+}
+
 resource "google_sql_database_instance" "kratos" {
   count = var.enable_database ? 1 : 0
 
@@ -95,6 +103,16 @@ resource "google_sql_user" "control_plane" {
   type     = "CLOUD_IAM_SERVICE_ACCOUNT"
 }
 
+resource "google_sql_user" "database_migration" {
+  count = var.enable_database ? 1 : 0
+
+  project        = var.project_id
+  name           = trimsuffix(google_service_account.database_migration.email, ".gserviceaccount.com")
+  instance       = google_sql_database_instance.kratos[0].name
+  type           = "CLOUD_IAM_SERVICE_ACCOUNT"
+  database_roles = ["cloudsqlsuperuser"]
+}
+
 resource "google_project_iam_member" "control_plane_cloud_sql_client" {
   count = var.enable_database ? 1 : 0
 
@@ -109,4 +127,20 @@ resource "google_project_iam_member" "control_plane_cloud_sql_user" {
   project = var.project_id
   role    = "roles/cloudsql.instanceUser"
   member  = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+resource "google_project_iam_member" "database_migration_cloud_sql_client" {
+  count = var.enable_database ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.database_migration.email}"
+}
+
+resource "google_project_iam_member" "database_migration_cloud_sql_user" {
+  count = var.enable_database ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/cloudsql.instanceUser"
+  member  = "serviceAccount:${google_service_account.database_migration.email}"
 }

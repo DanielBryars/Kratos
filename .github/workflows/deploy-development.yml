@@ -74,14 +74,41 @@ jobs:
         run: |
           database_enabled="$(terraform output -raw database_enabled)"
           echo "runtime_service_account=$(terraform output -raw runtime_service_account)" >> "$GITHUB_OUTPUT"
+          echo "migration_service_account=$(terraform output -raw migration_service_account)" >> "$GITHUB_OUTPUT"
           echo "database_enabled=$database_enabled" >> "$GITHUB_OUTPUT"
           if [[ "$database_enabled" == "true" ]]; then
             echo "database_connection_name=$(terraform output -raw database_connection_name)" >> "$GITHUB_OUTPUT"
             echo "database_iam_username=$(terraform output -raw database_iam_username)" >> "$GITHUB_OUTPUT"
+            echo "migration_database_iam_username=$(terraform output -raw migration_database_iam_username)" >> "$GITHUB_OUTPUT"
           else
             echo "database_connection_name=" >> "$GITHUB_OUTPUT"
             echo "database_iam_username=" >> "$GITHUB_OUTPUT"
+            echo "migration_database_iam_username=" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Apply database migration job
+        working-directory: infrastructure/migration
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.GCP_TERRAFORM_STATE_BUCKET }}" \
+            -backend-config="prefix=development/migration"
+          terraform apply -auto-approve \
+            -var="project_id=${{ vars.GCP_DEVELOPMENT_PROJECT_ID }}" \
+            -var="region=${{ vars.GCP_REGION }}" \
+            -var="database_enabled=${{ steps.platform.outputs.database_enabled }}" \
+            -var="container_image=${{ steps.image.outputs.reference }}" \
+            -var="migration_service_account=${{ steps.platform.outputs.migration_service_account }}" \
+            -var="database_connection_name=${{ steps.platform.outputs.database_connection_name }}" \
+            -var="migration_database_iam_username=${{ steps.platform.outputs.migration_database_iam_username }}" \
+            -var="application_database_iam_username=${{ steps.platform.outputs.database_iam_username }}"
+
+      - name: Run database migrations
+        if: ${{ steps.platform.outputs.database_enabled == 'true' }}
+        run: >-
+          gcloud run jobs execute kratos-database-migration
+          --project=${{ vars.GCP_DEVELOPMENT_PROJECT_ID }}
+          --region=${{ vars.GCP_REGION }}
+          --wait
 
       - name: Apply application infrastructure
         working-directory: infrastructure/application

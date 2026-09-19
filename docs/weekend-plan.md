@@ -57,7 +57,8 @@ mounted one-time credential file and send periodic heartbeats.
 
 The remaining critical path is:
 
-1. Enable the development database and run its migrations.
+1. Enable the development database cost gate; the implemented deployment job will run migrations
+   before updating the service.
 2. Configure Identity Platform and deploy the implemented operator path that creates one-time
    enrolment credentials.
 3. Publish and install the agent on both GPU machines.
