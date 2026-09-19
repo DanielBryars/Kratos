@@ -23,3 +23,21 @@ Build and run the Linux GPU container from the repository root:
 docker build --file workers/agent/Dockerfile --tag kratos-agent .
 docker run --rm --gpus all kratos-agent inspect
 ```
+
+The trusted agent can invoke the controlled health image as a constrained sibling through the Docker
+Engine socket. Use an immutable registry digest or local image ID:
+
+```shell
+docker run --rm \
+  --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+  --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
+  kratos-agent health-check --image sha256:<64-hex-character-image-id>
+```
+
+Docker Desktop currently presents the socket as group `0`; a PowerShell launch can therefore use
+`--group-add 0`. Native Linux installation must use the actual socket group rather than assuming a
+fixed identifier.
+
+The executor disables networking, uses a read-only root filesystem, drops Linux capabilities,
+applies CPU, memory and process limits, assigns only the requested GPU and always removes the health
+container after collecting its bounded JSON result.

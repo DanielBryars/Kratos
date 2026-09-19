@@ -66,9 +66,24 @@ Expected: non-zero exit and a structured unhealthy result; no CPU fallback.
 Observed: exit one with `status=unhealthy`, `error_type=CUDARuntimeError` and a CUDA driver/runtime
 availability error. No result was reported as healthy.
 
+## Agent executor case
+
+The non-root agent container was given the Docker socket and its actual socket group as a
+supplementary group. It launched the immutable local image identity through the Docker API with:
+
+- networking disabled;
+- a read-only root filesystem;
+- all Linux capabilities dropped;
+- `no-new-privileges`;
+- one CPU, 1 GiB memory and 128-process limits;
+- bounded temporary filesystems; and
+- only GPU device zero assigned.
+
+The agent received and validated healthy structured evidence for the RTX 5090, then removed the
+health-check container. No managed health-check container remained after collection.
+
 ## Remaining work
 
 - Publish the health image by immutable registry digest.
-- Make the agent invoke that digest through its executor interface.
 - Attach the structured result and image digest to the capability heartbeat.
 - Repeat the same evidence on `local-gpu-02`.
