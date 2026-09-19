@@ -32,6 +32,11 @@ impl PlaintextCredential {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
 }
 
 impl fmt::Debug for PlaintextCredential {

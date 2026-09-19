@@ -30,7 +30,7 @@ Hardware detection SHALL NOT be treated as a successful computation check. Detec
 
 ## Enrolment exchange
 
-`POST /api/v1/worker-enrolments` will accept a single-use bootstrap credential in the
+`POST /api/v1/worker-enrolments` SHALL accept a single-use bootstrap credential in the
 `Authorization` header and a request containing:
 
 - `protocol_version`;
@@ -50,6 +50,11 @@ file readable by the agent service identity and SHALL authorise operations for t
 Server-side storage SHALL retain a verifier rather than the credential value. Revocation SHALL make
 subsequent authenticated requests fail.
 
+The endpoint SHALL return `503 persistence_unavailable` when the worker registry is not configured.
+Authentication failures SHALL use one generic `401 unauthorized` response and SHALL NOT reveal
+whether a credential identifier exists, has expired or has been revoked. A correctly authenticated
+credential which has already been consumed SHALL return `409 enrolment_consumed`.
+
 Credential strings are opaque to agents. The current envelope carries a type prefix and random
 lookup identifier followed by 256 bits of random secret material. The prefix and identifier are not
 proof of authority. The control plane SHALL authenticate the complete value against its Argon2id
@@ -57,7 +62,7 @@ verifier and SHALL perform rate limiting before expensive verification work.
 
 ## Heartbeat
 
-`PUT /api/v1/workers/{worker_id}/heartbeat` will authenticate the worker and accept:
+`PUT /api/v1/workers/{worker_id}/heartbeat` SHALL authenticate the worker and accept:
 
 - `protocol_version`;
 - a monotonically increasing sequence number;

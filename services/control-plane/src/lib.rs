@@ -1,14 +1,28 @@
 use std::path::PathBuf;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post, put},
+};
 use serde::Serialize;
 use sqlx::PgPool;
 use tower_http::services::{ServeDir, ServeFile};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{
+    Modify, OpenApi, ToSchema,
+    openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
+};
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod credentials;
 pub mod database;
+mod registry;
+
+use registry::{
+    EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability, GpuHealth, GpuHealthStatus,
+    HeartbeatRequest, HeartbeatResponse, VerificationGate, WorkerCapabilities, WorkerState,
+};
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct HealthResponse {
@@ -28,17 +42,44 @@ pub struct ReadinessResponse {
 }
 
 #[derive(Clone)]
-struct AppState {
-    database: Option<PgPool>,
+pub(crate) struct AppState {
+    pub(crate) database: Option<PgPool>,
+    pub(crate) verification_gate: VerificationGate,
 }
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, readiness, version),
-    components(schemas(HealthResponse, ReadinessResponse, VersionResponse)),
-    tags((name = "system", description = "Control-plane status"))
+    paths(health, readiness, version, registry::enrol_worker, registry::heartbeat),
+    components(schemas(
+        HealthResponse, ReadinessResponse, VersionResponse, EnrolmentRequest,
+        EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
+        WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState
+    )),
+    tags(
+        (name = "system", description = "Control-plane status"),
+        (name = "workers", description = "Worker enrolment and liveness")
+    ),
+    modifiers(&SecurityAddon)
 )]
 struct ApiDoc;
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearer_credential",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("Kratos opaque credential")
+                        .build(),
+                ),
+            );
+        }
+    }
+}
 
 #[utoipa::path(
     get,
@@ -109,8 +150,16 @@ pub fn app(web_root: Option<PathBuf>, database: Option<PgPool>) -> Router {
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/api/v1/version", get(version))
+        .route("/api/v1/worker-enrolments", post(registry::enrol_worker))
+        .route(
+            "/api/v1/workers/{worker_id}/heartbeat",
+            put(registry::heartbeat),
+        )
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .with_state(AppState { database });
+        .with_state(AppState {
+            database,
+            verification_gate: VerificationGate::default(),
+        });
 
     if let Some(root) = web_root {
         let index = root.join("index.html");
@@ -159,5 +208,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn worker_routes_fail_closed_when_persistence_is_disabled() {
+        let response = app(None, None)
+            .oneshot(
+                Request::post("/api/v1/worker-enrolments")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 503);
     }
 }
