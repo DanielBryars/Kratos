@@ -1,10 +1,13 @@
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
+import docker
 import pytest
 
 from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import GpuHealthStatus
+from kratos_agent.models import GpuHealthStatus, JobAssignment
 
 IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -116,3 +119,66 @@ def test_invalid_output_is_rejected_and_container_removed() -> None:
         DockerExecutor(FakeClient(container)).run_gpu_health_check(IMAGE_ID)
 
     assert container.removed is True
+
+
+class JobContainer:
+    def wait(self, timeout: int) -> dict[str, int]:
+        assert timeout == 120
+        return {"StatusCode": 0}
+
+    def logs(self, *, stdout: bool, stderr: bool) -> bytes:
+        return b"completed\n" if stdout else b""
+
+
+class JobContainers:
+    def __init__(self) -> None:
+        self.container = JobContainer()
+        self.options: dict[str, Any] | None = None
+
+    def get(self, _: str) -> JobContainer:
+        raise docker.errors.NotFound("missing")
+
+    def run(self, _: str, **options: Any) -> JobContainer:
+        self.options = options
+        return self.container
+
+
+class JobImages:
+    def __init__(self) -> None:
+        self.pulled: list[str] = []
+
+    def pull(self, image: str) -> None:
+        self.pulled.append(image)
+
+
+class JobClient:
+    def __init__(self) -> None:
+        self.containers = JobContainers()
+        self.images = JobImages()
+
+
+def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
+    image = "example.test/work@sha256:" + ("b" * 64)
+    assignment = JobAssignment(
+        attempt_id=UUID("11111111-1111-4111-8111-111111111111"),
+        job_id=UUID("22222222-2222-4222-8222-222222222222"),
+        name="Matrix check",
+        image_reference=image,
+        gpu_index=0,
+        timeout_seconds=120,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    client = JobClient()
+
+    result = DockerExecutor(client).run_job(assignment)
+
+    assert result.exit_code == 0
+    assert result.stdout == "completed\n"
+    assert client.images.pulled == [image]
+    options = client.containers.options
+    assert options is not None
+    assert options["network_disabled"] is True
+    assert options["read_only"] is True
+    assert options["cap_drop"] == ["ALL"]
+    assert options["device_requests"][0].device_ids == ["0"]
+    assert options["labels"]["com.kratos.role"] == "job"

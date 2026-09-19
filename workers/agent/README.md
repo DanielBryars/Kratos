@@ -124,3 +124,15 @@ container after collecting its bounded JSON result.
 GitHub Actions publishes `edge`, `sha-<commit>` and `agent-v*` release tags with provenance and an
 SBOM. After the first publication, the repository owner must set the GHCR package visibility to
 public once; image contents and subsequent publishing remain automated.
+
+## Scheduled work
+
+An enrolled agent polls for at most one assignment in each signed heartbeat. Assigned images MUST be
+immutable digest references. The agent runs them as named sibling containers with one selected GPU,
+no network, a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, and bounded
+CPU, memory, process count and runtime.
+
+The stopped container remains present until the control plane acknowledges its bounded stdout,
+stderr and exit status. This lets a restarted agent report the same attempt instead of knowingly
+starting it twice. The agent removes the container after acknowledgement. The Docker socket therefore
+remains an explicit host-administrative trust boundary.

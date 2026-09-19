@@ -39,7 +39,25 @@ type Worker = {
   capabilities: PendingRegistration["capabilities"];
   compute_groups: Array<{ id: string; name: string }>;
 };
+type Job = {
+  job_id: string;
+  name: string;
+  image_reference: string;
+  gpu_count: number;
+  timeout_seconds: number;
+  status: "queued" | "assigned" | "running" | "succeeded" | "failed" | "cancelled";
+  assigned_worker_id: string | null;
+  submitted_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  failure_message: string | null;
+};
 type ApiError = { message?: string };
+
+const DEMO_WORKLOAD_IMAGE = "ghcr.io/danielbryars/kratos-gpu-health-check@sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9";
 
 function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
@@ -61,6 +79,11 @@ export function App() {
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
   const [workerActionId, setWorkerActionId] = useState<string | null>(null);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobName, setJobName] = useState("RTX 5090 matrix check");
+  const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
+  const [jobTimeout, setJobTimeout] = useState(120);
+  const [jobAction, setJobAction] = useState(false);
 
   useEffect(() => {
     fetch("/api/v1/version")
@@ -79,19 +102,22 @@ export function App() {
     if (!user) {
       setPending([]);
       setWorkers([]);
+      setJobs([]);
       return;
     }
     let cancelled = false;
     async function refresh() {
       const idToken = await user!.getIdToken();
       const headers = { Authorization: `Bearer ${idToken}` };
-      const [pendingResponse, workersResponse] = await Promise.all([
+      const [pendingResponse, workersResponse, jobsResponse] = await Promise.all([
         fetch("/api/v1/operator/worker-registration-requests", { headers }),
         fetch("/api/v1/operator/workers", { headers }),
+        fetch("/api/v1/operator/jobs", { headers }),
       ]);
       if (!cancelled) {
         if (pendingResponse.ok) setPending((await pendingResponse.json()) as PendingRegistration[]);
         if (workersResponse.ok) setWorkers((await workersResponse.json()) as Worker[]);
+        if (jobsResponse.ok) setJobs((await jobsResponse.json()) as Job[]);
       }
     }
     void refresh();
@@ -224,6 +250,53 @@ export function App() {
     }
   }
 
+  async function submitJob() {
+    if (!user) return;
+    setJobAction(true);
+    setMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/v1/operator/jobs", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ name: jobName, image_reference: jobImage, timeout_seconds: jobTimeout }),
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      const created = (await response.json()) as Job;
+      setJobs((current) => [created, ...current]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The job could not be queued.");
+    } finally {
+      setJobAction(false);
+    }
+  }
+
+  async function cancelJob(jobId: string) {
+    if (!user) return;
+    setJobAction(true);
+    setMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(`/api/v1/operator/jobs/${jobId}/cancel`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      const cancelled = (await response.json()) as Job;
+      setJobs((current) => current.map((job) => job.job_id === jobId ? cancelled : job));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The job could not be cancelled.");
+    } finally {
+      setJobAction(false);
+    }
+  }
+
   return (
     <main>
       <header>
@@ -282,6 +355,30 @@ export function App() {
                           <button className="button-danger" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "revoke")}>Revoke</button>
                         </div>
                       )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="registration-section">
+                <div><p className="label">Work queue</p><h3>Schedule GPU work</h3></div>
+                <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
+                <div className="job-form">
+                  <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /></label>
+                  <label>Immutable image<input value={jobImage} onChange={(event) => setJobImage(event.target.value)} /></label>
+                  <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
+                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim()} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                </div>
+                {jobs.length === 0 && <p className="muted compact">No jobs have been submitted.</p>}
+                <div className="job-list">
+                  {jobs.map((job) => (
+                    <div className="job" key={job.job_id}>
+                      <div className="job-heading"><div><strong>{job.name}</strong><p>{new Date(job.submitted_at).toLocaleString()}</p></div><span className={`badge badge--job-${job.status}`}>{job.status}</span></div>
+                      <p className="job-image">{job.image_reference}</p>
+                      <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
+                      {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
+                      {job.stdout && <pre>{job.stdout}</pre>}
+                      {job.stderr && <pre className="job-failure">{job.stderr}</pre>}
+                      {job.status === "queued" && <button className="button-secondary" type="button" disabled={jobAction} onClick={() => void cancelJob(job.job_id)}>Cancel queued job</button>}
                     </div>
                   ))}
                 </div>

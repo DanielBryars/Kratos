@@ -150,3 +150,21 @@ state changes. Revocation SHALL also revoke every active credential for the work
 An agent MAY report network observations, but it cannot grant itself membership of a compute group.
 Group membership is a separate administrator-approved control-plane record. R0.1 will show the home
 group's peer connectivity as unverified until the container-to-container test is delivered in R0.6.
+
+## R0.2 job assignment extension
+
+An eligible heartbeat response MAY include one `assignment`. The assignment SHALL identify the job
+and attempt, an immutable image reference, one GPU index, a bounded runtime and an absolute lease
+deadline. Only an approved `idle` worker whose current report contains a verified healthy GPU SHALL
+receive new work.
+
+The agent SHALL persist the accepted heartbeat sequence before starting the assignment. It SHALL
+execute at most one active assignment and SHALL reject an assignment whose lease has already expired.
+If a heartbeat or result acknowledgement is lost, the control plane SHALL return the same attempt;
+the agent SHALL inspect its stable attempt-named container and SHALL NOT knowingly start a duplicate.
+
+The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
+`PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be
+idempotent. The control plane SHALL release the worker only after it has durably recorded a terminal
+job and attempt state. Output fields SHALL be limited to 64 KiB each and SHALL NOT contain granted
+secrets because this initial slice grants none.

@@ -144,8 +144,33 @@ class HeartbeatRequest(StrictModel):
     capabilities: WorkerCapabilities
 
 
+class JobAssignment(StrictModel):
+    attempt_id: UUID
+    job_id: UUID
+    name: str = Field(min_length=1, max_length=120)
+    image_reference: str = Field(pattern=r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+    gpu_index: int = Field(ge=0)
+    timeout_seconds: int = Field(ge=30, le=3600)
+    lease_expires_at: datetime
+
+
 class HeartbeatResponse(StrictModel):
     worker_id: UUID
     state: str
     accepted_sequence: int = Field(ge=0)
     next_heartbeat_seconds: int = Field(gt=0)
+    assignment: JobAssignment | None = None
+
+
+class JobExecutionResult(StrictModel):
+    exit_code: int
+    timed_out: bool
+    stdout: str = Field(max_length=65_536)
+    stderr: str = Field(max_length=65_536)
+    failure_message: str | None = Field(default=None, max_length=1_000)
+
+
+class JobResultResponse(StrictModel):
+    attempt_id: UUID
+    job_id: UUID
+    status: str

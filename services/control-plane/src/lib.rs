@@ -24,15 +24,16 @@ mod registry;
 
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
-    ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, OperatorWorkerResponse,
-    PendingRegistrationResponse, RegistrationDecisionResponse, WorkerActionResponse,
-    WorkerConnectivity, WorkerGroupResponse,
+    ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, CreateJobRequest,
+    OperatorJobResponse, OperatorWorkerResponse, PendingRegistrationResponse,
+    RegistrationDecisionResponse, WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
     GpuHealth, GpuHealthEvidence, GpuHealthStatus, HeartbeatRequest, HeartbeatResponse,
-    RegistrationCreatedResponse, RegistrationRequest, RegistrationState,
-    RegistrationStatusResponse, VerificationGate, WorkerCapabilities, WorkerState,
+    JobAssignment, JobResultRequest, JobResultResponse, RegistrationCreatedResponse,
+    RegistrationRequest, RegistrationState, RegistrationStatusResponse, VerificationGate,
+    WorkerCapabilities, WorkerState,
 };
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -74,11 +75,15 @@ pub(crate) struct AppState {
         operator::approve_worker,
         operator::quarantine_worker,
         operator::revoke_worker,
+        operator::create_job,
+        operator::list_jobs,
+        operator::cancel_job,
         registry::enrol_worker,
         registry::request_registration,
         registry::registration_status,
         registry::claim_registration,
-        registry::heartbeat
+        registry::heartbeat,
+        registry::report_job_result
     ),
     components(schemas(
         HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
@@ -88,7 +93,8 @@ pub(crate) struct AppState {
         RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
         ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,
         ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
-        WorkerGroupResponse
+        WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, JobAssignment,
+        JobResultRequest, JobResultResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -248,6 +254,14 @@ pub fn app_with_human_auth(
         )
         .route("/api/v1/operator/workers", get(operator::list_workers))
         .route(
+            "/api/v1/operator/jobs",
+            get(operator::list_jobs).post(operator::create_job),
+        )
+        .route(
+            "/api/v1/operator/jobs/{job_id}/cancel",
+            post(operator::cancel_job),
+        )
+        .route(
             "/api/v1/operator/workers/{worker_id}/approve",
             post(operator::approve_worker),
         )
@@ -275,6 +289,10 @@ pub fn app_with_human_auth(
         .route(
             "/api/v1/workers/{worker_id}/heartbeat",
             put(registry::heartbeat),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result",
+            put(registry::report_job_result),
         )
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(AppState {

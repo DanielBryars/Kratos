@@ -61,6 +61,18 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .badge--offline { border-color: #713737; color: #ff8585; }
 .worker-controls { flex-wrap: wrap; padding-top: 4px; }
 .worker-controls input { min-width: 120px; flex: 1; min-height: 42px; border: 1px solid #334154; border-radius: 8px; padding: 0 12px; color: #eef4fa; background: #151f2c; }
+.job-form { display: grid; grid-template-columns: 1fr 2fr 0.8fr auto; gap: 12px; align-items: end; }
+.job-form label { display: grid; gap: 7px; color: #9babbc; font-size: 0.82rem; }
+.job-form input { width: 100%; min-height: 42px; border: 1px solid #334154; border-radius: 8px; padding: 0 12px; color: #eef4fa; background: #151f2c; }
+.job-list { display: grid; gap: 12px; }
+.job { display: grid; gap: 10px; padding: 18px; border: 1px solid #334154; border-radius: 10px; background: #111a26; color: #9babbc; font-size: 0.9rem; }
+.job-heading { display: flex; justify-content: space-between; gap: 16px; }
+.job strong { color: #eef4fa; }
+.job-image { overflow-wrap: anywhere; color: #8cc0ff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
+.job pre { overflow: auto; max-height: 220px; margin: 0; padding: 12px; border-radius: 8px; color: #bcd0e4; background: #0b1017; white-space: pre-wrap; }
+.job-failure, .badge--job-failed { color: #ff9e9e; }
+.badge--job-succeeded { border-color: #245d48; color: #66d19e; }
+.badge--job-assigned, .badge--job-running { border-color: #376791; color: #8cc0ff; }
 .operator-action { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .form-row { flex-wrap: wrap; gap: 12px; }
 .form-row label { color: #9babbc; }
@@ -87,4 +99,5 @@ select { color: #eef4fa; background: #151f2c; border-color: #334154; }
   .registration-actions { flex-direction: column; }
   .worker-heading { align-items: flex-start; flex-direction: column; }
   .form-row { align-items: stretch; flex-direction: column; }
+  .job-form { grid-template-columns: 1fr; }
 }

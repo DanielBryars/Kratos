@@ -14,6 +14,8 @@ from kratos_agent.models import (
     EnrolmentResponse,
     HeartbeatRequest,
     HeartbeatResponse,
+    JobExecutionResult,
+    JobResultResponse,
     RegistrationCreatedResponse,
     RegistrationRequest,
     RegistrationStatusResponse,
@@ -26,6 +28,7 @@ ResponseModel = TypeVar(
     HeartbeatResponse,
     RegistrationCreatedResponse,
     RegistrationStatusResponse,
+    JobResultResponse,
 )
 
 
@@ -131,6 +134,20 @@ class WorkerProtocolClient:
             json=request.model_dump(mode="json"),
         )
         return self._parse(response, HeartbeatResponse)
+
+    def report_job_result(
+        self,
+        worker_id: UUID,
+        credential: str,
+        attempt_id: UUID,
+        result: JobExecutionResult,
+    ) -> JobResultResponse:
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=result.model_dump(mode="json"),
+        )
+        return self._parse(response, JobResultResponse)
 
     @staticmethod
     def _parse(response: httpx.Response, model: type[ResponseModel]) -> ResponseModel:

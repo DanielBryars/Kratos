@@ -65,10 +65,9 @@ def main() -> int:
     elif args.command == "run":
         try:
             capability_collector = collect_capabilities
+            executor = DockerExecutor.from_environment()
             if args.health_check_image:
-                evidence = DockerExecutor.from_environment().run_gpu_health_check(
-                    image_reference=args.health_check_image
-                )
+                evidence = executor.run_gpu_health_check(image_reference=args.health_check_image)
                 health = _reported_health(evidence)
                 capability_collector = partial(collect_capabilities, gpu_health_override=health)
             with WorkerProtocolClient(args.control_plane) as client:
@@ -78,6 +77,7 @@ def main() -> int:
                     state_path=args.state_file,
                     enrolment_credential_path=args.enrolment_credential_file,
                     capability_collector=capability_collector,
+                    executor=executor,
                 ).run()
         except KeyboardInterrupt:
             return 0

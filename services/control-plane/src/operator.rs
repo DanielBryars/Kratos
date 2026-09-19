@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
@@ -95,6 +95,33 @@ pub struct WorkerActionResponse {
     pub state: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateJobRequest {
+    pub name: String,
+    /// Immutable OCI image reference selected and approved by the operator.
+    pub image_reference: String,
+    pub timeout_seconds: i32,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OperatorJobResponse {
+    pub job_id: Uuid,
+    pub name: String,
+    pub image_reference: String,
+    pub gpu_count: i32,
+    pub timeout_seconds: i32,
+    pub status: String,
+    pub assigned_worker_id: Option<Uuid>,
+    pub submitted_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub failure_message: Option<String>,
+}
+
 #[derive(FromRow)]
 struct PendingRegistrationRecord {
     id: Uuid,
@@ -122,6 +149,45 @@ struct IdentityRecord {
     id: Uuid,
     role: String,
     disabled_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow)]
+struct JobRecord {
+    id: Uuid,
+    name: String,
+    image_reference: String,
+    gpu_count: i32,
+    timeout_seconds: i32,
+    status: String,
+    assigned_worker_id: Option<Uuid>,
+    submitted_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    finished_at: Option<DateTime<Utc>>,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    failure_message: Option<String>,
+}
+
+impl From<JobRecord> for OperatorJobResponse {
+    fn from(record: JobRecord) -> Self {
+        Self {
+            job_id: record.id,
+            name: record.name,
+            image_reference: record.image_reference,
+            gpu_count: record.gpu_count,
+            timeout_seconds: record.timeout_seconds,
+            status: record.status,
+            assigned_worker_id: record.assigned_worker_id,
+            submitted_at: record.submitted_at,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+            exit_code: record.exit_code,
+            stdout: record.stdout,
+            stderr: record.stderr,
+            failure_message: record.failure_message,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -193,6 +259,14 @@ impl OperatorError {
             StatusCode::CONFLICT,
             "worker_state_conflict",
             "The worker cannot be changed from its current state.",
+        )
+    }
+
+    const fn job_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "job_state_conflict",
+            "Only a queued job can be cancelled.",
         )
     }
 
@@ -786,6 +860,139 @@ pub(crate) async fn revoke_worker(
     headers: HeaderMap,
 ) -> Result<Json<WorkerActionResponse>, OperatorError> {
     change_worker_state(state, headers, worker_id, "revoked").await
+}
+
+const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, status, assigned_worker_id, \
+     submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message";
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/jobs",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    request_body = CreateJobRequest,
+    responses(
+        (status = 201, description = "GPU job queued", body = OperatorJobResponse),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 422, description = "Job request is invalid", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn create_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateJobRequest>,
+) -> Result<(StatusCode, Json<OperatorJobResponse>), OperatorError> {
+    let operator_id = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let name = request.name.trim();
+    if name.is_empty()
+        || name.chars().count() > 120
+        || !(30..=3600).contains(&request.timeout_seconds)
+        || !crate::registry::immutable_sha256_reference(&request.image_reference)
+    {
+        return Err(OperatorError::invalid_request());
+    }
+    let id = Uuid::new_v4();
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let query = format!(
+        "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
+         VALUES ($1, $2, $3, $4, $5) RETURNING {JOB_COLUMNS}"
+    );
+    let record = sqlx::query_as::<_, JobRecord>(&query)
+        .bind(id)
+        .bind(operator_id)
+        .bind(name)
+        .bind(&request.image_reference)
+        .bind(request.timeout_seconds)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'job.queued', 'job', $3, 'succeeded', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(operator_id)
+    .bind(id)
+    .bind(json!({ "image_reference": request.image_reference, "timeout_seconds": request.timeout_seconds }))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok((StatusCode::CREATED, Json(record.into())))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/operator/jobs",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    responses((status = 200, description = "Jobs owned by the operator", body = [OperatorJobResponse]))
+)]
+pub(crate) async fn list_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<OperatorJobResponse>>, OperatorError> {
+    let operator_id = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let query = format!(
+        "SELECT {JOB_COLUMNS} FROM jobs WHERE owner_identity_id = $1 ORDER BY submitted_at DESC LIMIT 100"
+    );
+    let records = sqlx::query_as::<_, JobRecord>(&query)
+        .bind(operator_id)
+        .fetch_all(database)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(Json(records.into_iter().map(Into::into).collect()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/jobs/{job_id}/cancel",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("job_id" = Uuid, Path, description = "Job identifier")),
+    responses(
+        (status = 200, description = "Queued job cancelled", body = OperatorJobResponse),
+        (status = 409, description = "Job has already been assigned", body = ErrorResponse)
+    )
+)]
+pub(crate) async fn cancel_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<OperatorJobResponse>, OperatorError> {
+    let operator_id = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let query = format!(
+        "UPDATE jobs SET status = 'cancelled', finished_at = now() \
+         WHERE id = $1 AND owner_identity_id = $2 AND status = 'queued' RETURNING {JOB_COLUMNS}"
+    );
+    let record = sqlx::query_as::<_, JobRecord>(&query)
+        .bind(job_id)
+        .bind(operator_id)
+        .fetch_optional(database)
+        .await
+        .map_err(|_| OperatorError::internal())?
+        .ok_or_else(OperatorError::job_conflict)?;
+    Ok(Json(record.into()))
 }
 
 async fn authorize_operator(
