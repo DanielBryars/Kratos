@@ -11,10 +11,10 @@ GCP, Terraform, Rust/Axum for the control plane, and the VS Code dev-container w
 | Web interface | React/TypeScript SPA; server-rendered UI | React/TypeScript for the interactive fleet and experiment UI. | Separate frontend tooling versus a simpler server-rendered first release. |
 | Developer workflow — accepted | VS Code dev container; RustRover; native tools | VS Code with a Linux dev container; [ADR-005](decisions/005-developer-workflow.md). | Real GPU tests still require the host execution environment. |
 | Cloud runtime | Cloud Run service; Compute Engine VM; GKE | Cloud Run for the HTTP control plane. R0.1 does not need a continuously running scheduler. | VM offers process control with patching duties; Kubernetes adds cluster operations before a concrete need. |
-| Metadata | PostgreSQL; Firestore | PostgreSQL for relationships between users, workers, jobs and later ledger transactions. | Choose managed Cloud SQL versus a maintained VM only after a small cost and recovery comparison. |
+| Metadata — accepted | PostgreSQL; Firestore | Cloud SQL for PostgreSQL with automatic IAM database authentication; [ADR-011](decisions/011-metadata-and-human-identity.md). | Starts as a deliberately enabled, zonal development instance; scale and availability follow evidence. |
 | CI/CD | GitHub Actions; Cloud Build | GitHub Actions with GCP Workload Identity Federation for review-to-deployment traceability. | GCP-native build execution is an alternative; do not add two overlapping pipelines without a reason. |
 | Secrets | Secret Manager; self-managed Vault | Secret Manager for the control plane; scoped agent credentials rather than direct broad vault access. | Dynamic credential needs may later justify another component. |
-| Human identity | Managed OIDC provider; self-hosted identity service | Managed OIDC login with Kratos-owned role and project permissions. | Provider, user population and cost remain open; do not build password storage. |
+| Human identity — accepted | Managed OIDC provider; self-hosted identity service | Identity Platform with Google sign-in and Kratos-owned roles; [ADR-011](decisions/011-metadata-and-human-identity.md). | Provider login authenticates a person; API authorisation remains in Kratos. |
 | Agent protocol — accepted | Outbound HTTPS polling; WebSocket; gRPC streaming | HTTPS enrolment and periodic heartbeat for R0.1; [ADR-007](decisions/007-python-worker-agent.md). | Polling has request overhead; persistent connections add lifecycle and reconnect complexity. |
 | Agent implementation — accepted | Python; Go; .NET | Python for GPU/runtime inspection and ML tooling proximity; [ADR-007](decisions/007-python-worker-agent.md). | The wire protocol remains language-neutral. |
 | Windows execution | WSL2 Linux runtime; another supported Linux container stack | Validate WSL2-based GPU execution on the actual two hosts before choosing packaging. | Startup, device access, container-to-container LAN reachability and updates must be tested; no compatibility assumed. |
@@ -38,7 +38,7 @@ GCP, Terraform, Rust/Axum for the control plane, and the VS Code dev-container w
 ## Discussion order
 
 1. Frontend details and agent language; repository, Rust control plane and developer workflow are accepted.
-2. R0.1 hosting, database and identity service, including a monthly cost estimate.
+2. R0.1 frontend component and data-fetching choices.
 3. Windows runtime validation, agent packaging and enrolment protocol.
 4. CI/CD promotion and Terraform state/bootstrap design.
 

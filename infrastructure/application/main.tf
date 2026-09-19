@@ -14,7 +14,9 @@ resource "google_cloud_run_v2_service" "control_plane" {
     }
 
     containers {
-      image = var.container_image
+      name       = "control-plane"
+      image      = var.container_image
+      depends_on = var.database_enabled ? ["cloud-sql-proxy"] : []
 
       resources {
         limits = {
@@ -31,6 +33,20 @@ resource "google_cloud_run_v2_service" "control_plane" {
       env {
         name  = "RUST_LOG"
         value = "kratos_control_plane=info"
+      }
+
+      dynamic "env" {
+        for_each = var.database_enabled ? {
+          KRATOS_DATABASE_HOST = "127.0.0.1"
+          KRATOS_DATABASE_PORT = "5432"
+          KRATOS_DATABASE_NAME = "kratos"
+          KRATOS_DATABASE_USER = var.database_iam_username
+        } : {}
+
+        content {
+          name  = env.key
+          value = env.value
+        }
       }
 
       startup_probe {
@@ -53,6 +69,41 @@ resource "google_cloud_run_v2_service" "control_plane" {
         http_get {
           path = "/healthz"
           port = 8080
+        }
+      }
+    }
+
+    dynamic "containers" {
+      for_each = var.database_enabled ? [var.database_connection_name] : []
+
+      content {
+        name  = "cloud-sql-proxy"
+        image = var.cloud_sql_proxy_image
+        args = [
+          "--address=0.0.0.0",
+          "--port=5432",
+          "--auto-iam-authn",
+          "--structured-logs",
+          containers.value,
+        ]
+
+        resources {
+          limits = {
+            cpu    = "0.25"
+            memory = "128Mi"
+          }
+          cpu_idle = true
+        }
+
+        startup_probe {
+          initial_delay_seconds = 0
+          timeout_seconds       = 2
+          period_seconds        = 2
+          failure_threshold     = 15
+
+          tcp_socket {
+            port = 5432
+          }
         }
       }
     }

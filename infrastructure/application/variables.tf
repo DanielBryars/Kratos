@@ -34,3 +34,42 @@ variable "allow_unauthenticated" {
   type        = bool
   default     = true
 }
+
+variable "database_enabled" {
+  description = "Attach the passwordless Cloud SQL Auth Proxy sidecar and database connection metadata."
+  type        = bool
+  default     = false
+}
+
+variable "database_connection_name" {
+  description = "Cloud SQL instance connection name when database_enabled is true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.database_enabled || length(trimspace(var.database_connection_name)) > 0
+    error_message = "database_connection_name must be set when database_enabled is true."
+  }
+}
+
+variable "database_iam_username" {
+  description = "PostgreSQL IAM username when database_enabled is true."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = !var.database_enabled || length(trimspace(var.database_iam_username)) > 0
+    error_message = "database_iam_username must be set when database_enabled is true."
+  }
+}
+
+variable "cloud_sql_proxy_image" {
+  description = "Immutable multi-architecture Cloud SQL Auth Proxy v2 image."
+  type        = string
+  default     = "gcr.io/cloud-sql-connectors/cloud-sql-proxy@sha256:88501f0a695a586988add1b8a206fdf3f29f9a1a3deeb9b45ef2b1481ea6be83"
+
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.cloud_sql_proxy_image))
+    error_message = "cloud_sql_proxy_image must use an immutable SHA256 digest."
+  }
+}

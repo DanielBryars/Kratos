@@ -44,4 +44,22 @@ The application deployment reserves a global IPv4 address, provisions a Google-m
 
 Cloud Run accepts internet traffic only through the load balancer. Direct public requests to its default URI are rejected by its ingress policy. Port 80 redirects to HTTPS; the HTTPS frontend requires TLS 1.2 or newer.
 
+## Development database cost gate
+
+The platform configuration enables the Cloud SQL and Identity Platform APIs, but does not create a
+database by default. This keeps an ordinary deployment from silently adding continuous database
+cost. Review [ADR-011](../docs/architecture/decisions/011-metadata-and-human-identity.md), then set
+`enable_database=true` only in the environment that should own the development database.
+
+The deployment workflow reads the persistent `GCP_ENABLE_DATABASE` GitHub Actions variable and
+defaults it to `false`. Before changing it to `true`, reapply the bootstrap root so the federated
+deployment identity receives its Cloud SQL administrator role. To remove an instance, first apply
+with `database_deletion_protection=false`; only then set `GCP_ENABLE_DATABASE=false` and apply again.
+
+When enabled, Terraform creates the zonal development PostgreSQL instance, database, IAM database
+user and the two narrow Cloud SQL IAM grants for the Cloud Run service account. The application root
+then adds a digest-pinned Cloud SQL Auth Proxy v2 sidecar and supplies non-secret connection metadata
+to the Rust container. It does not create or store a database password. Schema migrations and the
+Rust persistence layer must be ready before the cost gate is turned on.
+
 The application is temporarily public while it exposes only scaffold health, version and documentation routes. Application authentication SHALL be added before worker registration or any private data endpoint is deployed.

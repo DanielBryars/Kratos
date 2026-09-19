@@ -58,7 +58,11 @@ R0.2 adds reproducible single-worker training; R0.3 adds shared scheduling and f
 
 ## Technology decisions
 
-GCP, Terraform, Rust/Axum for the control plane, and the VS Code Linux dev-container workflow are accepted project choices. Remaining options, including Cloud Run, PostgreSQL, Secret Manager, GitHub Actions and MLflow, are documented as proposals in the [technology decision register](../docs/architecture/README.md). Proposed choices SHALL remain distinguishable from accepted decisions.
+GCP, Terraform, Cloud Run, Rust/Axum, Cloud SQL for PostgreSQL, Identity Platform, Secret Manager,
+GitHub Actions, the self-hosted Grafana stack, MLflow and the VS Code Linux dev-container workflow
+are accepted project choices. Their rationale and current implementation status are recorded in the
+[technology decision register](../docs/architecture/README.md). Proposed choices SHALL remain
+distinguishable from accepted decisions.
 
 ## Document governance
 
