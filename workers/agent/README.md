@@ -13,9 +13,24 @@ The command uses `nvidia-smi` when it is available. Detection proves that the de
 it deliberately reports GPU computation health as `unverified`. A later controlled health-check
 container must execute a real GPU computation before the control plane can mark the worker healthy.
 
-No enrolment credential is accepted on the command line because command arguments can be exposed
-by process inspection. The agent reads the one-time credential from a mounted file and writes the
-issued worker identity and scoped credential atomically to a mode-`0600` state file.
+The normal first-run flow requires no copied credential. The agent generates its device key in the
+persistent state volume, radios in, and prints a short code. Compare that code with the pending
+machine in the authenticated operator console before approving it:
+
+```shell
+docker run --detach --restart unless-stopped --gpus all \
+  --name kratos-agent \
+  --mount type=volume,source=kratos-agent-state,target=/var/lib/kratos-agent \
+  ghcr.io/danielbryars/kratos-agent:edge
+docker logs kratos-agent
+```
+
+The public image contains no Kratos credential. The device private key and issued worker credential
+are written atomically to the mode-`0600` state file. The state volume must be retained across
+container replacement.
+
+Automated provisioners may instead mount a one-time enrolment credential. No enrolment credential
+is accepted on the command line because command arguments can be exposed by process inspection.
 
 Start the long-running agent with persistent state and a read-only enrolment secret mount:
 
@@ -24,7 +39,7 @@ docker run --detach --restart unless-stopped --gpus all \
   --name kratos-agent \
   --mount type=volume,source=kratos-agent-state,target=/var/lib/kratos-agent \
   --mount type=bind,source=/secure/path/enrolment,target=/run/secrets/kratos-enrolment,readonly \
-  kratos-agent run \
+  ghcr.io/danielbryars/kratos-agent:edge run \
   --display-name "Home GPU 1" \
   --enrolment-credential-file /run/secrets/kratos-enrolment
 ```
@@ -57,3 +72,7 @@ fixed identifier.
 The executor disables networking, uses a read-only root filesystem, drops Linux capabilities,
 applies CPU, memory and process limits, assigns only the requested GPU and always removes the health
 container after collecting its bounded JSON result.
+
+GitHub Actions publishes `edge`, `sha-<commit>` and `agent-v*` release tags with provenance and an
+SBOM. After the first publication, the repository owner must set the GHCR package visibility to
+public once; image contents and subsequent publishing remain automated.

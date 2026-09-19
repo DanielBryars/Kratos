@@ -13,6 +13,18 @@ import { useEffect, useState } from "react";
 type Version = { name: string; version: string };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
 type Enrolment = { enrolment_credential: string; expires_at: string };
+type PendingRegistration = {
+  registration_id: string;
+  display_name: string;
+  confirmation_code: string;
+  expires_at: string;
+  capabilities: {
+    hostname: string;
+    logical_cpu_count: number;
+    memory_total_bytes: number;
+    gpus: Array<{ name: string; memory_total_bytes: number }>;
+  };
+};
 type ApiError = { message?: string };
 
 export function App() {
@@ -26,6 +38,8 @@ export function App() {
   const [action, setAction] = useState<"idle" | "signing-in" | "creating">("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [pending, setPending] = useState<PendingRegistration[]>([]);
+  const [decidingId, setDecidingId] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/v1/version")
@@ -39,6 +53,29 @@ export function App() {
       })
       .catch(() => setStatus("offline"));
   }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setPending([]);
+      return;
+    }
+    let cancelled = false;
+    async function refresh() {
+      const idToken = await user!.getIdToken();
+      const response = await fetch("/api/v1/operator/worker-registration-requests", {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (response.ok && !cancelled) {
+        setPending((await response.json()) as PendingRegistration[]);
+      }
+    }
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [user]);
 
   useEffect(() => {
     let cancelled = false;
@@ -111,6 +148,28 @@ export function App() {
     setCopied(true);
   }
 
+  async function decideRegistration(registrationId: string, decision: "approve" | "reject") {
+    if (!user) return;
+    setDecidingId(registrationId);
+    setMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(
+        `/api/v1/operator/worker-registration-requests/${registrationId}/${decision}`,
+        { method: "POST", headers: { Authorization: `Bearer ${idToken}` } },
+      );
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      setPending((current) => current.filter((item) => item.registration_id !== registrationId));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The registration could not be updated.");
+    } finally {
+      setDecidingId(null);
+    }
+  }
+
   return (
     <main>
       <header>
@@ -133,7 +192,7 @@ export function App() {
 
         <article className="card operator-card" aria-labelledby="operator-heading">
           <div className="card-heading">
-            <div><p className="label">Operator access</p><h3 id="operator-heading">Create a worker enrolment</h3></div>
+            <div><p className="label">Operator access</p><h3 id="operator-heading">Worker registration</h3></div>
             {user && <span className="identity">{user.email}</span>}
           </div>
           {authStatus === "loading" && <p className="muted compact">Loading secure sign-in…</p>}
@@ -146,6 +205,25 @@ export function App() {
           )}
           {authStatus === "ready" && user && (
             <>
+              <div className="registration-section">
+                <div><p className="label">Requests</p><h3>Machines waiting for approval</h3></div>
+                {pending.length === 0 && <p className="muted compact">No machines are waiting.</p>}
+                {pending.map((request) => (
+                  <div className="registration" key={request.registration_id}>
+                    <div>
+                      <strong>{request.display_name}</strong>
+                      <p>{request.capabilities.gpus.map((gpu) => gpu.name).join(", ") || "No GPU detected"} · {request.capabilities.logical_cpu_count} CPUs</p>
+                      <p className="registration-code">Code {request.confirmation_code}</p>
+                    </div>
+                    <div className="registration-actions">
+                      <button type="button" disabled={decidingId !== null} onClick={() => void decideRegistration(request.registration_id, "approve")}>Approve</button>
+                      <button className="button-secondary" type="button" disabled={decidingId !== null} onClick={() => void decideRegistration(request.registration_id, "reject")}>Reject</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="registration-section">
+                <div><p className="label">Automation</p><h3>Create a one-time enrolment</h3></div>
               <div className="form-row">
                 <label htmlFor="expiry">Credential lifetime</label>
                 <select id="expiry" value={expirySeconds} onChange={(event) => setExpirySeconds(Number(event.target.value))}>
@@ -161,6 +239,7 @@ export function App() {
                   <p>Expires {new Date(enrolment.expires_at).toLocaleString()}.</p>
                 </div>
               )}
+              </div>
             </>
           )}
           {message && <p className="notice notice--error" role="alert">{message}</p>}

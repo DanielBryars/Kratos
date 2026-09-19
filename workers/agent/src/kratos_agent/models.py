@@ -99,6 +99,32 @@ class EnrolmentResponse(StrictModel):
     heartbeat_interval_seconds: int = Field(gt=0)
 
 
+class RegistrationRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[0-9]+$")
+    agent_instance_id: UUID
+    display_name: str = Field(min_length=1, max_length=100)
+    public_key: str = Field(min_length=43, max_length=43)
+    capabilities: WorkerCapabilities
+
+
+class RegistrationCreatedResponse(StrictModel):
+    registration_id: UUID
+    confirmation_code: str = Field(pattern=r"^[A-Z2-9]{4}-[A-Z2-9]{4}$")
+    expires_at: datetime
+    poll_interval_seconds: int = Field(gt=0)
+
+
+class RegistrationStatusResponse(StrictModel):
+    registration_id: UUID
+    state: str
+    claim_challenge: str | None = None
+    poll_interval_seconds: int = Field(gt=0)
+
+
+class ClaimRegistrationRequest(StrictModel):
+    signature: str = Field(min_length=86, max_length=86)
+
+
 class HeartbeatRequest(StrictModel):
     protocol_version: str = Field(pattern=r"^1\.[0-9]+$")
     sequence: int = Field(ge=0)

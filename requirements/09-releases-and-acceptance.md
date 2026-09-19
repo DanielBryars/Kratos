@@ -47,6 +47,10 @@ R0.5 SHALL complete the mandatory single-worker platform requirements in Chapter
 
 - Install an agent on each of the two Windows machines using a validated Linux execution environment.
 - Enrol each worker using a single-use bootstrap credential and approved, revocable identity.
+- Permit an agent to request registration without a copied secret; require operator code comparison
+  and cryptographic proof of device-key possession before issuing its worker credential.
+- Publish the secret-free Linux AMD64 agent image from CI with immutable identity, provenance and an
+  SBOM so manually rented machines can join through the same approval flow.
 - Advertise CPU, RAM, GPU model/count/memory, runtime versions and available capacity.
 - Perform a real container GPU health check; display unsupported or unhealthy capability accurately.
 - Retain the GPU computation result, image identity, host/runtime versions and observed device as acceptance evidence.

@@ -40,6 +40,11 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .card a { color: #8cc0ff; text-decoration: none; }
 .card a:hover { color: #fff; }
 .operator-card { display: grid; gap: 24px; }
+.registration-section { display: grid; gap: 14px; padding-top: 20px; border-top: 1px solid #263242; }
+.registration { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px; border: 1px solid #334154; border-radius: 10px; background: #111a26; }
+.registration p { margin-top: 6px; color: #9babbc; font-size: 0.9rem; }
+.registration .registration-code { color: #8ce3b7; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1rem; letter-spacing: 0.08em; }
+.registration-actions { display: flex; gap: 10px; }
 .operator-action { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .form-row { flex-wrap: wrap; gap: 12px; }
 .form-row label { color: #9babbc; }
@@ -61,5 +66,7 @@ select { color: #eef4fa; background: #151f2c; border-color: #334154; }
   .hero { padding-top: 10vh; }
   .service-card { grid-template-columns: 1fr; align-items: start; }
   .operator-action, .card-heading { align-items: flex-start; flex-direction: column; }
+  .registration { align-items: stretch; flex-direction: column; }
+  .registration-actions { flex-direction: column; }
   .form-row { align-items: stretch; flex-direction: column; }
 }

@@ -30,6 +30,43 @@ Hardware detection SHALL NOT be treated as a successful computation check. Detec
 
 ## Enrolment exchange
 
+### Interactive radio-in
+
+On first start without a bootstrap credential, the agent SHALL generate a random instance UUID and
+an Ed25519 key pair, persist them before making a network request, and call
+`POST /api/v1/worker-registration-requests`. The request SHALL contain the public key, display name
+and current capability report. Retrying with the same instance and key SHALL return the existing
+open request rather than create another.
+
+The response SHALL contain an opaque request identifier, a fifteen-minute expiry, a polling
+interval and a short comparison code derived from the public key. The agent SHALL print the code.
+The authenticated operator console SHALL show the same code and advertised capabilities. An
+operator SHALL approve or reject the request. Approval SHALL create a random claim challenge and an
+audit event; it SHALL NOT return a worker credential to the browser.
+
+The agent SHALL poll `GET /api/v1/worker-registration-requests/{registration_id}`. Once approved, it
+SHALL sign this exact UTF-8 message, where the identifiers use their canonical response encoding:
+
+```text
+kratos-worker-claim-v1
+{registration_id}
+{base64url-without-padding challenge}
+```
+
+The agent SHALL send the base64url-without-padding signature to
+`POST /api/v1/worker-registration-requests/{registration_id}/claim`. The control plane SHALL verify
+the signature with the pending request's public key, atomically create an approved worker, and
+return its scoped worker credential. The credential SHALL be reproducibly derived from the signed
+claim so retrying an identical claim after a lost response returns the same identity and credential
+without creating another worker. A request that is expired, rejected or not approved SHALL NOT be
+claimable. The private key SHALL never leave the agent state volume.
+
+Pending registration volume SHALL be bounded. Edge and application rate limits SHOULD restrict
+request creation, status polling and failed claims. The identifier and comparison code are not
+credentials; possession of the private key is the authentication proof.
+
+### Automated bootstrap
+
 An operator SHALL obtain a short-lived Identity Platform ID token through the web login and call
 `POST /api/v1/operator/worker-enrolments`. The control plane SHALL ask Identity Platform to validate
 the token and SHALL separately require the stored Kratos identity to have the `operator` role. The
