@@ -1,6 +1,7 @@
 resource "google_project_service" "platform" {
   for_each = toset([
     "artifactregistry.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
     "identitytoolkit.googleapis.com",
