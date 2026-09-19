@@ -1107,7 +1107,7 @@ mod tests {
                 "memory_total_bytes": 12_000_000_000_u64,
                 "driver_version": "1.0"
             }],
-            "gpu_health": { "status": "healthy", "detail": "passed" }
+            "gpu_health": { "status": "unverified", "detail": "pending" }
         }))
         .execute(&pool)
         .await

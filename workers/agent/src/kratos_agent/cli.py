@@ -4,6 +4,7 @@ import argparse
 import json
 import socket
 import sys
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -11,7 +12,7 @@ from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import GpuHealthStatus
+from kratos_agent.models import GpuHealth, GpuHealthEvidence, GpuHealthStatus
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.runner import AgentRunner
 
@@ -28,7 +29,21 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--display-name", default=socket.gethostname())
     run.add_argument("--state-file", type=Path, default=Path("/var/lib/kratos-agent/state.json"))
     run.add_argument("--enrolment-credential-file", type=Path)
+    run.add_argument(
+        "--health-check-image",
+        help="immutable GPU health-check image run once before heartbeats",
+    )
     return parser
+
+
+def _reported_health(evidence: GpuHealthEvidence) -> GpuHealth:
+    if evidence.status is GpuHealthStatus.HEALTHY:
+        detail = (
+            f"GPU computation passed on {evidence.device_name} in {evidence.duration_ms:.3f} ms"
+        )
+    else:
+        detail = evidence.detail or "GPU computation health check failed"
+    return GpuHealth(status=evidence.status, detail=detail, evidence=evidence)
 
 
 def main() -> int:
@@ -49,16 +64,31 @@ def main() -> int:
         return 0 if evidence.status is GpuHealthStatus.HEALTHY else 1
     elif args.command == "run":
         try:
+            capability_collector = collect_capabilities
+            if args.health_check_image:
+                evidence = DockerExecutor.from_environment().run_gpu_health_check(
+                    image_reference=args.health_check_image
+                )
+                health = _reported_health(evidence)
+                capability_collector = partial(collect_capabilities, gpu_health_override=health)
             with WorkerProtocolClient(args.control_plane) as client:
                 AgentRunner(
                     client=client,
                     display_name=args.display_name,
                     state_path=args.state_file,
                     enrolment_credential_path=args.enrolment_credential_file,
+                    capability_collector=capability_collector,
                 ).run()
         except KeyboardInterrupt:
             return 0
-        except (ControlPlaneError, httpx.HTTPError, OSError, ValueError) as error:
+        except (
+            ControlPlaneError,
+            DockerException,
+            ExecutorError,
+            httpx.HTTPError,
+            OSError,
+            ValueError,
+        ) as error:
             print(json.dumps({"status": "error", "detail": str(error)}))
             return 2
 

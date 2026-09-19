@@ -83,7 +83,9 @@ def _detect_gpus(
     )
 
 
-def collect_capabilities(storage_path: Path = Path("/")) -> WorkerCapabilities:
+def collect_capabilities(
+    storage_path: Path = Path("/"), gpu_health_override: GpuHealth | None = None
+) -> WorkerCapabilities:
     """Collect a point-in-time report without claiming untested GPU health."""
 
     gpus, gpu_health = _detect_gpus()
@@ -99,5 +101,5 @@ def collect_capabilities(storage_path: Path = Path("/")) -> WorkerCapabilities:
         storage_available_bytes=shutil.disk_usage(storage_path).free,
         python_version=platform.python_version(),
         gpus=gpus,
-        gpu_health=gpu_health,
+        gpu_health=gpu_health_override or gpu_health,
     )

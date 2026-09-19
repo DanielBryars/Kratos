@@ -29,6 +29,21 @@ the mutable `edge` tag to its immutable digest, verifies that an NVIDIA GPU is v
 Linux container, creates the persistent state volume, starts the agent and prints its radio-in code.
 It does not create, copy or accept a Kratos secret.
 
+After the health-check package has been published, pass its full immutable digest to report a real
+CUDA computation result with each heartbeat:
+
+```powershell
+.\workers\agent\install-windows.ps1 `
+  -DisplayName "Home GPU 2" `
+  -AgentHostname "HOME-GPU-02" `
+  -HealthCheckImage "ghcr.io/danielbryars/kratos-gpu-health-check@sha256:<digest>"
+```
+
+This option mounts the Docker Engine socket only into the trusted agent. The agent launches the
+health image without networking, with a read-only root filesystem, dropped capabilities, bounded
+CPU, memory and process count, and access only to the selected GPU. The health container never
+receives the Docker socket.
+
 The equivalent manual command is:
 
 ```shell

@@ -83,7 +83,7 @@ impl VerificationGate {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GpuHealthStatus {
     Unavailable,
@@ -103,9 +103,29 @@ pub struct GpuCapability {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub struct GpuHealthEvidence {
+    pub schema_version: String,
+    pub status: GpuHealthStatus,
+    pub checked_at: DateTime<Utc>,
+    pub image_reference: String,
+    pub device_index: Option<u32>,
+    pub device_name: Option<String>,
+    pub operation: Option<String>,
+    pub matrix_size: Option<u32>,
+    pub max_absolute_error: Option<f64>,
+    pub duration_ms: Option<f64>,
+    pub cuda_driver_api_version: Option<String>,
+    pub cuda_runtime_version: Option<String>,
+    pub error_type: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GpuHealth {
     pub status: GpuHealthStatus,
     pub detail: String,
+    pub evidence: Option<GpuHealthEvidence>,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -385,6 +405,7 @@ fn validate_capabilities(capabilities: &WorkerCapabilities) -> Result<(), ApiErr
     });
     if strings_valid
         && gpus_valid
+        && valid_gpu_health(&capabilities.gpu_health)
         && capabilities.logical_cpu_count > 0
         && capabilities.memory_total_bytes > 0
     {
@@ -392,6 +413,70 @@ fn validate_capabilities(capabilities: &WorkerCapabilities) -> Result<(), ApiErr
     } else {
         Err(ApiError::invalid_request())
     }
+}
+
+fn valid_gpu_health(health: &GpuHealth) -> bool {
+    match (&health.status, &health.evidence) {
+        (GpuHealthStatus::Unavailable | GpuHealthStatus::Unverified, None) => true,
+        (GpuHealthStatus::Healthy, Some(evidence)) => {
+            evidence.status == health.status
+                && validate_protocol(&evidence.schema_version).is_ok()
+                && immutable_sha256_reference(&evidence.image_reference)
+                && evidence.device_index.is_some()
+                && evidence
+                    .device_name
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                && evidence
+                    .operation
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                && evidence.matrix_size.is_some_and(|value| value > 0)
+                && evidence.max_absolute_error.is_some_and(f64::is_finite)
+                && evidence
+                    .duration_ms
+                    .is_some_and(|value| value.is_finite() && value >= 0.0)
+                && evidence
+                    .cuda_driver_api_version
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                && evidence
+                    .cuda_runtime_version
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        (GpuHealthStatus::Unhealthy, Some(evidence)) => {
+            evidence.status == health.status
+                && validate_protocol(&evidence.schema_version).is_ok()
+                && immutable_sha256_reference(&evidence.image_reference)
+                && evidence
+                    .error_type
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                && evidence
+                    .detail
+                    .as_ref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }
+        _ => false,
+    }
+}
+
+fn immutable_sha256_reference(reference: &str) -> bool {
+    let digest = reference.strip_prefix("sha256:").or_else(|| {
+        reference
+            .split_once("@sha256:")
+            .filter(|(name, _)| {
+                !name.is_empty() && !name.contains('@') && !name.contains(char::is_whitespace)
+            })
+            .map(|(_, digest)| digest)
+    });
+    digest.is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn database(state: &AppState) -> Result<&PgPool, ApiError> {
@@ -1037,4 +1122,62 @@ pub(crate) async fn heartbeat(
         accepted_sequence,
         next_heartbeat_seconds: HEARTBEAT_INTERVAL_SECONDS,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::{
+        GpuHealth, GpuHealthEvidence, GpuHealthStatus, immutable_sha256_reference, valid_gpu_health,
+    };
+
+    fn healthy_evidence() -> GpuHealthEvidence {
+        GpuHealthEvidence {
+            schema_version: "1.0".to_owned(),
+            status: GpuHealthStatus::Healthy,
+            checked_at: Utc::now(),
+            image_reference: format!("example.test/health@sha256:{}", "a".repeat(64)),
+            device_index: Some(0),
+            device_name: Some("Test GPU".to_owned()),
+            operation: Some("matrix multiplication".to_owned()),
+            matrix_size: Some(512),
+            max_absolute_error: Some(0.0),
+            duration_ms: Some(12.5),
+            cuda_driver_api_version: Some("13.3".to_owned()),
+            cuda_runtime_version: Some("12.9".to_owned()),
+            error_type: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn health_evidence_requires_an_immutable_lowercase_digest() {
+        assert!(immutable_sha256_reference(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!immutable_sha256_reference("health:latest"));
+        assert!(!immutable_sha256_reference(&format!(
+            "sha256:{}",
+            "A".repeat(64)
+        )));
+    }
+
+    #[test]
+    fn reported_health_must_match_its_evidence() {
+        let valid = GpuHealth {
+            status: GpuHealthStatus::Healthy,
+            detail: "computation passed".to_owned(),
+            evidence: Some(healthy_evidence()),
+        };
+        assert!(valid_gpu_health(&valid));
+
+        let mismatched = GpuHealth {
+            status: GpuHealthStatus::Unhealthy,
+            detail: "mismatch".to_owned(),
+            evidence: Some(healthy_evidence()),
+        };
+        assert!(!valid_gpu_health(&mismatched));
+    }
 }

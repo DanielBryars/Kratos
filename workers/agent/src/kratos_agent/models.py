@@ -29,11 +29,6 @@ class GpuHealthStatus(StrEnum):
     UNHEALTHY = "unhealthy"
 
 
-class GpuHealth(StrictModel):
-    status: GpuHealthStatus
-    detail: str = Field(min_length=1)
-
-
 class GpuHealthEvidence(StrictModel):
     schema_version: str = Field(pattern=r"^1\.[0-9]+$")
     status: GpuHealthStatus
@@ -67,6 +62,23 @@ class GpuHealthEvidence(StrictModel):
                 raise ValueError("healthy evidence is missing computation fields")
         elif self.status is GpuHealthStatus.UNHEALTHY and not (self.error_type and self.detail):
             raise ValueError("unhealthy evidence requires error_type and detail")
+        return self
+
+
+class GpuHealth(StrictModel):
+    status: GpuHealthStatus
+    detail: str = Field(min_length=1)
+    evidence: GpuHealthEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_evidence(self) -> "GpuHealth":
+        verified = self.status in {GpuHealthStatus.HEALTHY, GpuHealthStatus.UNHEALTHY}
+        if verified and self.evidence is None:
+            raise ValueError("verified GPU health requires structured evidence")
+        if not verified and self.evidence is not None:
+            raise ValueError("unverified GPU health cannot include computation evidence")
+        if self.evidence is not None and self.evidence.status is not self.status:
+            raise ValueError("GPU health status does not match its evidence")
         return self
 
 

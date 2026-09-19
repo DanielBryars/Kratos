@@ -84,8 +84,8 @@ health-check container. No managed health-check container remained after collect
 
 ## Remaining work
 
-- Publish the health image by immutable registry digest.
-- Attach the structured result and image digest to the capability heartbeat.
+- Publish the health image by immutable registry digest and record the deployed digest.
+- Enable that digest on the installed agent and confirm the structured evidence reaches the fleet UI.
 - Repeat the same evidence on `local-gpu-02`.
 
 Agent-to-control-plane registration and live capability reporting are now complete for this worker.

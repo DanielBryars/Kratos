@@ -26,7 +26,11 @@ report. It includes:
 
 Hardware detection SHALL NOT be treated as a successful computation check. Detection through
 `nvidia-smi` produces `unverified`; only the controlled GPU health-check container can produce
-`healthy`. Detection failure produces `unavailable` and SHALL NOT silently fall back to CPU.
+`healthy` or `unhealthy`. Detection failure produces `unavailable` and SHALL NOT silently fall back
+to CPU.
+A verified result SHALL include the complete structured evidence and immutable health-check image
+digest. The reported status SHALL match the nested evidence status. The control plane SHALL reject
+mutable image references, incomplete healthy evidence and mismatched status values.
 
 ## Enrolment exchange
 
@@ -124,6 +128,10 @@ denied.
 The initial heartbeat interval is 30 seconds. A worker becomes `stale` after 90 seconds without an
 accepted heartbeat and `offline` after five minutes. The UI SHALL show the last accepted contact and
 the age of displayed capabilities.
+
+When configured with an immutable health-check image, the trusted agent SHALL run the check once at
+startup through its constrained Docker executor. Subsequent heartbeats SHALL carry that result and
+its original check time; the agent SHALL NOT rerun a CUDA workload at every heartbeat.
 
 ## Operator fleet controls
 

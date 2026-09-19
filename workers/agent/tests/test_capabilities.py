@@ -3,8 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from kratos_agent.capabilities import _detect_gpus, _memory_total_bytes, _parse_nvidia_smi
-from kratos_agent.models import GpuHealthStatus
+from kratos_agent.capabilities import (
+    _detect_gpus,
+    _memory_total_bytes,
+    _parse_nvidia_smi,
+    collect_capabilities,
+)
+from kratos_agent.models import GpuHealth, GpuHealthStatus
 
 
 def test_parses_nvidia_smi_capabilities() -> None:
@@ -50,3 +55,11 @@ def test_reads_linux_memory_total(tmp_path: Path) -> None:
 def test_rejects_unreadable_memory_information(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="unable to determine total memory"):
         _memory_total_bytes(tmp_path / "missing")
+
+
+def test_computation_health_overrides_detection_result(tmp_path: Path) -> None:
+    verified = GpuHealth(status=GpuHealthStatus.UNVERIFIED, detail="override")
+
+    capabilities = collect_capabilities(storage_path=tmp_path, gpu_health_override=verified)
+
+    assert capabilities.gpu_health is verified
