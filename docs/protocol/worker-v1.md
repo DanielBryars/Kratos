@@ -50,6 +50,11 @@ file readable by the agent service identity and SHALL authorise operations for t
 Server-side storage SHALL retain a verifier rather than the credential value. Revocation SHALL make
 subsequent authenticated requests fail.
 
+Credential strings are opaque to agents. The current envelope carries a type prefix and random
+lookup identifier followed by 256 bits of random secret material. The prefix and identifier are not
+proof of authority. The control plane SHALL authenticate the complete value against its Argon2id
+verifier and SHALL perform rate limiting before expensive verification work.
+
 ## Heartbeat
 
 `PUT /api/v1/workers/{worker_id}/heartbeat` will authenticate the worker and accept:
@@ -73,4 +78,3 @@ the age of displayed capabilities.
 An agent MAY report network observations, but it cannot grant itself membership of a compute group.
 Group membership is a separate administrator-approved control-plane record. R0.1 will show the home
 group's peer connectivity as unverified until the container-to-container test is delivered in R0.6.
-

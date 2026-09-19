@@ -4,6 +4,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use kratos_control_plane::database::DatabaseSettings;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -19,10 +21,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let address = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(address).await?;
 
-    info!(%address, "Kratos control plane listening");
     let web_root = env::var_os("KRATOS_WEB_ROOT").map(PathBuf::from);
+    let database = match DatabaseSettings::from_environment()? {
+        Some(settings) => Some(settings.connect().await?),
+        None => None,
+    };
 
-    axum::serve(listener, kratos_control_plane::app(web_root))
+    info!(%address, database_enabled = database.is_some(), "Kratos control plane listening");
+    axum::serve(listener, kratos_control_plane::app(web_root, database))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 

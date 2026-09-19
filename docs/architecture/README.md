@@ -20,3 +20,5 @@ Status distinguishes a selected direction from a recommendation still under disc
 Each decision record SHALL state its status, context, alternatives, rationale, consequences and conditions for reconsideration. Proposed decisions SHALL NOT be treated as approved implementation constraints.
 
 See the [release plan](../../requirements/09-releases-and-acceptance.md) for sequencing. Requirements describe required behaviour; decision records describe how and why a technology is selected.
+
+Implementation notes: [worker registry persistence](worker-registry-schema.md).
