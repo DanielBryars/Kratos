@@ -24,8 +24,9 @@ mod registry;
 
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
-    CreateEnrolmentRequest, CreateEnrolmentResponse, PendingRegistrationResponse,
-    RegistrationDecisionResponse,
+    ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, OperatorWorkerResponse,
+    PendingRegistrationResponse, RegistrationDecisionResponse, WorkerActionResponse,
+    WorkerConnectivity, WorkerGroupResponse,
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
@@ -69,6 +70,10 @@ pub(crate) struct AppState {
         operator::list_worker_registration_requests,
         operator::approve_worker_registration,
         operator::reject_worker_registration,
+        operator::list_workers,
+        operator::approve_worker,
+        operator::quarantine_worker,
+        operator::revoke_worker,
         registry::enrol_worker,
         registry::request_registration,
         registry::registration_status,
@@ -81,7 +86,9 @@ pub(crate) struct AppState {
         WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthStatus, WorkerState,
         CreateEnrolmentRequest, CreateEnrolmentResponse, RegistrationRequest,
         RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
-        ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse
+        ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,
+        ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
+        WorkerGroupResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -238,6 +245,19 @@ pub fn app_with_human_auth(
         .route(
             "/api/v1/operator/worker-registration-requests/{registration_id}/reject",
             post(operator::reject_worker_registration),
+        )
+        .route("/api/v1/operator/workers", get(operator::list_workers))
+        .route(
+            "/api/v1/operator/workers/{worker_id}/approve",
+            post(operator::approve_worker),
+        )
+        .route(
+            "/api/v1/operator/workers/{worker_id}/quarantine",
+            post(operator::quarantine_worker),
+        )
+        .route(
+            "/api/v1/operator/workers/{worker_id}/revoke",
+            post(operator::revoke_worker),
         )
         .route("/api/v1/worker-enrolments", post(registry::enrol_worker))
         .route(
