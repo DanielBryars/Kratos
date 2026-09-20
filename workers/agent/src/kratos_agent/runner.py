@@ -7,12 +7,14 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from docker.errors import DockerException
+from pydantic import ValidationError
 
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.courier import ObservationCourier
@@ -25,6 +27,7 @@ from kratos_agent.executor import (
     ExecutorError,
 )
 from kratos_agent.models import (
+    MAX_STRUCTURED_RESULT_BYTES,
     ArtifactResponse,
     HeartbeatResponse,
     JobAssignment,
@@ -723,14 +726,57 @@ def _with_observations(
         update["observation_counters"] = counters
     # The workload's own result, carried through untouched. The agent does not parse it and the
     # control plane stores it opaquely; it is the workload's output, not a measurement of it.
-    if pump.result is not None:
-        update["structured_result"] = pump.result
+    structured = _structured_result_that_fits(pump.result)
+    if structured is not None:
+        update["structured_result"] = structured
     if not update:
         return result
+
+    # Rebuilt and revalidated rather than copied. `model_copy(update=...)` does not run
+    # validators, so every rule on this model would be silently skipped on the one path that
+    # matters, and an invalid result would travel to a control plane that refuses the whole
+    # submission rather than the offending field.
     try:
-        return result.model_copy(update=update)
-    except Exception:  # noqa: BLE001 - a result is never lost over what it was carrying
+        return JobExecutionResult.model_validate({**result.model_dump(mode="json"), **update})
+    except ValidationError:
+        pass
+    # Something in what it was carrying is unacceptable. Report the job, not the payload: an
+    # execution result is evidence, and losing it over its own commentary would be the worse
+    # trade in every case.
+    update.pop("structured_result", None)
+    try:
+        return JobExecutionResult.model_validate({**result.model_dump(mode="json"), **update})
+    except ValidationError:
         return result
+
+
+def _structured_result_that_fits(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The workload's result, or None when it cannot be sent.
+
+    Bounded here as well as in the model because the control plane refuses a **whole result
+    submission** whose structured result is too large. A workload that printed an enormous final
+    record would otherwise cost its own job's outcome, which is a poor exchange: the outcome is
+    evidence and the record is the workload talking about itself.
+    """
+    if payload is None:
+        return None
+    try:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
+        print(
+            json.dumps(
+                {
+                    "status": "structured_result_omitted",
+                    "reason": "larger than the control plane accepts",
+                    "bytes": len(encoded),
+                }
+            ),
+            flush=True,
+        )
+        return None
+    return payload
 
 
 def _is_rejection(error: Exception) -> bool:

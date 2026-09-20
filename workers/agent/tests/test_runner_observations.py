@@ -268,3 +268,51 @@ def test_a_workload_that_emits_no_result_record_sends_no_field(runner: AgentRunn
     reported = _with_observations(result, pump)
     assert reported.structured_result is None
     assert "structured_result" not in reported.model_dump(exclude_none=True)
+
+
+def test_an_oversized_workload_result_is_omitted_and_the_job_result_survives(
+    runner: AgentRunner,
+) -> None:
+    """model_copy(update=...) does not validate, so the size rule was skipped on the one path
+    that matters. The control plane refuses a whole result submission whose structured result is
+    too large, so a workload printing an enormous final record would have cost its own job's
+    outcome: evidence lost to the workload's commentary about itself.
+    """
+    from kratos_agent.models import MAX_STRUCTURED_RESULT_BYTES
+
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    pump.ingest(Stream.STDOUT, T0, "x" * 9000)  # oversize line, so a counter is also present
+
+    # Past the classifier, which bounds a record line, straight onto the pump.
+    pump._result = {"huge": "x" * (MAX_STRUCTURED_RESULT_BYTES + 1)}
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    reported = _with_observations(result, pump)
+
+    assert reported.structured_result is None, "the payload is dropped"
+    assert reported.exit_code == 0, "the job result is not"
+    assert reported.observation_counters is not None, "and neither are the counters"
+    assert reported.observation_counters["dropped.oversize"] == 1
+
+
+def test_an_unserialisable_workload_result_is_omitted(runner: AgentRunner) -> None:
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    pump._result = {"not json": {1, 2, 3}}
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    reported = _with_observations(result, pump)
+    assert reported.structured_result is None
+    assert reported.exit_code == 0
+
+
+def test_a_result_that_fits_is_still_carried(runner: AgentRunner) -> None:
+    """The guard must not be so eager that it drops what it was added to protect."""
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    summary = {"steps": 2000, "checkpoint": "smolvla-checkpoint.tar"}
+    pump.ingest(Stream.STDOUT, T0, record(record="result", result=summary))
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    assert _with_observations(result, pump).structured_result == summary
