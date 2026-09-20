@@ -411,6 +411,14 @@ impl OperatorError {
         )
     }
 
+    const fn project_required() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "project_required",
+            "This account belongs to several projects; the request must name one.",
+        )
+    }
+
     const fn conflict() -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -516,7 +524,8 @@ pub(crate) async fn create_worker_enrolment(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let owner_identity_id = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let owner_identity_id = caller.identity_id;
     let credential =
         credentials::issue(CredentialKind::Enrolment).map_err(|_| OperatorError::internal())?;
     let expires_at = Utc::now()
@@ -564,7 +573,7 @@ pub(crate) async fn create_worker_enrolment(
 async fn authenticate_operator(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Uuid, OperatorError> {
+) -> Result<Caller, OperatorError> {
     let database = state
         .database
         .as_ref()
@@ -582,12 +591,12 @@ async fn authenticate_operator(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let operator_id = authorize_operator(&mut transaction, auth, &identity).await?;
+    let caller = authorize_operator(&mut transaction, auth, &identity).await?;
     transaction
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok(operator_id)
+    Ok(caller)
 }
 
 #[utoipa::path(
@@ -641,7 +650,7 @@ async fn decide_registration(
     registration_id: Uuid,
     approve: bool,
 ) -> Result<Json<RegistrationDecisionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -670,7 +679,7 @@ async fn decide_registration(
                AND claimed_at IS NULL AND expires_at > now()",
         )
         .bind(registration_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(challenge.as_slice())
         .execute(&mut *transaction)
         .await
@@ -683,7 +692,7 @@ async fn decide_registration(
                AND rejected_at IS NULL AND claimed_at IS NULL AND expires_at > now()",
         )
         .bind(registration_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -704,7 +713,7 @@ async fn decide_registration(
          VALUES ($1, 'human', $2, $3, 'worker_registration_request', $4, 'succeeded')",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(action)
     .bind(registration_id)
     .execute(&mut *transaction)
@@ -834,7 +843,7 @@ async fn approve_and_group_worker(
     worker_id: Uuid,
     request: ApproveWorkerRequest,
 ) -> Result<Json<WorkerActionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -906,7 +915,7 @@ async fn approve_and_group_worker(
          VALUES ($1, 'human', $2, $3, 'worker', $4, 'succeeded', $5)",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(audit_action)
     .bind(worker_id)
     .bind(json!({ "compute_group_name": group_name }))
@@ -947,7 +956,7 @@ async fn change_worker_state(
     worker_id: Uuid,
     target_state: &'static str,
 ) -> Result<Json<WorkerActionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -998,7 +1007,7 @@ async fn change_worker_state(
          VALUES ($1, 'human', $2, $3, 'worker', $4, 'succeeded')",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(format!("worker.{target_state}"))
     .bind(worker_id)
     .execute(&mut *transaction)
@@ -1191,7 +1200,10 @@ pub(crate) async fn create_job(
     headers: HeaderMap,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<OperatorJobResponse>), OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
+    // Resolved before anything else, because a caller with no project cannot own a job and
+    // one with several has not said which they meant.
+    let project_id = caller.sole_project()?;
     let database = state
         .database
         .as_ref()
@@ -1212,12 +1224,16 @@ pub(crate) async fn create_job(
         .await
         .map_err(|_| OperatorError::internal())?;
     let query = format!(
-        "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING {JOB_COLUMNS}"
+        "INSERT INTO jobs \
+         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {JOB_COLUMNS}"
     );
+    // Both meanings are written, and they are not the same value: the identity records who
+    // queued this, the project decides who can see it afterwards.
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
+        .bind(project_id)
         .bind(name)
         .bind(&request.image_reference)
         .bind(request.timeout_seconds)
@@ -1247,7 +1263,7 @@ pub(crate) async fn create_job(
          VALUES ($1, 'human', $2, 'job.queued', 'job', $3, 'succeeded', $4)",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(id)
     .bind(json!({
         "image_reference": request.image_reference,
@@ -1285,7 +1301,7 @@ pub(crate) async fn list_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OperatorJobResponse>>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -1293,11 +1309,15 @@ pub(crate) async fn list_jobs(
     reconcile_expired_attempts(database)
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Scoped by project, not by who created the row: a co-owner sees the project's jobs,
+    // including ones another member queued. `owner_identity_id` stays on the row as the record
+    // of who queued it.
     let query = format!(
-        "SELECT {JOB_COLUMNS} FROM jobs WHERE owner_identity_id = $1 ORDER BY submitted_at DESC LIMIT 100"
+        "SELECT {JOB_COLUMNS} FROM jobs \
+         WHERE project_id = ANY($1) ORDER BY submitted_at DESC LIMIT 100"
     );
     let records = sqlx::query_as::<_, JobRecord>(&query)
-        .bind(operator_id)
+        .bind(&caller.project_ids)
         .fetch_all(database)
         .await
         .map_err(|_| OperatorError::internal())?;
@@ -1341,20 +1361,22 @@ pub(crate) async fn list_job_artifacts(
     Path(job_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorArtifactListResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
-    let owns_job: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND owner_identity_id = $2)",
+    // Answers identically for a job in another project and a job that does not exist, so the
+    // probe cannot be used to discover what else is running.
+    let job_in_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND project_id = ANY($2))",
     )
     .bind(job_id)
-    .bind(operator_id)
+    .bind(&caller.project_ids)
     .fetch_one(database)
     .await
     .map_err(|_| OperatorError::internal())?;
-    if !owns_job {
+    if !job_in_scope {
         return Err(OperatorError::job_not_found());
     }
 
@@ -1381,7 +1403,7 @@ pub(crate) async fn cancel_job(
     Path(job_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorJobResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -1400,13 +1422,16 @@ pub(crate) async fn cancel_job(
              cancel_requested_at = COALESCE(cancel_requested_at, now()), \
              finished_at = CASE WHEN status IN ('queued', 'cancelled') \
                                 THEN COALESCE(finished_at, now()) ELSE NULL END \
-         WHERE id = $1 AND owner_identity_id = $2 \
+         WHERE id = $1 AND project_id = ANY($2) \
            AND status IN ('queued', 'assigned', 'running', 'cancelling', 'cancelled') \
          RETURNING {JOB_COLUMNS}"
     );
+    // Authorisation is fused into the mutation predicate, so a job outside the caller's projects
+    // simply does not match and the handler answers exactly as it does for a job in the wrong
+    // state. That is deliberate: distinguishing them would say whether it exists.
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(job_id)
-        .bind(operator_id)
+        .bind(&caller.project_ids)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -1432,11 +1457,47 @@ pub(crate) async fn cancel_job(
     Ok(Json(record.into_response(outputs, visibility)))
 }
 
+/// The project every existing resource was migrated into, and the one a first operator joins.
+const DEFAULT_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_d00f);
+
+/// Who is calling, and what they may act on -- deliberately two fields rather than one id.
+///
+/// Until projects existed these were the same UUID: the caller's identity was both the thing
+/// written into rows and the thing every query filtered on. That conflation is why handlers could
+/// record who acted while performing a mutation nobody had checked they were allowed to make, and
+/// why nothing flagged it.
+///
+/// Keeping them apart makes the mistake hard to write rather than merely discouraged. A query
+/// filtering on `identity_id` now reads wrongly, and a handler that touches neither field stands
+/// out instead of blending in.
+#[derive(Debug, Clone)]
+pub(crate) struct Caller {
+    /// Attribution: who did this. Written into rows and audit events, never filtered on.
+    pub(crate) identity_id: Uuid,
+    /// Authorisation: the projects this caller may act within. Empty authorises nothing.
+    pub(crate) project_ids: Vec<Uuid>,
+}
+
+impl Caller {
+    /// The project to place a new resource in.
+    ///
+    /// Fails closed while a caller belongs to more than one project: nothing in the request says
+    /// which was meant, and guessing would put a resource somewhere its creator cannot see. This
+    /// becomes a request field when a second project can exist.
+    pub(crate) fn sole_project(&self) -> Result<Uuid, OperatorError> {
+        match self.project_ids.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(OperatorError::forbidden()),
+            _ => Err(OperatorError::project_required()),
+        }
+    }
+}
+
 async fn authorize_operator(
     transaction: &mut Transaction<'_, Postgres>,
     auth: &crate::human_auth::HumanAuth,
     identity: &HumanIdentity,
-) -> Result<Uuid, OperatorError> {
+) -> Result<Caller, OperatorError> {
     let existing = sqlx::query_as::<_, IdentityRecord>(
         "SELECT id, role, disabled_at FROM human_identities \
          WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
@@ -1472,6 +1533,15 @@ async fn authorize_operator(
         .execute(&mut **transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+        // In the same transaction as the identity itself, so a first operator cannot be created
+        // into a state where it owns nothing: it would authenticate perfectly, see an empty
+        // console, and have no way to tell that from having no data.
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| OperatorError::internal())?;
         IdentityRecord {
             id,
             role: "operator".to_owned(),
@@ -1482,7 +1552,25 @@ async fn authorize_operator(
     if record.disabled_at.is_some() || record.role != "operator" {
         return Err(OperatorError::forbidden());
     }
-    Ok(record.id)
+
+    // Read once here rather than per query, so every handler in a request authorises against the
+    // same set and a revocation cannot take effect halfway through one.
+    let project_ids = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT project_id FROM project_memberships \
+         WHERE identity_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(record.id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .into_iter()
+    .map(|row| row.0)
+    .collect();
+
+    Ok(Caller {
+        identity_id: record.id,
+        project_ids,
+    })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, OperatorError> {
@@ -1667,7 +1755,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'stable-subject', 'Test Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -1736,7 +1824,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(stored, (true, Some(operator_id)));
+        assert_eq!(stored, (true, Some(caller.identity_id)));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1764,7 +1852,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'fleet-operator', 'Fleet Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -1775,7 +1863,7 @@ mod tests {
               capabilities, last_seen_at) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now())",
         )
         .bind(worker_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(Uuid::new_v4())
         .bind(json!({
             "protocol_version": "1.0",
@@ -1897,7 +1985,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'job-operator', 'Job Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -1909,7 +1997,7 @@ mod tests {
               status, capabilities) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4)",
         )
         .bind(worker_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
         .execute(&pool)
@@ -2041,7 +2129,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'cancellation-operator', \
                      'Cancellation Operator', 'operator@example.com', 'operator')",
         )
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -2053,7 +2141,7 @@ mod tests {
               status, capabilities) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4)",
         )
         .bind(worker_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
         .execute(&pool)
@@ -2078,7 +2166,7 @@ mod tests {
              VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4)",
         )
         .bind(job_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(format!("example.test/work@sha256:{}", "b".repeat(64)))
         .bind(worker_id)
         .execute(&pool)
