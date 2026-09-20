@@ -183,6 +183,17 @@ pub struct OperatorArtifactListResponse {
 pub struct OperatorAttemptIdentity {
     pub attempt_id: Uuid,
     pub attempt_number: i32,
+    pub observation_stream: Option<OperatorObservationStream>,
+    pub observation_counters: Option<HashMap<String, i64>>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct OperatorObservationStream {
+    pub stream_id: Uuid,
+    pub accepted_through_sequence: i64,
+    pub mlflow_run_id: Option<String>,
+    pub mlflow_created_at: Option<DateTime<Utc>>,
+    pub mlflow_last_error: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -254,6 +265,19 @@ struct OperatorArtifactRecord {
     verified_crc32c: Option<String>,
     verification_source: Option<String>,
     verified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow)]
+struct OperatorAttemptObservationRecord {
+    job_id: Uuid,
+    attempt_id: Uuid,
+    attempt_number: i32,
+    observation_counters: Option<serde_json::Value>,
+    stream_id: Option<Uuid>,
+    accepted_through_sequence: Option<i64>,
+    mlflow_run_id: Option<String>,
+    mlflow_created_at: Option<DateTime<Utc>>,
+    mlflow_last_error: Option<String>,
 }
 
 impl TryFrom<OperatorArtifactRecord> for OperatorArtifactResponse {
@@ -1074,20 +1098,39 @@ async fn job_artifact_visibility(
             )
         })
         .collect();
-    let attempts = sqlx::query_as::<_, (Uuid, Uuid, i32)>(
-        "SELECT DISTINCT ON (job_id) job_id, id, attempt_number FROM job_attempts \
-         WHERE job_id = ANY($1) ORDER BY job_id, attempt_number DESC",
+    let attempts = sqlx::query_as::<_, OperatorAttemptObservationRecord>(
+        "SELECT DISTINCT ON (a.job_id) a.job_id, a.id AS attempt_id, a.attempt_number, \
+                a.observation_counters, s.id AS stream_id, s.accepted_through_sequence, s.mlflow_run_id, \
+                s.mlflow_created_at, s.mlflow_last_error \
+         FROM job_attempts a LEFT JOIN observation_streams s ON s.attempt_id = a.id \
+         WHERE a.job_id = ANY($1) ORDER BY a.job_id, a.attempt_number DESC",
     )
     .bind(job_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
-    let attempt_ids: Vec<Uuid> = attempts.iter().map(|(_, id, _)| *id).collect();
-    for (job_id, attempt_id, attempt_number) in attempts {
-        if let Some(visibility) = by_job.get_mut(&job_id) {
+    let attempt_ids: Vec<Uuid> = attempts.iter().map(|record| record.attempt_id).collect();
+    for attempt in attempts {
+        if let Some(visibility) = by_job.get_mut(&attempt.job_id) {
             visibility.current_attempt = Some(OperatorAttemptIdentity {
-                attempt_id,
-                attempt_number,
+                attempt_id: attempt.attempt_id,
+                attempt_number: attempt.attempt_number,
+                observation_stream: attempt
+                    .stream_id
+                    .map(|stream_id| OperatorObservationStream {
+                        stream_id,
+                        accepted_through_sequence: attempt
+                            .accepted_through_sequence
+                            .unwrap_or_default(),
+                        mlflow_run_id: attempt.mlflow_run_id,
+                        mlflow_created_at: attempt.mlflow_created_at,
+                        mlflow_last_error: attempt.mlflow_last_error,
+                    }),
+                observation_counters: attempt
+                    .observation_counters
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|_| OperatorError::internal())?,
             });
         }
     }
@@ -2257,6 +2300,27 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let stream_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO observation_streams \
+             (id, attempt_id, job_id, worker_id, accepted_through_sequence, mlflow_run_id, mlflow_created_at) \
+             VALUES ($1, $2, $3, $4, 17, 'mlflow-run-17', now())",
+        )
+        .bind(stream_id)
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE job_attempts SET observation_counters = \
+             '{\"dropped.rate\":2}'::jsonb WHERE id = $1",
+        )
+        .bind(attempt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let manifest_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO job_artifact_manifests (id, attempt_id, job_id) VALUES ($1, $2, $3)",
@@ -2337,6 +2401,22 @@ mod tests {
             attempt_id.to_string()
         );
         assert_eq!(body["current_attempt"]["attempt_number"], 1);
+        assert_eq!(
+            body["current_attempt"]["observation_stream"]["stream_id"],
+            stream_id.to_string()
+        );
+        assert_eq!(
+            body["current_attempt"]["observation_stream"]["accepted_through_sequence"],
+            17
+        );
+        assert_eq!(
+            body["current_attempt"]["observation_stream"]["mlflow_run_id"],
+            "mlflow-run-17"
+        );
+        assert_eq!(
+            body["current_attempt"]["observation_counters"]["dropped.rate"],
+            2
+        );
         assert_eq!(body["artifacts"][0]["status"], "verified");
         assert_eq!(body["artifacts"][0]["mandatory"], true);
         assert_eq!(

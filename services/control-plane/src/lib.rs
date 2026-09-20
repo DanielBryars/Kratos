@@ -35,9 +35,9 @@ use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
     ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, CreateJobRequest,
     OperatorArtifactListResponse, OperatorArtifactResponse, OperatorArtifactStatus,
-    OperatorAttemptIdentity, OperatorJobResponse, OperatorWorkerResponse,
-    PendingRegistrationResponse, RegistrationDecisionResponse, VerifiedArtifactEvidence,
-    WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
+    OperatorAttemptIdentity, OperatorJobResponse, OperatorObservationStream,
+    OperatorWorkerResponse, PendingRegistrationResponse, RegistrationDecisionResponse,
+    VerifiedArtifactEvidence, WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
@@ -113,7 +113,7 @@ pub(crate) struct AppState {
         ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
         WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, OperatorArtifactResponse,
         OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
-        VerifiedArtifactEvidence, JobAssignment,
+        OperatorObservationStream, VerifiedArtifactEvidence, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         observations::SubmitObservationBatchRequest, observations::ObservationRecord,
         observations::ObservationBatchResponse,

@@ -64,7 +64,18 @@ type Job = {
   stderr: string | null;
   failure_message: string | null;
   output_requirements: OutputRequirement[];
-  current_attempt: { attempt_id: string; attempt_number: number } | null;
+  current_attempt: {
+    attempt_id: string;
+    attempt_number: number;
+    observation_stream: {
+      stream_id: string;
+      accepted_through_sequence: number;
+      mlflow_run_id: string | null;
+      mlflow_created_at: string | null;
+      mlflow_last_error: string | null;
+    } | null;
+    observation_counters: Record<string, number> | null;
+  } | null;
   artifacts: Artifact[];
 };
 type ApiError = { message?: string };
@@ -559,6 +570,23 @@ export function App() {
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
                       <p>{jobTiming(job)}</p>
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
+                      {job.current_attempt?.observation_stream && (
+                        <div className="run-observations" aria-label={`Live observations for ${job.name}`}>
+                          <div className="artifact-list-heading">
+                            <strong>Training observations</strong>
+                            <span>{job.current_attempt.observation_stream.mlflow_run_id ? "MLflow connected" : "MLflow pending"}</span>
+                          </div>
+                          <p>{pluralise(job.current_attempt.observation_stream.accepted_through_sequence, "record")} accepted from attempt {job.current_attempt.attempt_number}.</p>
+                          <p className="job-identity">Stream {job.current_attempt.observation_stream.stream_id}</p>
+                          {job.current_attempt.observation_stream.mlflow_run_id && <p className="job-identity">MLflow run {job.current_attempt.observation_stream.mlflow_run_id}</p>}
+                          {job.current_attempt.observation_stream.mlflow_last_error && <p className="job-failure">MLflow is catching up: {job.current_attempt.observation_stream.mlflow_last_error}</p>}
+                          {job.current_attempt.observation_counters && Object.keys(job.current_attempt.observation_counters).length > 0 && (
+                            <details><summary>View delivery evidence</summary><dl className="observation-counters">
+                              {Object.entries(job.current_attempt.observation_counters).map(([name, count]) => <div key={name}><dt>{name}</dt><dd>{count}</dd></div>)}
+                            </dl></details>
+                          )}
+                        </div>
+                      )}
                       {(job.stdout || job.stderr) && <details className="run-output"><summary>View container output</summary><div className="terminal"><div className="terminal-bar"><i /><i /><i /><span>container output</span></div>{job.stdout && <pre>{job.stdout}</pre>}{job.stderr && <pre className="job-failure">{job.stderr}</pre>}</div></details>}
                       <div className="artifact-list" aria-label={`Outputs for ${job.name}`}>
                         <div className="artifact-list-heading"><strong>Outputs</strong><span>{job.output_requirements.length} requested</span></div>
