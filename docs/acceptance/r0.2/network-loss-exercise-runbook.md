@@ -18,9 +18,16 @@
    `kratos-agent@sha256:d7d03326…`, predates it: it exits on the first failed request, which is the
    behaviour this exercise is meant to disprove, so the exercise cannot run against it. Confirm
    before starting that the installed digest is **not** that one.
-2. The soak workload is merged and published from `main`. Record the **immutable digest** its
-   publish workflow produced and approve that digest as a job image; do not substitute a mutable
-   tag. It holds the GPU for a fixed 600 seconds, which is the window the disconnect happens in.
+2. The soak workload is merged and published from `main`. Its publish workflow succeeded from
+   commit `b69f254`, producing the `linux/amd64` image
+
+   ```text
+   ghcr.io/danielbryars/kratos-soak-workload@sha256:75fa1ec48131c799a7b8b272557c11ed205e81b2c6dac83aea50fbb8edfa8773
+   ```
+
+   Confirm that digest still matches the published `edge` tag, then approve **the digest** as a job
+   image; never submit a mutable tag. The workload holds the GPU for a fixed 600 seconds, which is
+   the window the disconnect happens in.
 3. The worker is `ONLINE IDLE` in the `Home` group with a verified healthy GPU, and no other job is
    queued.
 4. A second device, not on the worker's network link, is signed in to the operator console.
