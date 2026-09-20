@@ -444,15 +444,16 @@ resource "google_compute_backend_service" "human" {
     group = google_compute_instance_group.observability[0].id
   }
 
-  # Human access is IAP-only. Without an OAuth client the service is created with IAP disabled,
-  # which would publish it unauthenticated, so the plan requires the client identifier.
-  # Identity-Aware Proxy with a Google-managed OAuth client. No client is configured here, and
-  # none can be: Google shut down the IAP OAuth Admin APIs on 19 March 2026, so a custom client
-  # cannot be created any more. The managed client is now the only supported path, and it is the
-  # better one -- no secret exists to be created, rotated, or held in Terraform state.
+  # Human access is IAP-only, with a Google-managed OAuth client.
   #
-  # `enabled` is unconditional. A backend service published without it would serve Grafana and
-  # MLflow to the internet unauthenticated, so it is not a variable anyone can turn off.
+  # A custom client is possible -- the IAP OAuth Admin *API* was shut down on 19 March 2026, but
+  # one can still be created by hand in the console. It is not wanted here. Browser access is a
+  # single principal inside this project's own organisation, and there is no need for custom
+  # consent branding or for users outside it. The managed client is therefore the simpler choice,
+  # and it leaves no secret to create, rotate, or hold in Terraform state.
+  #
+  # `enabled` is what turns IAP on, and it is unconditional. Omitting an OAuth client does not
+  # disable it.
   iap {
     enabled = true
   }

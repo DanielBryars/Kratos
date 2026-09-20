@@ -153,10 +153,14 @@ authentication boundary is a larger blast radius than the convenience is worth.
 3. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
    platform database enabled first.
 
-There is no OAuth client to create. Identity-Aware Proxy uses a Google-managed client, which is now
-the only supported path: Google shut down the IAP OAuth Admin APIs on **19 March 2026**, so a custom
-client can no longer be created. It is also the better path, because no secret exists to be rotated
-or to sit in Terraform state.
+There is no OAuth client to create. Identity-Aware Proxy uses a **Google-managed** client.
+
+A custom client remains possible — the IAP OAuth Admin *API* was shut down on 19 March 2026, but
+one can still be created by hand in the console ([migration
+guide](https://docs.cloud.google.com/iap/docs/deprecations/migrate-oauth-client)). It is not wanted
+here. Browser access is a single principal inside this project's own organisation, and there is no
+need for custom consent branding or for users outside it. A managed client is therefore simpler,
+and it leaves no secret to create, rotate, or hold in Terraform state.
 
 ### Who can reach Grafana and MLflow
 
