@@ -1,3 +1,4 @@
+use std::env;
 use std::path::PathBuf;
 
 use axum::{
@@ -58,6 +59,12 @@ pub struct VersionResponse {
     version: &'static str,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ExternalLinksResponse {
+    grafana_url: Option<String>,
+    mlflow_url: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReadinessResponse {
     status: &'static str,
@@ -70,6 +77,7 @@ pub(crate) struct AppState {
     pub(crate) human_auth: Option<HumanAuth>,
     pub(crate) artifact_storage: Option<ArtifactStorageClient>,
     pub(crate) verification_gate: VerificationGate,
+    external_links: ExternalLinksResponse,
 }
 
 #[derive(OpenApi)]
@@ -78,6 +86,7 @@ pub(crate) struct AppState {
         health,
         readiness,
         version,
+        external_links,
         auth_config,
         operator::create_worker_enrolment,
         operator::list_worker_registration_requests,
@@ -104,7 +113,7 @@ pub(crate) struct AppState {
         artifacts::complete_upload
     ),
     components(schemas(
-        HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
+        HealthResponse, ReadinessResponse, VersionResponse, ExternalLinksResponse, ClientAuthConfig, EnrolmentRequest,
         EnrolmentResponse, HeartbeatRequest, HeartbeatResponse, ErrorResponse,
         WorkerCapabilities, GpuCapability, GpuHealth, GpuHealthEvidence, GpuHealthStatus, WorkerState,
         CreateEnrolmentRequest, CreateEnrolmentResponse, RegistrationRequest,
@@ -223,6 +232,23 @@ async fn version() -> Json<VersionResponse> {
 
 #[utoipa::path(
     get,
+    path = "/api/v1/links",
+    tag = "system",
+    responses((status = 200, description = "Configured operator tools", body = ExternalLinksResponse))
+)]
+async fn external_links(State(state): State<AppState>) -> Json<ExternalLinksResponse> {
+    Json(state.external_links)
+}
+
+fn configured_link(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| value.starts_with("https://") || value.starts_with("http://127.0.0.1:"))
+}
+
+#[utoipa::path(
+    get,
     path = "/api/v1/auth/config",
     tag = "system",
     responses(
@@ -270,6 +296,7 @@ pub fn app_with_dependencies(
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/api/v1/version", get(version))
+        .route("/api/v1/links", get(external_links))
         .route("/api/v1/auth/config", get(auth_config))
         .route(
             "/api/v1/operator/worker-enrolments",
@@ -360,6 +387,10 @@ pub fn app_with_dependencies(
             human_auth,
             artifact_storage,
             verification_gate: VerificationGate::default(),
+            external_links: ExternalLinksResponse {
+                grafana_url: configured_link("KRATOS_GRAFANA_URL"),
+                mlflow_url: configured_link("KRATOS_MLFLOW_URL"),
+            },
         });
 
     if let Some(root) = web_root {

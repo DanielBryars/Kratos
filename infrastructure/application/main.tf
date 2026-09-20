@@ -36,6 +36,16 @@ resource "google_cloud_run_v2_service" "control_plane" {
       }
 
       env {
+        name  = "KRATOS_GRAFANA_URL"
+        value = "https://grafana.${var.domain_name}"
+      }
+
+      env {
+        name  = "KRATOS_MLFLOW_URL"
+        value = "https://mlflow.${var.domain_name}"
+      }
+
+      env {
         name  = "KRATOS_ARTIFACT_BUCKET"
         value = var.artifact_bucket
       }

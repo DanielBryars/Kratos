@@ -20,6 +20,7 @@ import {
 import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
 
 type Version = { name: string; version: string };
+type ExternalLinks = { grafana_url: string | null; mlflow_url: string | null };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
 type Enrolment = { enrolment_credential: string; expires_at: string };
 type PendingRegistration = {
@@ -129,6 +130,7 @@ function jobTiming(job: Job) {
 
 export function App() {
   const [service, setService] = useState<Version | null>(null);
+  const [externalLinks, setExternalLinks] = useState<ExternalLinks>({ grafana_url: null, mlflow_url: null });
   const [status, setStatus] = useState<"checking" | "online" | "offline">("checking");
   const [auth, setAuth] = useState<Auth | null>(null);
   const [user, setUser] = useState<User | null>(null);
@@ -175,6 +177,16 @@ export function App() {
         setStatus("online");
       })
       .catch(() => setStatus("offline"));
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/v1/links")
+      .then((response) => {
+        if (!response.ok) throw new Error(`API returned ${response.status}`);
+        return response.json() as Promise<ExternalLinks>;
+      })
+      .then(setExternalLinks)
+      .catch(() => setExternalLinks({ grafana_url: null, mlflow_url: null }));
   }, []);
 
   useEffect(() => {
@@ -475,7 +487,11 @@ export function App() {
         <article className="card service-card" aria-labelledby="control-plane-heading">
           <div className="service-state"><span className={`service-pulse service-pulse--${status}`} /><div><p className="label" id="control-plane-heading">Control plane</p><p className="value">{service?.name ?? "Waiting for API"}</p></div></div>
           <div><p className="label">Version</p><p className="value">{service?.version ?? "—"}</p></div>
-          <a className="text-link" href="/swagger-ui/" target="_blank" rel="noreferrer">Open API <span aria-hidden="true">↗</span></a>
+          <nav className="tool-links" aria-label="Kratos tools">
+            {externalLinks.grafana_url && <a className="tool-link" href={externalLinks.grafana_url} target="_blank" rel="noreferrer"><span>Grafana</span><small>Dashboards, logs and traces</small><i aria-hidden="true">↗</i></a>}
+            {externalLinks.mlflow_url && <a className="tool-link" href={externalLinks.mlflow_url} target="_blank" rel="noreferrer"><span>MLflow</span><small>Experiments and models</small><i aria-hidden="true">↗</i></a>}
+            <a className="tool-link" href="/swagger-ui/" target="_blank" rel="noreferrer"><span>API</span><small>Developer reference</small><i aria-hidden="true">↗</i></a>
+          </nav>
         </article>
 
         <article className="card operator-card" aria-labelledby="operator-heading">
@@ -579,6 +595,7 @@ export function App() {
                           <p>{pluralise(job.current_attempt.observation_stream.accepted_through_sequence, "record")} accepted from attempt {job.current_attempt.attempt_number}.</p>
                           <p className="job-identity">Stream {job.current_attempt.observation_stream.stream_id}</p>
                           {job.current_attempt.observation_stream.mlflow_run_id && <p className="job-identity">MLflow run {job.current_attempt.observation_stream.mlflow_run_id}</p>}
+                          {externalLinks.mlflow_url && <a className="text-link" href={externalLinks.mlflow_url} target="_blank" rel="noreferrer">Open MLflow <span aria-hidden="true">↗</span></a>}
                           {job.current_attempt.observation_stream.mlflow_last_error && <p className="job-failure">MLflow is catching up: {job.current_attempt.observation_stream.mlflow_last_error}</p>}
                           {job.current_attempt.observation_counters && Object.keys(job.current_attempt.observation_counters).length > 0 && (
                             <details><summary>View delivery evidence</summary><dl className="observation-counters">
