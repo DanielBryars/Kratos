@@ -65,6 +65,8 @@ job state, the container listing and the Docker event log.
 - If the lease expires and the job is requeued or a second attempt starts, stop the exercise. That
   is bounded recovery, but it fails this exercise's single-execution replay path. Record both
   attempts and the `job.attempt.lease_expired` audit event before cancelling the job.
-- If the workload is still running when its runtime bound passes, the agent stops it locally and the
-  job is reported `FAILED` with a timeout after reconnection. That is correct lease behaviour but
-  not the replay path this exercise targets; repeat with a shorter outage.
+- If the workload is still running when its runtime bound passes, the agent **kills** the container
+  at that bound, with no grace period, and the job is reported `FAILED` with a timeout after
+  reconnection. Expect no interruption record from the workload: Kratos does not signal it. That
+  is correct lease behaviour but not the replay path this exercise targets; repeat with a shorter
+  outage.

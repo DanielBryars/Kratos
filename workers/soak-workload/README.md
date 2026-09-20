@@ -54,6 +54,17 @@ the result states plainly that these values are not claimed to be reproducible.
 
 ## Termination
 
+**Under Kratos this workload is never signalled.** When a job's authority ends — its runtime bound,
+its lease, or a cancellation — the agent kills the container outright, with no grace period, so
+that a workload which ignores `SIGTERM` cannot run past its authority. A run stopped by Kratos
+therefore produces **no `interrupted` record and no exit 143**: it is killed, and the control plane
+reports the attempt as timed out or cancelled. Do not expect this workload's interruption evidence
+from a Kratos timeout, a cancellation or the witnessed disconnect exercise.
+
+The `SIGTERM` handling below exists for an **external** runtime that does signal — an operator
+running `docker stop`, or a future protocol that adds a pre-expiry notice. It is correct, and it is
+tested, but it is not what Kratos invokes.
+
 On `SIGTERM` the workload stops within a few training steps, prints a `result` record with status
 `interrupted` describing what had been completed, and exits with code 143. It exits 0 only when the
 full duration has elapsed, and 1 on any failure.
@@ -68,11 +79,12 @@ no steps, and `deterministic_algorithms` is `false` when the stop arrived before
 configured. The `nvidia-smi` probe is bounded by a three second timeout so a wedged driver cannot
 hold up a stop; on timeout the driver is reported as `null` and the run continues.
 
-Two windows remain. A `SIGTERM` that arrives before the interpreter has installed the handler — the
-few seconds Python and PyTorch take to load — is ignored, because the workload is PID 1 in its
-container, and the stop falls back to the agent's SIGKILL. A `SIGTERM` that arrives inside a
+Two windows remain, both of which matter only to an external runtime. A `SIGTERM` that arrives
+before the interpreter has installed the handler — the few seconds Python and PyTorch take to load
+— is ignored, because the workload is PID 1 in its container. A `SIGTERM` that arrives inside a
 start-up call that cannot be interrupted is acted upon only when that call returns, so an unusually
-slow CUDA initialisation can still outlast the agent's grace period.
+slow CUDA initialisation can outlast a short grace. A supervisor in front of the interpreter would
+close the first window; none is included, because under Kratos neither window is reachable.
 
 Nothing is written to the filesystem, so the workload runs under the worker sandbox: no network, a
 read-only root filesystem, all capabilities dropped and a non-root user.

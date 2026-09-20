@@ -44,8 +44,9 @@ OUTPUT_LIMIT_BYTES = 16 * 1024
 RESULT_RESERVE_BYTES = 4 * 1024
 PROGRESS_RECORD_LIMIT_BYTES = 512
 EXIT_INTERRUPTED = 128 + signal.SIGTERM
-# The agent allows a short grace between SIGTERM and SIGKILL, so no single start-up phase may take
-# anything like that long; the driver probe is a subprocess and is bounded tightly.
+# Kratos does not signal a workload: at its authority boundary the agent kills the container
+# outright. This handling is for an external runtime that does signal, such as an operator
+# running `docker stop`, so a phase must still not block long enough to outlast that grace.
 DRIVER_PROBE_TIMEOUT_SECONDS = 3
 
 
