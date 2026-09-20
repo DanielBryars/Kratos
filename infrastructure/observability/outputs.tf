@@ -1,0 +1,28 @@
+output "enabled" {
+  description = "Whether this apply created the continuously billed observability resources."
+  value       = var.enable_observability
+}
+
+output "required_dns_records" {
+  description = "A records to create once, after the first enabled apply, before certificates issue."
+  value = var.enable_observability ? {
+    "grafana.${var.domain_name}" = google_compute_global_address.observability[0].address
+    "mlflow.${var.domain_name}"  = google_compute_global_address.observability[0].address
+    "otel.${var.domain_name}"    = google_compute_global_address.observability[0].address
+  } : {}
+}
+
+output "config_bucket" {
+  description = "Bucket the instance reads its observability bundle from."
+  value       = var.enable_observability ? google_storage_bucket.config[0].name : ""
+}
+
+output "telemetry_bucket" {
+  description = "Bucket holding Loki chunks, Tempo blocks and MLflow artefacts."
+  value       = var.enable_observability ? google_storage_bucket.telemetry[0].name : ""
+}
+
+output "instance_service_account" {
+  description = "Identity the instance runs as."
+  value       = var.enable_observability ? google_service_account.observability[0].email : ""
+}
