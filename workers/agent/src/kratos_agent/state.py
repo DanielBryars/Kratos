@@ -24,6 +24,7 @@ class AgentState:
     # The attempt's whole execution authority, so a restarted agent can enforce its bounds
     # without first reaching the control plane.
     started_assignment: JobAssignment | None = None
+    retained_attempt_ids: tuple[UUID, ...] = ()
 
     @property
     def is_enrolled(self) -> bool:
@@ -49,6 +50,9 @@ def load_state(path: Path) -> AgentState | None:
         started_attempt_id=(
             UUID(payload["started_attempt_id"]) if payload.get("started_attempt_id") else None
         ),
+        retained_attempt_ids=tuple(
+            UUID(value) for value in payload.get("retained_attempt_ids", ())
+        ),
         started_assignment=(
             JobAssignment.model_validate(payload["started_assignment"])
             if payload.get("started_assignment")
@@ -67,6 +71,7 @@ def save_state(path: Path, state: AgentState) -> None:
     payload["started_attempt_id"] = (
         str(state.started_attempt_id) if state.started_attempt_id else None
     )
+    payload["retained_attempt_ids"] = [str(value) for value in state.retained_attempt_ids]
     payload["started_assignment"] = (
         state.started_assignment.model_dump(mode="json") if state.started_assignment else None
     )

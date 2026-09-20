@@ -1,5 +1,6 @@
 """HTTPS client for the versioned worker protocol."""
 
+import hashlib
 from dataclasses import dataclass
 from typing import TypeVar
 from urllib.parse import urlparse
@@ -9,7 +10,16 @@ import httpx
 from pydantic import ValidationError
 
 from kratos_agent.models import (
+    PROTOCOL_VERSION,
+    AbandonArtifactUploadRequest,
+    ArtifactManifestFile,
+    ArtifactManifestResponse,
+    ArtifactResponse,
+    BeginArtifactUploadRequest,
+    BeginArtifactUploadResponse,
     ClaimRegistrationRequest,
+    CompleteArtifactUploadRequest,
+    DeclareArtifactManifestRequest,
     EnrolmentRequest,
     EnrolmentResponse,
     HeartbeatRequest,
@@ -24,11 +34,14 @@ from kratos_agent.models import (
 
 ResponseModel = TypeVar(
     "ResponseModel",
+    ArtifactResponse,
     EnrolmentResponse,
     HeartbeatResponse,
     RegistrationCreatedResponse,
     RegistrationStatusResponse,
     JobResultResponse,
+    ArtifactManifestResponse,
+    BeginArtifactUploadResponse,
 )
 
 
@@ -53,9 +66,13 @@ class WorkerProtocolClient:
             follow_redirects=False,
             transport=transport,
         )
+        # Object bytes go straight to Cloud Storage, not through the control plane, so they use a
+        # separate client with no base URL and no Kratos credential attached.
+        self.storage = httpx.Client(follow_redirects=False, transport=transport)
 
     def close(self) -> None:
         self._client.close()
+        self.storage.close()
 
     def __enter__(self) -> "WorkerProtocolClient":
         return self
@@ -148,6 +165,85 @@ class WorkerProtocolClient:
             json=result.model_dump(mode="json"),
         )
         return self._parse(response, JobResultResponse)
+
+    def declare_artifact_manifest(
+        self,
+        worker_id: UUID,
+        credential: str,
+        attempt_id: UUID,
+        manifest_id: UUID,
+        files: tuple[ArtifactManifestFile, ...],
+    ) -> ArtifactManifestResponse:
+        request = DeclareArtifactManifestRequest(
+            protocol_version=PROTOCOL_VERSION, manifest_id=manifest_id, files=files
+        )
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifact-manifest",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, ArtifactManifestResponse)
+
+    def begin_artifact_upload(
+        self, worker_id: UUID, credential: str, attempt_id: UUID, artifact_id: UUID
+    ) -> BeginArtifactUploadResponse:
+        request = BeginArtifactUploadRequest(protocol_version=PROTOCOL_VERSION)
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/upload",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, BeginArtifactUploadResponse)
+
+    def complete_artifact_upload(
+        self,
+        worker_id: UUID,
+        credential: str,
+        attempt_id: UUID,
+        artifact: ArtifactManifestFile,
+        artifact_id: UUID,
+        storage_generation: int,
+    ) -> ArtifactResponse:
+        request = CompleteArtifactUploadRequest(
+            protocol_version=PROTOCOL_VERSION,
+            storage_generation=storage_generation,
+            byte_length=artifact.byte_length,
+            sha256=artifact.sha256,
+            crc32c=artifact.crc32c,
+        )
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}"
+            f"/artifacts/{artifact_id}/complete-upload",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, ArtifactResponse)
+
+    def abandon_artifact_upload(
+        self,
+        worker_id: UUID,
+        credential: str,
+        attempt_id: UUID,
+        artifact_id: UUID,
+        session_uri: str,
+    ) -> None:
+        """Consume a session Cloud Storage has rejected, so a replacement may be issued.
+
+        The URI is a credential, so only its fingerprint is sent. That fingerprint also stops a
+        delayed request cancelling a session issued after it.
+        """
+        request = AbandonArtifactUploadRequest(
+            protocol_version=PROTOCOL_VERSION,
+            session_uri_sha256=hashlib.sha256(session_uri.encode("utf-8")).hexdigest(),
+        )
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}"
+            f"/artifacts/{artifact_id}/abandon-upload",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        if response.status_code != 204:
+            self._parse(response, ArtifactManifestResponse)
 
     @staticmethod
     def _parse(response: httpx.Response, model: type[ResponseModel]) -> ResponseModel:

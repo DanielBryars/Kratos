@@ -70,6 +70,7 @@ docker run --detach --restart unless-stopped --gpus all \
   --mount type=bind,source=/secure/path/enrolment,target=/run/secrets/kratos-enrolment,readonly \
   ghcr.io/danielbryars/kratos-agent:edge run \
   --display-name "Home GPU 1" \
+  --state-volume kratos-agent-state \
   --enrolment-credential-file /run/secrets/kratos-enrolment
 ```
 
@@ -164,5 +165,42 @@ or modification or change time differs after hashing is rejected. The builder re
 with every manifest entry. The uploader SHALL re-check it on the descriptor it sends, or hash again
 immediately before transfer, so the uploaded bytes cannot differ from the manifest.
 
-This is not yet connected to job execution. The agent still advertises protocol `1.0`, so the
-control plane assigns it no job with output requirements until the mount and upload steps exist.
+
+## Durable outputs
+
+A job may declare output requirements. The agent advertises protocol `1.1` **only when it could
+actually deliver them**: it needs `--state-volume`, a reachable Docker Engine 26 or later for
+volume subpath support, that volume to exist, and the pinned cleanup image already local. The
+cleanup image is fetched during that check, while the worker is still free to decline the
+capability, because cleanup runs *after* a job has succeeded and must not depend on a registry
+being reachable then. When any of those is missing the agent says so on startup and advertises
+`1.0`, so the scheduler never assigns work the worker would have to reject.
+
+Before the container starts, the agent mounts the subpath `attempts/<attempt-id>/outputs` of its
+own state volume at `/kratos/outputs`, writable. Only that subdirectory is exposed: the volume root
+holds the worker credential and the device private key, and the job never sees it. This needs
+Docker Engine 26 or later for volume subpath support, and the agent must know its volume name,
+which `--state-volume` supplies and the installer passes. A job that declares outputs fails with an
+actionable message if that name is missing, rather than falling back to a weaker mount.
+
+Only a **successful** workload waits on delivery. A failed or timed-out result is reported
+immediately, because the control plane gates mandatory outputs on success alone; storage being
+unavailable must never hide a workload failure or leave the worker occupied. If the control plane
+withdraws the attempt while the container runs, the agent abandons delivery, reports the terminal
+result and cleans up.
+
+After a successful container stops, the agent builds the manifest described above, submits it, and
+for each artefact requests an upload session, sends the bytes, and reports the generation Cloud
+Storage returned. Only then does it report the job result, because the control plane refuses a
+successful result while a mandatory artefact is unverified. A job whose outputs cannot be collected
+is reported as a failure rather than as a success that would be refused.
+
+Transfers resume: the agent asks Cloud Storage what it already holds and continues from the
+acknowledged offset, so an interrupted upload does not restart. Each file is reopened and
+re-checked against the identity recorded during hashing, so a file altered between hashing and
+transfer is never sent under the manifest's checksums. A session that is refused, or that stops
+making progress, is abandoned through `abandon-upload`, which carries only a SHA-256 fingerprint of
+the URI, and a replacement is requested. If the manifest already carries a `storage_generation` the
+bytes arrived and only the acknowledgement was lost, so the agent completes rather than uploading
+again. Session URIs are credentials and never reach a log. Retained outputs are discarded only once the control plane has
+acknowledged the result.
