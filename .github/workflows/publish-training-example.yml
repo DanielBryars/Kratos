@@ -1,0 +1,67 @@
+name: Publish training example
+
+on:
+  push:
+    branches: [main]
+    tags: ["training-v*"]
+    paths:
+      - "workers/training-example/**"
+      - ".github/workflows/publish-training-example.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/danielbryars/kratos-training-example
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+            type=match,pattern=training-v(.*),group=1
+      - name: Build image for security scan
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: workers/training-example/Dockerfile
+          load: true
+          tags: kratos-training-example:scan
+          cache-from: type=gha,scope=training-example
+          cache-to: type=gha,mode=max,scope=training-example
+      - name: Scan image for fixable high-severity vulnerabilities
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: kratos-training-example:scan
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: workers/training-example/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=training-example
+          cache-to: type=gha,mode=max,scope=training-example
+          provenance: mode=max
+          sbom: true
+      - name: Record published digest
+        run: echo "Published ${{ steps.metadata.outputs.tags }} at ${{ steps.build.outputs.digest }}"

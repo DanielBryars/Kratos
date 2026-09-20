@@ -107,6 +107,23 @@ jobs:
       - run: uv run --python 3.12 ruff check .
       - run: uv run --python 3.12 mypy health_check.py
 
+  training-example:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/training-example
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.19"
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - run: uv run --python 3.12 ruff format --check .
+      - run: uv run --python 3.12 ruff check .
+      - run: uv run --python 3.12 mypy train.py tests
+      - run: uv run --python 3.12 pytest
+
   infrastructure:
     runs-on: ubuntu-latest
     steps:
@@ -153,3 +170,11 @@ jobs:
           tags: kratos-gpu-health-check:ci
           cache-from: type=gha,scope=gpu-health-check
           cache-to: type=gha,mode=max,scope=gpu-health-check
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: workers/training-example/Dockerfile
+          push: false
+          tags: kratos-training-example:ci
+          cache-from: type=gha,scope=training-example
+          cache-to: type=gha,mode=max,scope=training-example
