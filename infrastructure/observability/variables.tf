@@ -65,34 +65,6 @@ variable "iap_member" {
   type        = string
 }
 
-variable "oauth_client_id" {
-  description = <<-EOT
-    IAP OAuth client identifier. Created by the user; not managed by Terraform. Required whenever
-    observability is enabled, because a backend service created with IAP disabled would publish
-    Grafana and MLflow to the internet unauthenticated.
-  EOT
-  type        = string
-  default     = ""
-}
-
-variable "oauth_client_secret" {
-  description = <<-EOT
-    IAP OAuth client secret. Created by the user; not managed by Terraform. Terraform stores this
-    in state, so the state bucket is as sensitive as the secret; see the README.
-  EOT
-  type        = string
-  default     = ""
-  sensitive   = true
-}
-
-variable "require_iap_client" {
-  description = <<-EOT
-    Refuse to plan an enabled stack without an IAP OAuth client. Leave this true: turning it off
-    creates backend services with IAP disabled, which publishes Grafana and MLflow to the internet.
-  EOT
-  type        = bool
-  default     = true
-}
 
 variable "enable_otlp_ingress" {
   description = <<-EOT

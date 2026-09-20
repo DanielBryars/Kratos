@@ -5,27 +5,10 @@
 #
 # Only Grafana, MLflow and the OTLP gateway are reachable, all through an HTTPS load balancer.
 # Grafana and MLflow sit behind Identity-Aware Proxy so a human must sign in before reaching the
-# service itself. Prometheus, Loki and Tempo have no route from outside the VPC, which is what
+# service itself. Kratos itself authenticates humans through Cloud Identity Platform rather than
+# IAP; the two are different mechanisms, and the principal authorised here is the same Google
+# account either way. Prometheus, Loki and Tempo have no route from outside the VPC, which is what
 # ADR-009 requires of the backends.
-
-# Fail the plan, before anything billable exists, rather than creating backend services with IAP
-# disabled and publishing Grafana and MLflow unauthenticated.
-resource "terraform_data" "iap_client_required" {
-  count = local.enabled
-
-  lifecycle {
-    precondition {
-      condition = !var.require_iap_client || (
-        var.oauth_client_id != "" && var.oauth_client_secret != ""
-      )
-      error_message = join(" ", [
-        "enable_observability is true but no IAP OAuth client was supplied.",
-        "Create the client, then pass oauth_client_id and oauth_client_secret.",
-        "Grafana and MLflow would otherwise be published without authentication.",
-      ])
-    }
-  }
-}
 
 locals {
   enabled = var.enable_observability ? 1 : 0
@@ -461,12 +444,18 @@ resource "google_compute_backend_service" "human" {
     group = google_compute_instance_group.observability[0].id
   }
 
-  # Human access is IAP-only. Without an OAuth client the service is created with IAP disabled,
-  # which would publish it unauthenticated, so the plan requires the client identifier.
+  # Human access is IAP-only, with a Google-managed OAuth client.
+  #
+  # A custom client is possible -- the IAP OAuth Admin *API* was shut down on 19 March 2026, but
+  # one can still be created by hand in the console. It is not wanted here. Browser access is a
+  # single principal inside this project's own organisation, and there is no need for custom
+  # consent branding or for users outside it. The managed client is therefore the simpler choice,
+  # and it leaves no secret to create, rotate, or hold in Terraform state.
+  #
+  # `enabled` is what turns IAP on, and it is unconditional. Omitting an OAuth client does not
+  # disable it.
   iap {
-    enabled              = true
-    oauth2_client_id     = var.oauth_client_id
-    oauth2_client_secret = var.oauth_client_secret
+    enabled = true
   }
 
   log_config {
