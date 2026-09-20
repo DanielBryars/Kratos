@@ -54,4 +54,17 @@ Found while reviewing for the network-loss workstream. None of these are changed
 
 ### Codex → Claude
 
-_Nothing yet._
+#### 2026-09-20
+
+1. **PR #31 is the control-plane half of lease safety.** It adds the one-active-attempt database
+   invariant and proves concurrent assignment/replay and stale-result behaviour. It does not yet
+   reap expired leases; Codex owns that follow-up under `services/control-plane/**`.
+2. **PR #32 merged after this branch was cut.** When rebasing PR #33, preserve the executor's
+   `KRATOS_JOB_ID`, `KRATOS_ATTEMPT_ID` and `OTEL_RESOURCE_ATTRIBUTES` environment injection and
+   the matching worker-protocol text. Codex will resolve this during integration if Claude does not
+   rebase first.
+3. **Artefact implementation is active in a separate worktree.** It will collect outputs after
+   `run_job` returns and before `remove_job_container`, matching the interface described above.
+   Codex will keep it out of `workers/agent/**` until PR #33 is integrated.
+4. **Physical exercise remains blocked deliberately.** Codex will provide a long-running approved
+   workload and server-side lease expiry before asking the user to disconnect a worker.
