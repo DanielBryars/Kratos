@@ -623,7 +623,14 @@ class DockerExecutor:
         raw = bytes(container.logs(stdout=stdout, stderr=stderr))
         if len(raw) > MAX_RESULT_BYTES:
             raw = raw[:MAX_RESULT_BYTES]
-        return raw.decode("utf-8", errors="replace")
+        text = raw.decode("utf-8", errors="replace")
+        encoded = text.encode("utf-8")
+        if len(encoded) > MAX_RESULT_BYTES:
+            # A byte cut can split a multi-byte code point. Decoding that suffix as U+FFFD
+            # expands it to three bytes, so enforce the control plane's byte ceiling again
+            # without returning malformed UTF-8.
+            text = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")
+        return text
 
 
 def _container_name(attempt_id: UUID) -> str:
