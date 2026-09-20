@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -6,7 +7,7 @@ from uuid import UUID
 import docker
 import pytest
 
-from kratos_agent.executor import DockerExecutor, ExecutorError
+from kratos_agent.executor import DockerExecutor, EnforcementError, ExecutorError
 from kratos_agent.models import GpuHealthStatus, JobAssignment
 
 IMAGE_ID = "sha256:" + ("a" * 64)
@@ -128,6 +129,7 @@ class FakeClock:
     def __init__(self) -> None:
         self.now = T0
         self.slept: list[float] = []
+        self.on_sleep: Callable[[], None] | None = None
 
     def __call__(self) -> datetime:
         return self.now
@@ -135,6 +137,8 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         self.slept.append(seconds)
         self.now += timedelta(seconds=seconds)
+        if self.on_sleep is not None:
+            self.on_sleep()
 
 
 class JobContainer:
@@ -153,6 +157,7 @@ class JobContainer:
         self.started_at = started_at
         self.exits_at = exits_at
         self.killed = False
+        self.unkillable = False
         self.attrs: dict[str, Any] = {}
         self._publish()
 
@@ -183,6 +188,8 @@ class JobContainer:
 
     def kill(self) -> None:
         self.killed = True
+        if self.unkillable:
+            raise docker.errors.APIError("cannot kill container")
         self.status = "exited"
         self.exits_at = self.clock.now
         self._publish()
@@ -496,3 +503,53 @@ def test_container_killed_at_its_bound_is_described_the_same_way_when_reported_l
 
     assert (result.exit_code, result.timed_out) == (124, True)
     assert result.failure_message == "execution exceeded 120 seconds"
+
+
+def test_container_that_cannot_be_killed_is_not_reported_as_a_result() -> None:
+    # Reporting a result here would tell the control plane the attempt is over while the
+    # workload is still running beyond its authority.
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
+    existing.unkillable = True
+
+    with pytest.raises(EnforcementError, match="outlived its authority and could not be stopped"):
+        job_executor(clock, JobClient(clock, existing)).run_job(job_assignment(), may_start=False)
+
+    assert existing.status == "running"
+    assert clock.slept[-2:] == [1.0, 1.0]
+
+
+def test_kill_that_wins_on_a_later_attempt_is_reported_normally() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
+    existing.unkillable = True
+
+    def relent() -> None:
+        existing.unkillable = False
+
+    clock.on_sleep = relent
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
+
+    assert existing.status == "exited"
+    assert (result.exit_code, result.timed_out) == (124, True)
+    assert result.failure_message == "execution exceeded 120 seconds"
+
+
+def test_attempt_without_recorded_bounds_is_stopped_but_kept() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=10))
+    client = JobClient(clock, existing)
+
+    job_executor(clock, client).stop_unbounded_attempt(job_assignment().attempt_id)
+
+    assert existing.killed is True
+    assert existing.status == "exited"
+
+
+def test_stopping_an_absent_unbounded_attempt_is_harmless() -> None:
+    clock = FakeClock()
+
+    job_executor(clock, JobClient(clock)).stop_unbounded_attempt(job_assignment().attempt_id)

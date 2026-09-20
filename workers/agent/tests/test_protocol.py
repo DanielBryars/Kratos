@@ -218,6 +218,7 @@ class FakeJobExecutor(DockerExecutor):
         self.prepared: list[UUID] = []
         self.runs: list[tuple[UUID, bool]] = []
         self.removed: list[UUID] = []
+        self.stopped_unbounded: list[UUID] = []
         self.ticks = 0
         self.authorised: list[bool] = []
         self.tick_seconds: float | None = None
@@ -244,6 +245,9 @@ class FakeJobExecutor(DockerExecutor):
 
     def remove_job_container(self, attempt_id: UUID) -> None:
         self.removed.append(attempt_id)
+
+    def stop_unbounded_attempt(self, attempt_id: UUID) -> None:
+        self.stopped_unbounded.append(attempt_id)
 
 
 def heartbeat_response(request: httpx.Request, *, assigned: bool) -> httpx.Response:
@@ -674,3 +678,66 @@ def test_recorded_assignment_survives_a_state_round_trip(tmp_path: Path) -> None
     )
 
     assert load_state(state_path) == state
+
+
+def test_state_written_before_bounds_were_recorded_still_stops_its_container(
+    tmp_path: Path,
+) -> None:
+    # An agent upgraded in place during an outage: its state file names an attempt but predates
+    # the recorded bounds, so it cannot show the container is still authorised.
+    clock = FakeClock()
+    container = JobContainer(clock, started_at=T0 - timedelta(seconds=10))
+    executor = DockerExecutor(JobClient(clock, container), clock=clock, sleep=clock.sleep)
+    attempt_id = job_assignment().attempt_id
+    state_path = tmp_path / "agent.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "agent_instance_id": str(UUID(int=1)),
+                "worker_id": str(WORKER_ID),
+                "worker_credential": WORKER_SECRET,
+                "next_sequence": 4,
+                "heartbeat_interval_seconds": 30,
+                "started_attempt_id": str(attempt_id),
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy = load_state(state_path)
+    assert legacy is not None and legacy.started_assignment is None
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(unreachable)
+    ) as client:
+        job_runner(client, state_path, executor).step(legacy)
+
+    assert container.killed is True
+    assert container.status == "exited"
+
+
+def test_unstoppable_container_blocks_any_result_report(tmp_path: Path) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return heartbeat_response(request, assigned=True)
+
+    clock = FakeClock()
+    container = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
+    container.unkillable = True
+    executor = DockerExecutor(JobClient(clock, container), clock=clock, sleep=clock.sleep)
+    assignment = job_assignment()
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(
+        state_path, started_attempt_id=assignment.attempt_id, started_assignment=assignment
+    )
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        after = job_runner(client, state_path, executor).step(state)
+
+    assert not any(path.endswith("/result") for path in requests)
+    assert after.started_assignment == assignment
+    assert container.status == "running"

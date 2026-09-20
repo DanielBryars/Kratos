@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
-from kratos_agent.executor import DockerExecutor, ExecutorError
+from kratos_agent.executor import DockerExecutor, EnforcementError, ExecutorError
 from kratos_agent.models import (
     HeartbeatResponse,
     JobAssignment,
@@ -271,17 +271,23 @@ class AgentRunner:
         state is reloaded after a failure and the next heartbeat resumes the same attempt.
         """
         try:
-            if self._executor is not None and state.started_assignment is not None:
+            recorded_attempt_id = state.started_attempt_id
+            if self._executor is not None and recorded_attempt_id is not None:
                 # A recorded attempt is supervised to the end of its authority before anything
                 # that needs the control plane, so a restart during an outage still enforces
                 # its bounds. The heartbeat below then reports the finished container.
-                state = self._supervise(state, state.started_assignment, may_start=False)[0]
+                if state.started_assignment is not None:
+                    state = self._supervise(state, state.started_assignment, may_start=False)[0]
+                else:
+                    # A state file written before the bounds were recorded.
+                    self._executor.stop_unbounded_attempt(recorded_attempt_id)
             return self.heartbeat_once(state)
         except (
             CapabilityCollectionError,
-            ControlPlaneError,
             DockerException,
+            EnforcementError,
             httpx.TransportError,
+            ControlPlaneError,
         ) as error:
             if isinstance(error, ControlPlaneError) and not _is_transient(error):
                 raise

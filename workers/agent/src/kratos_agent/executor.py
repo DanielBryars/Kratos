@@ -1,5 +1,6 @@
 """Constrained Docker execution for controlled worker operations."""
 
+import contextlib
 import json
 import re
 import time
@@ -24,11 +25,22 @@ MAX_FAILURE_MESSAGE_CHARS = 1_000
 SUPERVISION_POLL_SECONDS = 1.0
 # How late a bound may be enforced: one poll plus one in-flight heartbeat and its collection.
 ENFORCEMENT_TOLERANCE = timedelta(seconds=30)
+# How hard the agent tries to stop a container before it admits it cannot.
+KILL_ATTEMPTS = 3
+KILL_RETRY_SECONDS = 1.0
 ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 
 class ExecutorError(RuntimeError):
     """The local container executor could not produce trustworthy evidence."""
+
+
+class EnforcementError(ExecutorError):
+    """A container outlived its authority and could not be stopped.
+
+    This is never a job result. The attempt stays recorded so the agent retries
+    enforcement rather than reporting an outcome while the workload still runs.
+    """
 
 
 class DockerExecutor:
@@ -140,6 +152,7 @@ class DockerExecutor:
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
         container_name = _container_name(assignment.attempt_id)
+        logical_name = f"attempt {assignment.attempt_id}"
         job_id = str(assignment.job_id)
         attempt_id = str(assignment.attempt_id)
         try:
@@ -223,10 +236,7 @@ class DockerExecutor:
             self._sleep(min(SUPERVISION_POLL_SECONDS, (deadline - now).total_seconds()))
         if failure_message is not None:
             exit_code = 124 if timed_out else 125
-            try:
-                container.kill()
-            except Exception:
-                failure_message = f"{failure_message}; container kill failed"
+            self._kill(container, logical_name)
         else:
             # A container that has already exited is reported with its real exit status, even
             # when a network outage held the result back beyond the lease.
@@ -254,11 +264,45 @@ class DockerExecutor:
             failure_message=failure_message,
         )
 
+    def _kill(self, container: Any, logical_name: str) -> None:
+        """Stop a container whose authority has ended, or refuse to report a result."""
+        for remaining in range(KILL_ATTEMPTS - 1, -1, -1):
+            # The container may simply have exited between the check and the kill.
+            with contextlib.suppress(Exception):
+                container.kill()
+            try:
+                container.reload()
+                if container.status not in ACTIVE_CONTAINER_STATUSES:
+                    return
+            except docker.errors.NotFound:
+                return
+            except Exception:
+                # Without a confirmed status the agent cannot claim the workload stopped.
+                pass
+            if remaining:
+                self._sleep(KILL_RETRY_SECONDS)
+        raise EnforcementError(f"{logical_name} outlived its authority and could not be stopped")
+
     def remove_job_container(self, attempt_id: UUID) -> None:
         try:
             self._client.containers.get(_container_name(attempt_id)).remove(force=True)
         except docker.errors.NotFound:
             return
+
+    def stop_unbounded_attempt(self, attempt_id: UUID) -> None:
+        """Stop a container whose recorded authority is unknown, keeping it for reporting.
+
+        An agent upgraded in place during an outage can hold an attempt identifier from an
+        older state file without the bounds needed to supervise it. It cannot show the
+        container is still authorised, so it stops it and leaves it for the control plane.
+        """
+        try:
+            container = self._client.containers.get(_container_name(attempt_id))
+        except docker.errors.NotFound:
+            return
+        container.reload()
+        if container.status in ACTIVE_CONTAINER_STATUSES:
+            self._kill(container, f"attempt {attempt_id}")
 
     @staticmethod
     def _bounded_log(container: Any, *, stdout: bool, stderr: bool) -> str:

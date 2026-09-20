@@ -200,8 +200,11 @@ to observe the host's capabilities, SHALL end supervision of a running container
 
 Known limitations of this slice: the lease deadline is compared with the worker's clock, so worker
 clock error shifts the local bound; a heartbeat in progress can delay enforcement of a bound by up
-to the fifteen-second request timeout; and no bound is enforced while the agent process itself is
-not running, which is why an overrun found afterwards is reported as a failure.
+to about twenty-five seconds, being a ten-second capability collection followed by a fifteen-second
+request timeout, plus the polling interval; and no bound is enforced while the agent process itself
+is not running, which is why an overrun found afterwards is reported as a failure. A container that
+cannot be killed is reported as no result at all: the attempt stays recorded and enforcement is
+retried, because a result would tell the control plane the attempt had ended while it had not.
 
 The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
 `PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be
