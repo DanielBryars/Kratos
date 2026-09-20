@@ -17,6 +17,7 @@ import {
   type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
+import { buildJobSubmission } from "./jobSubmission";
 
 type Version = { name: string; version: string };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
@@ -133,7 +134,20 @@ export function App() {
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
+  const [durableOutputEnabled, setDurableOutputEnabled] = useState(false);
+  const [durableOutputPath, setDurableOutputPath] = useState("model.pt");
+  const [durableOutputRole, setDurableOutputRole] = useState("model");
+  const [durableOutputMediaType, setDurableOutputMediaType] = useState("application/x-pytorch");
+  const [durableOutputMaxMiB, setDurableOutputMaxMiB] = useState(1);
   const [jobAction, setJobAction] = useState(false);
+  const durableOutputValid = !durableOutputEnabled || (
+    durableOutputPath.trim().length > 0
+    && durableOutputRole.trim().length > 0
+    && durableOutputMediaType.trim().length > 0
+    && Number.isInteger(durableOutputMaxMiB)
+    && durableOutputMaxMiB >= 1
+    && durableOutputMaxMiB <= 5120
+  );
 
   useEffect(() => {
     fetch("/api/v1/version")
@@ -335,7 +349,13 @@ export function App() {
       const response = await fetch("/api/v1/operator/jobs", {
         method: "POST",
         headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: jobName, image_reference: jobImage, timeout_seconds: jobTimeout }),
+        body: JSON.stringify(buildJobSubmission(jobName, jobImage, jobTimeout, {
+          enabled: durableOutputEnabled,
+          logicalPath: durableOutputPath,
+          role: durableOutputRole,
+          mediaType: durableOutputMediaType,
+          maxMiB: durableOutputMaxMiB,
+        })),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as ApiError;
@@ -449,7 +469,21 @@ export function App() {
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /></label>
                   <label>Immutable image<input value={jobImage} onChange={(event) => setJobImage(event.target.value)} /></label>
                   <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
-                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim()} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                </div>
+                <div className="output-contract">
+                  <label className="output-toggle">
+                    <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => setDurableOutputEnabled(event.target.checked)} />
+                    Require one durable output
+                  </label>
+                  {durableOutputEnabled && (
+                    <div className="output-fields">
+                      <label>Path<input value={durableOutputPath} maxLength={240} onChange={(event) => setDurableOutputPath(event.target.value)} /></label>
+                      <label>Role<input value={durableOutputRole} maxLength={32} onChange={(event) => setDurableOutputRole(event.target.value)} /></label>
+                      <label>Media type<input value={durableOutputMediaType} maxLength={127} onChange={(event) => setDurableOutputMediaType(event.target.value)} /></label>
+                      <label>Maximum MiB<input type="number" min={1} max={5120} value={durableOutputMaxMiB} onChange={(event) => setDurableOutputMaxMiB(Number(event.target.value))} /></label>
+                    </div>
+                  )}
                 </div>
                 {jobsSnapshotState === "loading" && <p className="muted compact">Loading jobs and output status…</p>}
                 {jobsSnapshotState === "empty" && <p className="muted compact">No jobs have been submitted.</p>}

@@ -25,7 +25,8 @@ WORKLOAD_VERSION = "kratos-training-example-v1"
 DATASET_VERSION = "kratos-shapes-v1"
 DATASET_SHA256 = "c338e2ffabc1a0470ad2d4c0b9efa3ab53a82135aaca54845b3a3ebafd746451"
 DATASET_PATH = Path(__file__).parent / "data" / "kratos_shapes_v1.csv"
-CHECKPOINT_PATH = Path("/tmp/kratos-training-example-v1.pt")
+OUTPUT_DIRECTORY = Path("/kratos/outputs")
+CHECKPOINT_PATH = OUTPUT_DIRECTORY / "model.pt"
 SEED = 20260920
 EPOCHS = 180
 LEARNING_RATE = 0.025
@@ -76,6 +77,14 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(64 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def save_checkpoint(checkpoint: dict[str, Any], path: Path = CHECKPOINT_PATH) -> str:
+    """Write the model only to the worker-provided durable-output mount."""
+    if not path.parent.is_dir():
+        raise RuntimeError(f"durable output directory is unavailable: {path.parent}")
+    torch.save(checkpoint, path)
+    return sha256_file(path)
 
 
 def verify_dataset(path: Path = DATASET_PATH) -> str:
@@ -196,8 +205,7 @@ def run_training() -> dict[str, Any]:
         "seed": SEED,
         "model_state_dict": model.state_dict(),
     }
-    torch.save(checkpoint, CHECKPOINT_PATH)
-    checkpoint_hash = sha256_file(CHECKPOINT_PATH)
+    checkpoint_hash = save_checkpoint(checkpoint)
     properties = torch.cuda.get_device_properties(device)
 
     return {
@@ -238,7 +246,7 @@ def run_training() -> dict[str, Any]:
             "state_sha256": state_hash,
             "checkpoint_sha256": checkpoint_hash,
             "checkpoint_location": str(CHECKPOINT_PATH),
-            "checkpoint_durable": False,
+            "checkpoint_staged": True,
         },
         "environment": {
             "python": platform.python_version(),

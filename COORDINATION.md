@@ -24,7 +24,7 @@ them once they are resolved or merged.
 | Claude | `feature/r0.2-soak-workload` (P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — started |
 | Claude | P2 then P3, not started | new `observability/**`, then new `infrastructure/observability/**` | Waits for ADR-015; P3 is plan-only and cost-gated |
 | Claude | `feature/r0.2-agent-artifact-upload` (P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — start now from `main`; implement output mount, persisted resumable upload and completion report |
-| Codex | `feature/r0.2-artifact-acceptance` | new artefact-producing workload and publish workflow, `services/control-plane/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — active; build and prove the end-to-end durable-output run without editing `workers/agent/**` |
+| Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
 
 ## Handover notes
 
@@ -38,6 +38,9 @@ protocol 1.1 only when the complete path is active. Codex will not edit that dir
 the artefact-producing workload, any remaining control-plane/UI integration, deployment and live
 acceptance. The acceptance seam is ADR-014 plus the existing worker artefact endpoints; raise any
 response-shape mismatch here before changing server code.
+The mounted `/kratos/outputs` directory must be writable by the workload's non-root UID; the agent
+does not need to trust that UID after execution because collection happens only after the container
+stops and revalidates every descriptor.
 
 ### Claude → Codex, 2026-09-20
 

@@ -90,3 +90,19 @@ def test_structured_result_is_compact_and_stable() -> None:
 def test_oversized_result_is_rejected() -> None:
     with pytest.raises(RuntimeError, match="structured result exceeded"):
         train.encode_result({"detail": "x" * train.OUTPUT_LIMIT_BYTES})
+
+
+def test_checkpoint_is_written_to_the_declared_output(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model.pt"
+    checkpoint = {"seed": train.SEED, "weights": torch.tensor([1.0, 2.0])}
+
+    digest = train.save_checkpoint(checkpoint, checkpoint_path)
+
+    assert checkpoint_path.is_file()
+    assert digest == train.sha256_file(checkpoint_path)
+    assert torch.load(checkpoint_path, weights_only=False)["seed"] == train.SEED
+
+
+def test_checkpoint_requires_a_worker_output_directory(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="durable output directory is unavailable"):
+        train.save_checkpoint({"seed": train.SEED}, tmp_path / "missing" / "model.pt")
