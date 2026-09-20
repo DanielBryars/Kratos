@@ -6,6 +6,7 @@ Terraform is separated into three independently applied roots:
 - `platform`: project APIs, Artifact Registry and the runtime identity.
 - `migration`: the separately deployed and executed schema migration job.
 - `application`: the Cloud Run service for one immutable image.
+- `observability`: the ADR-009 telemetry stack, gated off by default.
 
 This separation lets CI create the image repository before an application image exists. It also prevents routine application releases from refreshing bootstrap identity resources.
 
@@ -106,3 +107,135 @@ absent.
 
 The web console supports 15, 30 and 60 minute enrolments. It displays the credential once and keeps
 it only in browser memory; reloading the page requires the operator to issue a replacement.
+
+## Observability cost gate
+
+The `observability` root builds the [ADR-009](../docs/architecture/decisions/009-observability-and-mlflow.md)
+stack — Grafana, Prometheus, Loki, Tempo, an OpenTelemetry Collector gateway and MLflow — on one
+Compute Engine instance. Its configuration is the bundle in
+[`observability/`](../observability/README.md), applied with `compose.cloud.yaml`, which is the
+overlay that makes that bundle serve a load balancer and keep its data off the boot disk.
+
+`enable_observability` defaults to `false`. With the gate closed the root plans **nothing that
+bills**: no instance, no disk, no load balancer. Unlike Cloud Run, an instance and a persistent disk
+bill continuously whether or not anyone opens a dashboard, so enabling it is the user's decision and
+no workflow sets it. CI only formats and validates.
+
+One resource is deliberately outside that gate. If `billing_account` is supplied, a closed plan
+creates **two**: a budget for the project and the Billing Budgets API it needs. A budget should
+exist before anything starts spending and should outlive whatever it watches, so gating it behind
+the stack would defeat it. Neither resource bills. With no `billing_account` the closed plan is
+still empty, and an *enabled* plan is refused outright until one is supplied — the stack cannot be
+switched on unwatched.
+
+A budget **alerts; it does not cap**. Spend continues past it. The only hard stop Google offers is
+removing the billing account from the project, which takes the whole project down with it, so it is
+not wired up here.
+
+### Who applies this
+
+A human operator applies this root with their own credentials. The federated deployment identity
+used by CI is deliberately **not** granted the Compute, Secret Manager, IAP and Storage roles this
+root needs: an automated pipeline that could create billable infrastructure or alter an
+authentication boundary is a larger blast radius than the convenience is worth.
+
+### Before the first enabled apply
+
+1. **Decide the spend.** One `e2-standard-2`, a 50 GB balanced disk, a load balancer, NAT and
+   egress bill continuously. Take the current figures from GCP's price list for your region rather
+   than from this file. `monthly_budget` defaults to 300 in the billing account's own currency.
+2. **Check you can manage the budget.** The budget is created against the billing account, not the
+   project, and project-level ownership does not carry that permission. Whoever applies needs
+   **Billing Account Administrator** (`roles/billing.admin`), or Billing Account Costs Manager
+   (`roles/billing.costsManager`), on the account named in `billing_account` — otherwise the apply
+   fails on the budget before it reaches anything else. Alerts then go by email to that account's
+   administrators and billing account users.
+3. **Create the IAP OAuth client** in the console and keep its identifier and secret. Terraform does
+   not create it, and an enabled plan **fails** without it rather than creating backend services
+   with IAP disabled, which would publish Grafana and MLflow unauthenticated.
+4. **Decide where the OAuth secret lives.** Terraform holds `oauth_client_secret` in state, so the
+   state bucket is exactly as sensitive as the secret. It is the bucket created by the bootstrap
+   root, which is private and versioned; treat access to it accordingly.
+5. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
+   platform database enabled first.
+
+### Applying
+
+Run from the repository root. The backend prefix keeps this root's state beside the others and must
+be unique to it:
+
+```shell
+terraform -chdir=infrastructure/observability init \
+  -backend-config="bucket=YOUR_STATE_BUCKET" \
+  -backend-config="prefix=observability"
+
+terraform -chdir=infrastructure/observability apply \
+  -var project_id=YOUR_PROJECT \
+  -var domain_name=kratos.bryars.com \
+  -var 'iap_member=user:you@example.com' \
+  -var billing_account=012345-6789AB-CDEF01 \
+  -var enable_observability=true \
+  -var oauth_client_id=YOUR_CLIENT_ID
+```
+
+Leave `oauth_client_secret` off the command line: Terraform prompts for it, so it does not reach
+the shell history or the process list. In PowerShell the same commands work with the quoting
+reversed — use `--%` or double quotes around `iap_member`, for example
+`terraform -chdir=infrastructure/observability apply -var "iap_member=user:you@example.com"`.
+
+Then, once:
+
+```shell
+# The password Terraform never sees.
+"YOUR_PASSWORD" | gcloud secrets versions add kratos-observability-grafana-admin --data-file=-
+
+# The bundle the instance runs. Re-upload this to update the stack.
+tar -czf observability.tar.gz observability
+gcloud storage cp observability.tar.gz \
+  "gs://$(terraform -chdir=infrastructure/observability output -raw config_bucket)/bundles/observability-current.tar.gz"
+```
+
+Copy the three `required_dns_records` addresses to the DNS provider. Certificate issuance begins
+once those names resolve.
+
+**The order above is safe.** Terraform is applied before the bundle and the secret exist, so the
+first boot finds neither. The startup script installs a systemd timer, exits cleanly when either
+is missing, and the timer retries every five minutes, so the stack starts by itself once you have
+uploaded them — no reboot and no second apply. That same timer is what picks up a replaced bundle:
+it compares the object's generation and restarts the stack when it changes, so re-uploading is how
+the configuration is updated and the instance is never recreated.
+
+### What this root commits to
+
+- The instance has **no public address**. Egress uses Cloud NAT, and the only ingress rule admits
+  Google's load-balancer ranges to the published service ports, with a default deny behind it. So
+  Prometheus, Loki and Tempo have no route from outside the VPC.
+- **Containers cannot reach the instance metadata server.** The startup script rejects traffic to
+  `169.254.169.254` from the Docker bridges, so nothing running a workload or a public service can
+  mint the instance's token. The Cloud SQL Auth Proxy is the one component that legitimately needs
+  that identity, for IAM database login, and it is the one component placed on the **host network**
+  so the rule does not cover it. Nothing else is granted the exception, and MLflow reaches it
+  through an explicit host-gateway route rather than by reopening metadata to the bridges.
+- **The Cloud SQL overlay is applied only when a database exists.** With `enable_mlflow_database`
+  false the startup script omits `compose.cloudsql.yaml` entirely, so the stack never references a
+  proxy that was not created and MLflow keeps a SQLite store on the persistent disk. `validate.sh`
+  asserts that the default rendering contains no proxy at all.
+- **Each data directory is owned by the user its image runs as** — Prometheus 65534, Loki and Tempo
+  10001, Grafana 472 — because these services are not root and a root-owned bind mount would leave
+  their data path unwritable.
+- Grafana and MLflow sit behind IAP, restricted to `iap_member`. **OTLP ingestion is a separate
+  gate, `enable_otlp_ingress`, and is off**: nothing authenticates a worker sending telemetry yet,
+  so publishing it would expose unauthenticated ingestion. Until ADR-009's scoped worker credential
+  is decided, leave it off and send telemetry from inside the VPC.
+- The instance runs Container-Optimized OS with Secure Boot, vTPM, integrity monitoring and OS
+  Login, as a service account that can read its configuration bucket, write telemetry objects and
+  log in to Cloud SQL, and deploy nothing.
+- Its data disk is only formatted when it carries **no filesystem signature**. `fsck` exiting
+  non-zero because it corrected errors never triggers a reformat.
+- Compose is fetched as a pinned binary and verified against a recorded SHA-256 before it runs,
+  because Container-Optimized OS ships no Compose plugin. The Google Cloud CLI helper, which runs
+  on the host network and can read the secret and mint the token, is pinned by digest for the same
+  reason.
+- Prometheus, Loki, Tempo and Grafana keep their state on the persistent disk; Loki chunks, Tempo
+  blocks and MLflow artefacts go to Cloud Storage; MLflow metadata goes to Cloud SQL over the Auth
+  Proxy with IAM authentication, so no database password exists.

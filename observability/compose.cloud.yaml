@@ -1,0 +1,82 @@
+# Cloud overlay for the instance provisioned by infrastructure/observability.
+#
+# Applied with:
+#   docker compose -f compose.yaml -f compose.cloud.yaml up -d
+#
+# It changes three things the local bundle deliberately gets wrong for a server:
+#
+#  1. Ports. Locally every service publishes on a high loopback port. Here each publishes on the
+#     port the load balancer's backend expects, on all interfaces, because the only route to this
+#     instance is the load balancer: it has no public address and one firewall rule admits Google's
+#     health-check and proxy ranges. The collector also publishes its health endpoint, which the
+#     OTLP backend service probes.
+#  2. Durable storage. Locally the data lives in Docker named volumes on the container filesystem.
+#     Here Prometheus, Loki and Tempo local state sit on the attached persistent disk, Loki chunks,
+#     Tempo blocks and MLflow artefacts go to Cloud Storage, and MLflow metadata goes to Cloud SQL
+#     through the Auth Proxy, so it is covered by the platform root's backups.
+#  3. Secrets. The Grafana administrator password is read from Secret Manager by the instance
+#     startup script into an environment file, never written into an image, this file or Terraform
+#     state.
+
+services:
+  otel-gateway:
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+
+  prometheus:
+    volumes:
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/prometheus:/prometheus
+    ports: []
+
+  loki:
+    command:
+      - -config.file=/etc/loki/loki-cloud.yaml
+      # The bucket name reaches the config through the environment, so it stays in one place.
+      - -config.expand-env=true
+    volumes:
+      - ./config/cloud/loki.yaml:/etc/loki/loki-cloud.yaml:ro
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/loki:/loki
+    environment:
+      KRATOS_TELEMETRY_BUCKET: ${KRATOS_TELEMETRY_BUCKET:?the telemetry bucket must be named}
+    ports: []
+
+  tempo:
+    command:
+      - -config.file=/etc/tempo/tempo-cloud.yaml
+      - -config.expand-env=true
+      - -backend-scheduler.provider.work.compaction.block-retention=72h
+    volumes:
+      - ./config/cloud/tempo.yaml:/etc/tempo/tempo-cloud.yaml:ro
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/tempo:/var/tempo
+    environment:
+      KRATOS_TELEMETRY_BUCKET: ${KRATOS_TELEMETRY_BUCKET:?the telemetry bucket must be named}
+    ports: []
+
+  grafana:
+    environment:
+      GF_SERVER_ROOT_URL: https://${KRATOS_GRAFANA_HOST:?the public Grafana host must be named}
+      # Identity-Aware Proxy has already authenticated the request at the load balancer.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/grafana:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+  mlflow:
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=2
+      - --backend-store-uri=${KRATOS_MLFLOW_DATABASE_URI:?the MLflow database URI must be supplied}
+      - --artifacts-destination=gs://${KRATOS_TELEMETRY_BUCKET:?the telemetry bucket must be named}/mlflow
+      - --serve-artifacts
+      - --allowed-hosts=${KRATOS_MLFLOW_HOST:?the public MLflow host must be named},mlflow:5000
+    volumes:
+      # Holds the SQLite store when no Cloud SQL database is enabled; unused when one is.
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/mlflow:/var/lib/mlflow
+    ports:
+      - "5000:5000"

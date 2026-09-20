@@ -19,6 +19,41 @@ echo "compose"
 # A password is required at runtime; any value satisfies the interpolation check.
 KRATOS_GRAFANA_ADMIN_PASSWORD=validate-only docker compose config --quiet
 
+echo "compose (cloud overlay)"
+# Every value the overlay requires must be supplied by the instance startup script.
+KRATOS_GRAFANA_ADMIN_PASSWORD=validate-only \
+  KRATOS_DATA_ROOT=/mnt/disks/data \
+  KRATOS_TELEMETRY_BUCKET=validate-bucket \
+  KRATOS_GRAFANA_HOST=grafana.example.test \
+  KRATOS_MLFLOW_HOST=mlflow.example.test \
+  KRATOS_MLFLOW_DATABASE_URI=sqlite:////tmp/validate.db \
+  KRATOS_MLFLOW_INSTANCE=project:region:instance \
+  docker compose -f compose.yaml -f compose.cloud.yaml config --quiet
+
+echo "compose (cloud overlay, no database)"
+# The closed Cloud SQL gate must render without naming the proxy at all.
+KRATOS_GRAFANA_ADMIN_PASSWORD=validate-only \
+  KRATOS_DATA_ROOT=/mnt/disks/data \
+  KRATOS_TELEMETRY_BUCKET=validate-bucket \
+  KRATOS_GRAFANA_HOST=grafana.example.test \
+  KRATOS_MLFLOW_HOST=mlflow.example.test \
+  KRATOS_MLFLOW_DATABASE_URI=sqlite:////var/lib/mlflow/mlflow.db \
+  docker compose -f compose.yaml -f compose.cloud.yaml config \
+  | grep -q cloud-sql-proxy && {
+    echo "the default stack still references the Cloud SQL proxy" >&2; exit 1;
+  }
+
+echo "compose (cloud overlay with Cloud SQL)"
+KRATOS_GRAFANA_ADMIN_PASSWORD=validate-only \
+  KRATOS_DATA_ROOT=/mnt/disks/data \
+  KRATOS_TELEMETRY_BUCKET=validate-bucket \
+  KRATOS_GRAFANA_HOST=grafana.example.test \
+  KRATOS_MLFLOW_HOST=mlflow.example.test \
+  KRATOS_MLFLOW_DATABASE_URI=postgresql://u@cloud-sql-proxy:5432/mlflow \
+  KRATOS_MLFLOW_INSTANCE=project:region:instance \
+  docker compose -f compose.yaml -f compose.cloud.yaml -f compose.cloudsql.yaml \
+  config --quiet
+
 echo "prometheus"
 docker run --rm --entrypoint promtool -v "$config/prometheus/prometheus.yml:/p.yml:ro" \
   "$PROMETHEUS" check config /p.yml >/dev/null
@@ -26,6 +61,17 @@ docker run --rm --entrypoint promtool -v "$config/prometheus/prometheus.yml:/p.y
 echo "collector"
 docker run --rm -v "$config/otel-gateway/config.yaml:/c.yaml:ro" \
   "$COLLECTOR" validate --config=/c.yaml
+
+echo "loki (cloud)"
+docker run --rm -e KRATOS_TELEMETRY_BUCKET=validate-bucket \
+  -v "$config/cloud/loki.yaml:/lc.yaml:ro" \
+  "$LOKI" -config.file=/lc.yaml -config.expand-env=true -verify-config
+
+echo "tempo (cloud)"
+docker run --rm -e KRATOS_TELEMETRY_BUCKET=validate-bucket \
+  -v "$config/cloud/tempo.yaml:/tc.yaml:ro" \
+  "$TEMPO" -config.file=/tc.yaml -config.expand-env=true \
+  -backend-scheduler.provider.work.compaction.block-retention=72h -config.verify=true
 
 echo "loki"
 docker run --rm -v "$config/loki/loki.yaml:/l.yaml:ro" \
@@ -38,7 +84,7 @@ docker run --rm -v "$config/tempo/tempo.yaml:/t.yaml:ro" \
 
 echo "images pinned by digest"
 # A tag without a digest would silently change what CI validated and what a VM would run.
-if grep -nE "^\s+image: .*" compose.yaml | grep -v "@sha256:"; then
+if grep -nE "^\s+image: .*" compose*.yaml | grep -v "@sha256:"; then
   echo "the images above are not pinned by digest" >&2
   exit 1
 fi

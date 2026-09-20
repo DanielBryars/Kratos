@@ -1,0 +1,38 @@
+# Applied on top of compose.cloud.yaml only when a Cloud SQL database was provisioned, so the
+# default closed database gate never references a proxy that does not exist. Without this overlay
+# MLflow keeps its SQLite store on the persistent disk.
+#
+#   docker compose -f compose.yaml -f compose.cloud.yaml -f compose.cloudsql.yaml up -d
+
+services:
+  mlflow:
+    # The proxy listens on the host, so the hostname in the database URI resolves to the host
+    # gateway rather than to a container on this bridge.
+    extra_hosts:
+      - "cloud-sql-proxy:host-gateway"
+    depends_on:
+      cloud-sql-proxy:
+        condition: service_started
+
+  cloud-sql-proxy:
+    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2@sha256:fc224915ef435afeb5b2a9421260a0d31986d5c8b7c7f5783c7f5d5885700cd2
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Deliberately on the host network. Every bridged container is denied the metadata server, so
+    # nothing running a workload or a public service can mint the instance token; the proxy is the
+    # one component that legitimately needs that identity, for --auto-iam-authn, and it obtains it
+    # here instead. Nothing else is granted the exception. The instance has no public address and
+    # its only ingress rule admits Google's load-balancer ranges, so this listener is reachable
+    # only from the instance itself and the rest of its private subnet.
+    network_mode: host
+    command:
+      - --address=0.0.0.0
+      - --port=5432
+      - --auto-iam-authn
+      - ${KRATOS_MLFLOW_INSTANCE:?the Cloud SQL instance connection name must be supplied}
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
