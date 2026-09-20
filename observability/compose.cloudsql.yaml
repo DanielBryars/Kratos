@@ -6,10 +6,6 @@
 
 services:
   mlflow:
-    # The proxy listens on the host, so the hostname in the database URI resolves to the host
-    # gateway rather than to a container on this bridge.
-    extra_hosts:
-      - "cloud-sql-proxy:host-gateway"
     depends_on:
       cloud-sql-proxy:
         condition: service_started
@@ -20,13 +16,13 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # Deliberately on the host network. Every bridged container is denied the metadata server, so
-    # nothing running a workload or a public service can mint the instance token; the proxy is the
-    # one component that legitimately needs that identity, for --auto-iam-authn, and it obtains it
-    # here instead. Nothing else is granted the exception. The instance has no public address and
-    # its only ingress rule admits Google's load-balancer ranges, so this listener is reachable
-    # only from the instance itself and the rest of its private subnet.
-    network_mode: host
+    # A fixed address on the dedicated metadata bridge is allowlisted by the host startup script.
+    # The proxy can therefore mint its short-lived IAM database credential without exposing its
+    # listener on the host or granting metadata access to the rest of the backend network.
+    networks:
+      backend: {}
+      metadata:
+        ipv4_address: 172.30.2.12
     command:
       - --address=0.0.0.0
       - --port=5432

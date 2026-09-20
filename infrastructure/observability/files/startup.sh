@@ -8,10 +8,12 @@ set -euo pipefail
 DATA_DEVICE=/dev/disk/by-id/google-observability-data
 DATA_ROOT=/mnt/disks/data
 BUNDLE_DIR="$DATA_ROOT/bundle"
-COMPOSE=/var/lib/kratos/docker-compose
+COMPOSE="$DATA_ROOT/docker-compose"
 # Pinned: this helper runs on the host network and can mint the instance token and read the
 # Grafana secret, so it must not float on a mutable tag.
 CLOUD_CLI="gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:409a43ae520cd0acff8185636a4df9a656a44df2c7d58b99300eeed81142c5a2"
+METADATA_IP=169.254.169.254
+TRUSTED_STORAGE_CLIENTS=(172.30.1.12 172.30.2.10 172.30.2.11 172.30.2.12)
 
 metadata() {
   curl -sf -H Metadata-Flavor:Google \
@@ -25,22 +27,34 @@ gcloud_helper() {
 # --- Block containers from reaching the instance metadata server.
 # The instance identity can read the config bucket, write telemetry objects and log in to Cloud
 # SQL. A workload or a compromised service in a bridged container must not be able to mint that
-# token. The Cloud SQL Auth Proxy genuinely needs it, so it runs on the host network instead,
-# which this rule does not cover; everything else stays on the bridges and stays blocked.
-if ! iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT 2>/dev/null; then
-  iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT
-fi
+# token. Loki, Tempo, MLflow and the Cloud SQL Auth Proxy use fixed, dedicated bridge addresses
+# because their Google Cloud clients need short-lived instance credentials. No other bridged
+# container may reach metadata.
+configure_metadata_firewall() {
+  if ! iptables -C DOCKER-USER -d "$METADATA_IP" -j REJECT 2>/dev/null; then
+    iptables -I DOCKER-USER -d "$METADATA_IP" -j REJECT
+  fi
+  for client_ip in "${TRUSTED_STORAGE_CLIENTS[@]}"; do
+    if ! iptables -C DOCKER-USER -s "$client_ip" -d "$METADATA_IP" -j ACCEPT 2>/dev/null; then
+      iptables -I DOCKER-USER -s "$client_ip" -d "$METADATA_IP" -j ACCEPT
+    fi
+  done
+}
+
+configure_metadata_firewall
 
 # --- Prepare the data disk without ever reformatting one that already holds data.
 # `fsck` exits 1 when it corrected errors, which is a normal, successful outcome. Keying a
 # reformat off a non-zero exit would therefore destroy a healthy filesystem.
-if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
-  echo "no filesystem signature on $DATA_DEVICE; creating one"
-  mkfs.ext4 -F "$DATA_DEVICE"
-fi
-fsck.ext4 -p "$DATA_DEVICE" || [ $? -le 2 ]
 mkdir -p "$DATA_ROOT"
-mountpoint -q "$DATA_ROOT" || mount -o discard,defaults "$DATA_DEVICE" "$DATA_ROOT"
+if ! mountpoint -q "$DATA_ROOT"; then
+  if ! blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+    echo "no filesystem signature on $DATA_DEVICE; creating one"
+    mkfs.ext4 -F "$DATA_DEVICE"
+  fi
+  fsck.ext4 -p "$DATA_DEVICE" || [ $? -le 2 ]
+  mount -o discard,defaults "$DATA_DEVICE" "$DATA_ROOT"
+fi
 mkdir -p "$DATA_ROOT"/{prometheus,loki,tempo,grafana,mlflow} "$BUNDLE_DIR" /var/lib/kratos
 
 # --- Each service runs as a non-root user from its own image, so the directory it writes into
@@ -62,7 +76,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/var/lib/kratos/startup.sh
+ExecStart=/bin/bash /var/lib/kratos/startup.sh
 UNIT
   cat > /etc/systemd/system/kratos-observability.timer <<'UNIT'
 [Unit]
@@ -95,7 +109,7 @@ fi
 # --- Fetch the observability bundle, and re-fetch when its generation changes.
 BUNDLE_OBJECT="$(metadata config-bundle)"
 CURRENT_GENERATION="$(docker run --rm --network host "$CLOUD_CLI" \
-  gcloud storage ls --format='value(generation)' "$BUNDLE_OBJECT" 2>/dev/null || true)"
+  gcloud storage objects describe --format='value(generation)' "$BUNDLE_OBJECT" 2>/dev/null || true)"
 if [ -z "$CURRENT_GENERATION" ]; then
   echo "no bundle at $BUNDLE_OBJECT yet; the timer will retry"
   exit 0
@@ -142,3 +156,6 @@ fi
 
 cd "$BUNDLE_DIR"
 "$COMPOSE" "${OVERLAYS[@]}" up -d --remove-orphans
+# Docker can rewrite DOCKER-USER while creating networks. Reconcile the allowlist after Compose so
+# the explicit storage-client exceptions remain ahead of the metadata deny rule.
+configure_metadata_firewall

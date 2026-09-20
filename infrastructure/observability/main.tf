@@ -131,6 +131,14 @@ resource "google_service_account" "observability" {
   display_name = "Kratos observability instance"
 }
 
+resource "google_project_iam_member" "logging_writer" {
+  count = local.enabled
+
+  project = var.project_id
+  role    = "roles/logging.logWriter"
+  member  = google_service_account.observability[0].member
+}
+
 resource "google_storage_bucket" "config" {
   count = local.enabled
 
@@ -184,6 +192,16 @@ resource "google_storage_bucket_iam_member" "telemetry_write" {
 
   bucket = google_storage_bucket.telemetry[0].name
   role   = "roles/storage.objectAdmin"
+  member = google_service_account.observability[0].member
+}
+
+# The service backends inspect their bucket before writing objects. objectAdmin deliberately lacks
+# storage.buckets.get, so grant only the bucket-metadata/list permissions required for startup.
+resource "google_storage_bucket_iam_member" "telemetry_bucket_read" {
+  count = local.enabled
+
+  bucket = google_storage_bucket.telemetry[0].name
+  role   = "roles/storage.legacyBucketReader"
   member = google_service_account.observability[0].member
 }
 
