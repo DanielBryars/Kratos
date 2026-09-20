@@ -226,6 +226,20 @@ class JobExecutionResult(StrictModel):
     stdout: str = Field(max_length=65_536)
     stderr: str = Field(max_length=65_536)
     failure_message: str | None = Field(default=None, max_length=1_000)
+    # What the container runtime observed, sent as a pair or not at all. A failure before the
+    # container started has no execution interval, and inventing one from assignment or report
+    # time is what the control plane stopped doing.
+    execution_started_at: datetime | None = None
+    execution_finished_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def execution_interval_is_whole_and_ordered(self) -> "JobExecutionResult":
+        started, finished = self.execution_started_at, self.execution_finished_at
+        if (started is None) != (finished is None):
+            raise ValueError("execution timestamps are sent as a pair or not at all")
+        if started is not None and finished is not None and finished < started:
+            raise ValueError("execution finished before it started")
+        return self
 
 
 class JobResultResponse(StrictModel):
