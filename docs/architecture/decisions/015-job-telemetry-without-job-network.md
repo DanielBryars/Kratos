@@ -131,19 +131,51 @@ or replays records the other already holds. Each sink therefore has its own curs
 on that sink's acknowledgement and updated atomically with the spool. A record SHALL be retained
 until **every** sink's cursor has passed it. After a restart each path resumes from its own cursor.
 
-Replaying a batch SHALL be harmless, and each sink SHALL define how: the control plane SHALL be
-idempotent on stream and sequence; OpenTelemetry has no such guarantee, so the agent SHALL make
-each exported record's identity deterministic from the stream and sequence, and a deployment SHALL
-treat duplicate delivery of a log or metric point with the same stream and sequence as the same
-record rather than a second observation.
+Replaying a batch SHALL be harmless, and each sink SHALL define how, because the two offer very
+different guarantees.
+
+The control plane is idempotent on stream and sequence: it SHALL accept a repeated batch and change
+nothing, so the agent MAY replay freely up to its cursor.
+
+OpenTelemetry offers no such guarantee, and a deployment cannot be asked to deduplicate what a
+pipeline never identified, so this decision does not ask it to. Instead the acknowledgement
+boundary for that path is the **worker-local collector's durable queue**. The collector SHALL be
+configured with persistent storage, and the agent SHALL advance its OTLP cursor only when the
+collector has durably enqueued the batch. Past that point the agent SHALL NOT replay: the records
+are the collector's responsibility, and its own retry, backoff and queue limits govern them. A
+record can therefore be delivered twice only when the collector itself retries a partially
+delivered batch, which is a property of the collector rather than something this contract invents.
+
+That boundary is what makes the local collector a prerequisite rather than a refinement: without a
+durable queue on the worker there is no point at which the agent can stop replaying, and with
+replay there is no way to avoid duplicate observations.
 
 Loss is possible **above** a cursor, not below it: records below every cursor have been
 acknowledged and are safe to discard, while a bounded spool that overflows discards records that no
 sink has taken yet. When that happens the agent SHALL report the missing sequence range explicitly
 as a gap, per sink, rather than leave the absence to be inferred.
 
+### The result envelope, and images that predate it
+
+A `result` record SHALL be a Kratos record whose `record` field is `result` and which carries
+exactly one further member, `result`, holding the workload's own structured object. That object is
+opaque to the agent and to the control plane: neither parses it, and its schema belongs to the
+workload. The envelope SHALL be at most 8 KiB once encoded, like any record, and a `result` object
+larger than that SHALL be counted as `dropped.result_too_large` and the job reported without a
+structured result rather than truncated into invalid JSON.
+
 The agent SHALL report the **last** `result` record as the job's structured result, within the
-existing 64 KiB bound, instead of the first 64 KiB of stdout.
+existing 64 KiB bound.
+
+**Rollout compatibility.** Every approved image today — the GPU health check, the training example
+and the fixed-duration workload — prints a bare JSON object with no `record` discriminator, and
+none of them is rebuilt by this decision. An agent implementing this contract SHALL therefore
+continue to accept them unchanged: a stdout line that is not a Kratos record is a log line, and
+when an attempt produces **no** `result` record the agent SHALL fall back to the existing bounded
+stdout capture, which is exactly today's behaviour. A workload adopting Kratos records gains
+progress and metrics; one that does not keeps working and loses nothing it has now. The agent
+SHALL NOT require `schema_version` on a line that carries no `record` field, so a workload cannot
+be broken by a field it has never heard of.
 
 ### Two sinks, both outside the job
 
@@ -216,6 +248,12 @@ SHALL be visible in the run view. Durable replay across long outages remains R0.
   the MLflow run identifier. Those documents SHOULD be updated in place when this is accepted.
 - The agent holds one durable cursor per sink rather than one overall, and retains a record until
   every cursor has passed it, so the spool is sized by the slowest sink rather than the fastest.
+- Handing the OTLP path to the collector's durable queue means the agent cannot report whether a
+  log or metric reached the cloud, only that the collector accepted it. Delivery beyond that point
+  is observable in the collector's own telemetry rather than in the run view, which is the price of
+  not inventing a deduplication scheme the pipeline cannot honour.
+- No approved image changes. The contract is additive, and an image that never emits a Kratos
+  record behaves exactly as it does today.
 - Stdout becomes a contract. Human-readable output belongs on stderr, and the result-extraction
   change must ship with the first record-aware agent.
 - Spans from inside a workload are not supported. Traces cover the control plane and agent only.
