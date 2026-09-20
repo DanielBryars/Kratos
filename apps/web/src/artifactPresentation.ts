@@ -39,6 +39,33 @@ export type ArtifactRow = OutputRequirement & {
   availability: "available" | "not_declared" | "request_failed";
 };
 
+export type JobSnapshotState =
+  | "loading"
+  | "initial_unavailable"
+  | "empty"
+  | "ready"
+  | "stale";
+
+export function jobSnapshotState(
+  hasLoadedSnapshot: boolean,
+  unavailable: boolean,
+  jobCount: number,
+): JobSnapshotState {
+  if (!hasLoadedSnapshot) return unavailable ? "initial_unavailable" : "loading";
+  if (unavailable) return "stale";
+  return jobCount === 0 ? "empty" : "ready";
+}
+
+export function jobSnapshotUnavailableMessage(state: JobSnapshotState): string | null {
+  if (state === "initial_unavailable") {
+    return "Live job and output status is unavailable. No complete snapshot has loaded yet.";
+  }
+  if (state === "stale") {
+    return "Live job and output status is temporarily unavailable. Showing the last complete snapshot.";
+  }
+  return null;
+}
+
 export function artifactRows(
   requirements: OutputRequirement[],
   response: ArtifactList | null,

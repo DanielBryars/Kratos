@@ -12,6 +12,8 @@ import { useEffect, useState } from "react";
 
 import {
   artifactRows,
+  jobSnapshotState,
+  jobSnapshotUnavailableMessage,
   type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
@@ -126,6 +128,7 @@ export function App() {
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
   const [workerActionId, setWorkerActionId] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [hasLoadedJobsSnapshot, setHasLoadedJobsSnapshot] = useState(false);
   const [jobStatusUnavailable, setJobStatusUnavailable] = useState(false);
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
@@ -150,6 +153,7 @@ export function App() {
       setPending([]);
       setWorkers([]);
       setJobs([]);
+      setHasLoadedJobsSnapshot(false);
       setJobStatusUnavailable(false);
       return;
     }
@@ -178,6 +182,7 @@ export function App() {
         if (nextWorkers) setWorkers(nextWorkers);
         if (nextJobs) {
           setJobs(nextJobs);
+          setHasLoadedJobsSnapshot(true);
           setJobStatusUnavailable(false);
         } else {
           setJobStatusUnavailable(true);
@@ -368,6 +373,13 @@ export function App() {
     }
   }
 
+  const jobsSnapshotState = jobSnapshotState(
+    hasLoadedJobsSnapshot,
+    jobStatusUnavailable,
+    jobs.length,
+  );
+  const jobsUnavailableMessage = jobSnapshotUnavailableMessage(jobsSnapshotState);
+
   return (
     <main>
       <header>
@@ -439,8 +451,9 @@ export function App() {
                   <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
                   <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim()} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
                 </div>
-                {jobs.length === 0 && <p className="muted compact">No jobs have been submitted.</p>}
-                {jobStatusUnavailable && <p className="notice notice--error" role="status">Live job and output status is temporarily unavailable. Showing the last complete snapshot.</p>}
+                {jobsSnapshotState === "loading" && <p className="muted compact">Loading jobs and output status…</p>}
+                {jobsSnapshotState === "empty" && <p className="muted compact">No jobs have been submitted.</p>}
+                {jobsUnavailableMessage && <p className="notice notice--error" role="status">{jobsUnavailableMessage}</p>}
                 <div className="job-list">
                   {jobs.map((job) => (
                     <div className="job" key={job.job_id}>

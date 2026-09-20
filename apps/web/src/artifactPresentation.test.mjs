@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { artifactRows } from "./artifactPresentation.ts";
+import {
+  artifactRows,
+  jobSnapshotState,
+  jobSnapshotUnavailableMessage,
+} from "./artifactPresentation.ts";
 
 const requirements = [
   {
@@ -78,6 +82,25 @@ describe("artifactRows", () => {
     assert.deepEqual(
       artifactRows(requirements, null, true).map((row) => row.availability),
       ["request_failed", "request_failed"],
+    );
+  });
+});
+
+describe("jobSnapshotState", () => {
+  it("distinguishes an initial failure from a successfully loaded empty queue", () => {
+    assert.equal(jobSnapshotState(false, true, 0), "initial_unavailable");
+    assert.equal(jobSnapshotState(true, false, 0), "empty");
+    assert.equal(
+      jobSnapshotUnavailableMessage("initial_unavailable"),
+      "Live job and output status is unavailable. No complete snapshot has loaded yet.",
+    );
+  });
+
+  it("labels a failed refresh after success as a stale snapshot", () => {
+    assert.equal(jobSnapshotState(true, true, 2), "stale");
+    assert.equal(
+      jobSnapshotUnavailableMessage("stale"),
+      "Live job and output status is temporarily unavailable. Showing the last complete snapshot.",
     );
   });
 });
