@@ -90,6 +90,8 @@ class DockerExecutor:
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
         container_name = f"kratos-job-{assignment.attempt_id}"
+        job_id = str(assignment.job_id)
+        attempt_id = str(assignment.attempt_id)
         try:
             container = self._client.containers.get(container_name)
         except docker.errors.NotFound:
@@ -107,6 +109,13 @@ class DockerExecutor:
                 nano_cpus=4_000_000_000,
                 pids_limit=512,
                 tmpfs={"/tmp": "rw,noexec,nosuid,size=1g"},
+                environment={
+                    "KRATOS_JOB_ID": job_id,
+                    "KRATOS_ATTEMPT_ID": attempt_id,
+                    "OTEL_RESOURCE_ATTRIBUTES": (
+                        f"kratos.job.id={job_id},kratos.attempt.id={attempt_id}"
+                    ),
+                },
                 device_requests=[
                     docker.types.DeviceRequest(
                         device_ids=[str(assignment.gpu_index)], capabilities=[["gpu"]]

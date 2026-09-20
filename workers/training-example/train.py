@@ -9,10 +9,13 @@ import os
 import platform
 import random
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
+from uuid import UUID
 
 import torch
 from torch import Tensor, nn
@@ -27,6 +30,33 @@ SEED = 20260920
 EPOCHS = 180
 LEARNING_RATE = 0.025
 OUTPUT_LIMIT_BYTES = 8 * 1024
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    job_id: UUID
+    attempt_id: UUID
+
+    def result_fields(self) -> dict[str, str]:
+        return {"job_id": str(self.job_id), "attempt_id": str(self.attempt_id)}
+
+    def otel_resource_attributes(self) -> dict[str, str]:
+        return {
+            "kratos.job.id": str(self.job_id),
+            "kratos.attempt.id": str(self.attempt_id),
+        }
+
+
+def load_run_identity(environment: Mapping[str, str] = os.environ) -> RunIdentity:
+    try:
+        raw_job_id = environment["KRATOS_JOB_ID"]
+        raw_attempt_id = environment["KRATOS_ATTEMPT_ID"]
+    except KeyError as error:
+        raise RuntimeError(f"required run identity is missing: {error.args[0]}") from error
+    try:
+        return RunIdentity(job_id=UUID(raw_job_id), attempt_id=UUID(raw_attempt_id))
+    except ValueError as error:
+        raise RuntimeError("Kratos job and attempt identifiers must be valid UUIDs") from error
 
 
 class Classifier(nn.Module):
@@ -111,6 +141,7 @@ def accuracy(logits: Tensor, labels: Tensor) -> float:
 
 
 def run_training() -> dict[str, Any]:
+    run_identity = load_run_identity()
     dataset_hash = verify_dataset()
     configure_determinism()
     device = require_cuda()
@@ -177,6 +208,8 @@ def run_training() -> dict[str, Any]:
             "name": "Kratos CUDA classification example",
             "version": WORKLOAD_VERSION,
         },
+        "run": run_identity.result_fields(),
+        "telemetry": {"resource_attributes": run_identity.otel_resource_attributes()},
         "dataset": {
             "name": "Kratos Shapes",
             "version": DATASET_VERSION,
@@ -228,19 +261,29 @@ def encode_result(payload: dict[str, Any]) -> str:
     return encoded
 
 
+def failure_result(error: Exception, environment: Mapping[str, str] = os.environ) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "failed",
+        "workload_version": WORKLOAD_VERSION,
+        "error_type": type(error).__name__,
+        "detail": str(error)[:512],
+        "cpu_fallback": False,
+    }
+    try:
+        run_identity = load_run_identity(environment)
+    except RuntimeError:
+        return payload
+    payload["run"] = run_identity.result_fields()
+    payload["telemetry"] = {"resource_attributes": run_identity.otel_resource_attributes()}
+    return payload
+
+
 def main() -> int:
     try:
         result = run_training()
     except Exception as error:  # noqa: BLE001 - process boundary returns a structured failure
-        failure = {
-            "schema_version": SCHEMA_VERSION,
-            "status": "failed",
-            "workload_version": WORKLOAD_VERSION,
-            "error_type": type(error).__name__,
-            "detail": str(error)[:512],
-            "cpu_fallback": False,
-        }
-        print(encode_result(failure))
+        print(encode_result(failure_result(error)))
         return 1
     print(encode_result(result))
     return 0

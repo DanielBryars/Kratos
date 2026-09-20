@@ -18,6 +18,12 @@ The single JSON line written to standard output records:
 - loss, accuracy and training duration;
 - a canonical model-state hash and serialized checkpoint hash.
 
+The worker supplies `KRATOS_JOB_ID` and `KRATOS_ATTEMPT_ID` to every job container. This workload
+requires valid UUID values, emits them under `run`, and repeats them as the future OpenTelemetry
+resource attributes `kratos.job.id` and `kratos.attempt.id`. Failed runs preserve the identifiers
+when they were valid, allowing operator output to be correlated before collectors or MLflow are
+deployed.
+
 The checkpoint is written to `/tmp/kratos-training-example-v1.pt`. Under the R0.2 worker sandbox it
 is intentionally ephemeral, so the result says `checkpoint_durable: false`. Durable artifact upload
 is a later platform slice. The hashes still prove the identity of the model produced during this
@@ -29,6 +35,8 @@ From the repository root:
 ```shell
 docker build --file workers/training-example/Dockerfile --tag kratos-training-example .
 docker run --rm --gpus device=0 --network none --read-only \
+  --env KRATOS_JOB_ID=22222222-2222-4222-8222-222222222222 \
+  --env KRATOS_ATTEMPT_ID=11111111-1111-4111-8111-111111111111 \
   --tmpfs /tmp:rw,noexec,nosuid,size=1g kratos-training-example
 ```
 
