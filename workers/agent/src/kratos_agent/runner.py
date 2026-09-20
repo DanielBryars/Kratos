@@ -7,14 +7,17 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4, uuid5
 
 import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from docker.errors import DockerException
+from pydantic import ValidationError
 
 from kratos_agent.capabilities import collect_capabilities
+from kratos_agent.courier import ObservationCourier
 from kratos_agent.executor import (
     ATTEMPT_DIRECTORY,
     AuthorityLost,
@@ -24,12 +27,14 @@ from kratos_agent.executor import (
     ExecutorError,
 )
 from kratos_agent.models import (
+    MAX_STRUCTURED_RESULT_BYTES,
     ArtifactResponse,
     HeartbeatResponse,
     JobAssignment,
     JobExecutionResult,
     WorkerCapabilities,
 )
+from kratos_agent.observations import ObservationCollector
 from kratos_agent.outputs import (
     OutputError,
     VerifiedOutput,
@@ -38,6 +43,8 @@ from kratos_agent.outputs import (
     discard_tree,
 )
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
+from kratos_agent.pump import CONTROL_PLANE_SINK, ObservationPump, batch_records
+from kratos_agent.spool import Batch, ObservationSpool
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 from kratos_agent.uploads import UploadConflict, UploadError, upload_object
 
@@ -74,6 +81,8 @@ class AgentRunner:
         self._enrolment_credential_path = enrolment_credential_path
         self._collect = capability_collector
         self._executor = executor
+        # One courier for the agent, not one per assignment. Created on first use.
+        self._courier: ObservationCourier | None = None
         self._clock = clock
 
     def ensure_enrolled(self) -> AgentState:
@@ -241,6 +250,84 @@ class AgentRunner:
         if assignment is not None:
             updated = self._run_assignment(updated, assignment)
         return updated
+
+    def _observations_root(self) -> Path:
+        return self._state_path.parent / "observations"
+
+    def _observation_directory(self, attempt_id: UUID) -> Path:
+        return self._observations_root() / str(attempt_id)
+
+    def _courier_for(self, state: AgentState) -> ObservationCourier | None:
+        """The agent's one courier, created on first use and never stopped for a job.
+
+        Delivery deliberately does not belong to the assignment. The first version of this gave
+        each attempt its own thread and stopped it on the result path, so a control plane that was
+        briefly unreachable could let the job report its result, watch the attempt disappear from
+        polling, and leave records nothing would ever send.
+        """
+        worker_id, credential = state.worker_id, state.worker_credential
+        if worker_id is None or credential is None:
+            return None
+        if self._courier is None:
+            self._courier = ObservationCourier(
+                self._observations_root(), self._submit_batch(worker_id, credential)
+            )
+            # Anything an earlier process left behind is picked up here, before any job runs.
+            self._courier.discover()
+            self._courier.start()
+        return self._courier
+
+    def _submit_batch(self, worker_id: UUID, credential: str) -> Callable[[UUID, Batch], int]:
+        """Address a batch by the stream the spool recorded, not by an assignment.
+
+        The courier delivers spools whose attempt finished long ago, possibly in another process,
+        so the stream identifier comes from the spool rather than from anything still in memory.
+        """
+
+        def submit(stream_id: UUID, batch: Batch) -> int:
+            response = self._client.submit_observation_batch(
+                worker_id,
+                credential,
+                stream_id,
+                batch.batch_id,
+                batch.first_sequence,
+                batch_records(batch),
+            )
+            if response.stream_id != stream_id or response.batch_id != batch.batch_id:
+                raise ControlPlaneError(
+                    200, "invalid_response", "observation acknowledgement is inconsistent"
+                )
+            return response.accepted_through_sequence
+
+        return submit
+
+    def _build_pump(self, state: AgentState, assignment: JobAssignment) -> ObservationPump | None:
+        """Create the pump for this attempt, or decline when there is nowhere to send.
+
+        No stream means the control plane did not allocate one, which is how it addresses an
+        agent below protocol 1.2 and how it behaves before its own side is deployed. Collecting
+        observations with nowhere to put them would fill the state volume for nothing.
+        """
+        stream_id = assignment.observation_stream_id
+        courier = self._courier_for(state)
+        if stream_id is None or courier is None:
+            return None
+        directory = self._observation_directory(assignment.attempt_id)
+        try:
+            spool = ObservationSpool(directory, (CONTROL_PLANE_SINK,))
+            # Recorded before a single line is collected. A spool that cannot say where it is
+            # addressed can never be delivered by a later process.
+            spool.record_stream(stream_id)
+        except Exception as error:  # noqa: BLE001 - telemetry never stops a job starting
+            print(json.dumps({"status": "observations_unavailable", "detail": str(error)}))
+            return None
+
+        courier.adopt(spool, directory)
+        return ObservationPump(
+            spool=spool,
+            collector=ObservationCollector(clock=time.monotonic),
+            clock=time.monotonic,
+        )
 
     def _attempt_directory_for(self, attempt_id: UUID) -> Path:
         return self._state_path.parent / ATTEMPT_DIRECTORY / str(attempt_id)
@@ -446,6 +533,7 @@ class AgentRunner:
             )
         result = None
         authorised = True
+        pump = self._build_pump(state, assignment)
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
             # The pull can take minutes for a multi-gigabyte image, so it heartbeats too.
             pull_state = [state]
@@ -464,7 +552,12 @@ class AgentRunner:
                 )
                 save_state(self._state_path, state)
         if result is None:
-            state, result, authorised = self._supervise(state, assignment, may_start=not resuming)
+            state, result, authorised = self._supervise(
+                state, assignment, may_start=not resuming, pump=pump
+            )
+        # A snapshot, taken now. Delivery is the courier's business and carries on without this
+        # result, past it, and if necessary into another process.
+        result = _with_observations(result, pump)
         succeeded = result.exit_code == 0 and not result.timed_out and not result.failure_message
         if assignment.output_requirements and authorised and succeeded:
             # Only a successful result is gated on verified outputs. A failed or timed-out
@@ -493,7 +586,12 @@ class AgentRunner:
         return state
 
     def _supervise(
-        self, state: AgentState, assignment: JobAssignment, *, may_start: bool
+        self,
+        state: AgentState,
+        assignment: JobAssignment,
+        *,
+        may_start: bool,
+        pump: ObservationPump | None = None,
     ) -> tuple[AgentState, JobExecutionResult, bool]:
         """Run the attempt's container to the end of its authority, heartbeating meanwhile."""
         if self._executor is None:
@@ -520,6 +618,7 @@ class AgentRunner:
             may_start=may_start,
             on_tick=still_authorised,
             tick_seconds=state.heartbeat_interval_seconds,
+            observe=None if pump is None else pump.ingest,
         )
         return state, result, authorised
 
@@ -562,6 +661,11 @@ class AgentRunner:
 
     def run(self) -> None:
         state = self.ensure_enrolled()
+        # Before the first heartbeat, and without waiting for an assignment. A worker that
+        # restarts holding undelivered records and is then never given another job would
+        # otherwise keep them for ever: the courier was only ever built when work arrived, which
+        # is precisely the case recovery is for.
+        self._courier_for(state)
         while True:
             state = self.step(state)
             time.sleep(state.heartbeat_interval_seconds)
@@ -600,6 +704,87 @@ def _manifest_id(attempt_id: UUID) -> UUID:
 
 def _is_transient(error: ControlPlaneError) -> bool:
     return error.status_code == 429 or error.status_code >= 500
+
+
+def _with_observations(
+    result: JobExecutionResult, pump: "ObservationPump | None"
+) -> JobExecutionResult:
+    """Put the observation counters and the workload's own result on the job result.
+
+    A snapshot, taken now, because the result is reported without waiting for delivery to finish.
+    The field is omitted when nothing was counted: the model refuses an empty object, so an
+    absent field and "nothing happened" are the same thing rather than two.
+    """
+    if pump is None:
+        return result
+    try:
+        counters = pump.counters()
+    except Exception:  # noqa: BLE001 - a result is never lost over its telemetry
+        return result
+    update: dict[str, object] = {}
+    if counters:
+        update["observation_counters"] = counters
+    # The workload's own result, carried through untouched. The agent does not parse it and the
+    # control plane stores it opaquely; it is the workload's output, not a measurement of it.
+    structured = _structured_result_that_fits(pump.result)
+    if structured is not None:
+        update["structured_result"] = structured
+    if not update:
+        return result
+
+    # Rebuilt and revalidated rather than copied. `model_copy(update=...)` does not run
+    # validators, so every rule on this model would be silently skipped on the one path that
+    # matters, and an invalid result would travel to a control plane that refuses the whole
+    # submission rather than the offending field.
+    try:
+        return JobExecutionResult.model_validate({**result.model_dump(mode="json"), **update})
+    except ValidationError:
+        pass
+    # Something in what it was carrying is unacceptable. Report the job, not the payload: an
+    # execution result is evidence, and losing it over its own commentary would be the worse
+    # trade in every case.
+    update.pop("structured_result", None)
+    try:
+        return JobExecutionResult.model_validate({**result.model_dump(mode="json"), **update})
+    except ValidationError:
+        return result
+
+
+def _structured_result_that_fits(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The workload's result, or None when it cannot be sent.
+
+    Bounded here as well as in the model because the control plane refuses a **whole result
+    submission** whose structured result is too large. A workload that printed an enormous final
+    record would otherwise cost its own job's outcome, which is a poor exchange: the outcome is
+    evidence and the record is the workload talking about itself.
+    """
+    if payload is None:
+        return None
+    try:
+        # allow_nan=False refuses NaN and Infinity, which Python's json would happily emit and
+        # no JSON parser should accept. The HTTP client rejects them too, so leaving them in
+        # would abort the entire result request over the workload's own commentary.
+        encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        # Unserialisable, non-finite, or nested past the interpreter's patience.
+        print(
+            json.dumps({"status": "structured_result_omitted", "reason": "not encodable as JSON"}),
+            flush=True,
+        )
+        return None
+    if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
+        print(
+            json.dumps(
+                {
+                    "status": "structured_result_omitted",
+                    "reason": "larger than the control plane accepts",
+                    "bytes": len(encoded),
+                }
+            ),
+            flush=True,
+        )
+        return None
+    return payload
 
 
 def _is_rejection(error: Exception) -> bool:

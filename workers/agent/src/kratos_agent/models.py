@@ -1,15 +1,28 @@
 """Versioned messages shared with the Kratos worker API."""
 
+import json
+import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    model_validator,
+)
 
-# 1.1 adds the durable output extension. The agent advertises it only when it can collect and
-# upload outputs, because the control plane withholds jobs with output requirements from 1.0.
-PROTOCOL_VERSION = "1.1"
+# 1.2 adds observation streaming. The agent advertises it only when it can collect a job's
+# records and deliver them, because a control plane that allocated a stream for an agent
+# that never sends to it would show a run with telemetry that never arrives.
+PROTOCOL_VERSION = "1.2"
+# 1.1 adds the durable output extension. The control plane withholds jobs with output
+# requirements from 1.0, and a 1.1 worker runs jobs without observation streaming.
+PROTOCOL_VERSION_WITH_OUTPUTS = "1.1"
 # What an agent advertises when it cannot deliver durable outputs. The control plane never
 # assigns a job with output requirements to a 1.0 worker, which is the point.
 PROTOCOL_VERSION_WITHOUT_OUTPUTS = "1.0"
@@ -17,6 +30,16 @@ MAX_OUTPUT_FILES = 100
 MAX_OUTPUT_FILE_BYTES = 5 * 1024**3
 MAX_OUTPUT_TOTAL_BYTES = 10 * 1024**3
 MAX_LOGICAL_PATH_BYTES = 240
+# A batch is bounded twice: by count, so one request is never unboundedly large, and by
+# encoded size, because a hundred records each near the line bound would not fit a request
+# the control plane will accept.
+MAX_OBSERVATION_BATCH_RECORDS = 100
+MAX_OBSERVATION_BATCH_BYTES = 256 * 1024
+# The first minor version that can stream observations.
+OBSERVATION_MINOR_VERSION = 2
+# Matches MAX_STRUCTURED_RESULT_BYTES in the control plane. Checked here as well as there
+# so an over-long workload result is reported without one rather than refused outright.
+MAX_STRUCTURED_RESULT_BYTES = 65_536
 
 
 class StrictModel(BaseModel):
@@ -200,6 +223,12 @@ class JobAssignment(StrictModel):
     output_requirements: tuple[JobOutputRequirement, ...] = Field(
         default=(), max_length=MAX_OUTPUT_FILES
     )
+    # Allocated by the control plane with the attempt, before anything is exported, so every
+    # observation carries it from the first record. Optional because the server omits it for
+    # agents below protocol 1.2, and because this field has to exist in the agent before the
+    # server ever sends it: the model forbids unknown fields, so an agent that did not know
+    # the field would reject the whole assignment and the job would not run.
+    observation_stream_id: UUID | None = None
 
     @model_validator(mode="after")
     def output_requirements_are_consistent(self) -> "JobAssignment":
@@ -231,6 +260,46 @@ class JobExecutionResult(StrictModel):
     # time is what the control plane stopped doing.
     execution_started_at: datetime | None = None
     execution_finished_at: datetime | None = None
+    # What the agent refused to forward, by reason, and what it kept but did not export.
+    # Omitted when nothing was counted, so a 1.1 result is unchanged. These are execution
+    # evidence: they survive even when every observation was dropped, which is what makes a
+    # gap a number an operator can read rather than silence they have to infer.
+    observation_counters: dict[str, StrictInt] | None = None
+    # The workload's own last `result` record, opaque to the agent and to the control
+    # plane. Omitted when the workload emitted none, which is every image that predates
+    # the contract, so a 1.1 result is unchanged.
+    structured_result: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def the_structured_result_is_sendable(self) -> "JobExecutionResult":
+        if self.structured_result is None:
+            return self
+        try:
+            # allow_nan=False is the point. Python's json emits NaN and Infinity by default,
+            # which are not JSON, and the HTTP client refuses to encode them -- so a workload
+            # result containing one would abort the whole result request rather than being
+            # dropped. json.loads accepts those literals, so they arrive here quite easily.
+            encoded = json.dumps(
+                self.structured_result, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as error:
+            raise ValueError("structured result cannot be encoded as JSON") from error
+        if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
+            raise ValueError("structured result exceeds its size limit")
+        return self
+
+    @model_validator(mode="after")
+    def counters_are_present_and_countable(self) -> "JobExecutionResult":
+        if self.observation_counters is None:
+            return self
+        if not self.observation_counters:
+            raise ValueError("observation counters are omitted rather than sent empty")
+        for name, count in self.observation_counters.items():
+            if not OBSERVATION_COUNTER_NAME.match(name):
+                raise ValueError("observation counter name is not permitted")
+            if count < 0:
+                raise ValueError("observation counter values are non-negative integers")
+        return self
 
     @model_validator(mode="after")
     def execution_interval_is_whole_and_ordered(self) -> "JobExecutionResult":
@@ -246,6 +315,95 @@ class JobResultResponse(StrictModel):
     attempt_id: UUID
     job_id: UUID
     status: str
+
+
+# Three namespaces, and the control plane persists whatever it is given. `dropped.` is a line
+# rejected from its intended forwarding path. `not_exported.` is a line intentionally not
+# sent to one named sink. `delivery.` is about the sending itself rather than about any
+# line, so a failed request is never mistaken for a lost record.
+OBSERVATION_COUNTER_NAME = re.compile(r"^(dropped|not_exported|delivery)\.[a-z][a-z0-9_]{0,63}$")
+
+
+class ObservationRecord(StrictModel):
+    """One observation, numbered by the agent and stamped by the container runtime.
+
+    Ordering is by the agent's sequence rather than by `at`, because container timestamps
+    repeat, can go backwards, and cannot express a gap. `at` is evidence of when the line
+    was written; `sequence` is what makes the stream a stream.
+    """
+
+    sequence: int = Field(ge=1)
+    at: datetime
+    record: Literal["param", "metric", "progress"]
+    name: str | None = Field(default=None, max_length=64)
+    value: str | float | bool | None = None
+    step: int | None = Field(default=None, ge=0)
+    total_steps: int | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, max_length=32)
+
+    @model_validator(mode="after")
+    def each_kind_carries_exactly_what_it_needs(self) -> "ObservationRecord":
+        # The classifier has already applied these rules to the workload's line. Applying
+        # them again here is deliberate: this model is what goes on the wire, and it should
+        # not be possible to assemble an invalid batch from valid code.
+        if self.record == "param":
+            if self.name is None or self.value is None:
+                raise ValueError("a parameter carries a name and a value")
+            if self.step is not None or self.total_steps is not None:
+                raise ValueError("a parameter has no position")
+        elif self.record == "metric":
+            if self.name is None or self.step is None:
+                raise ValueError("a metric carries a name and a step")
+            if not isinstance(self.value, float) and not isinstance(self.value, int):
+                raise ValueError("a metric value is a number")
+            if isinstance(self.value, bool):
+                raise ValueError("a metric value is a number")
+            if self.total_steps is not None:
+                raise ValueError("a metric has no total")
+        else:
+            if self.step is None:
+                raise ValueError("progress carries a step")
+            if self.name is not None or self.value is not None:
+                raise ValueError("progress carries no name or value")
+            if self.total_steps is not None and self.total_steps < self.step:
+                raise ValueError("progress cannot exceed its total")
+        return self
+
+
+class SubmitObservationBatchRequest(StrictModel):
+    """A contiguous run of observations, replayable without changing anything."""
+
+    protocol_version: str = Field(pattern=r"^1\.[0-9]+$")
+    first_sequence: int = Field(ge=1)
+    records: tuple[ObservationRecord, ...] = Field(
+        min_length=1, max_length=MAX_OBSERVATION_BATCH_RECORDS
+    )
+
+    @model_validator(mode="after")
+    def the_protocol_supports_observations(self) -> "SubmitObservationBatchRequest":
+        # Compared as a number, not matched as text: 1.10 is newer than 1.2, and a character
+        # class that reads left to right gets that backwards.
+        minor = int(self.protocol_version.split(".", 1)[1])
+        if minor < OBSERVATION_MINOR_VERSION:
+            raise ValueError("observation streaming requires protocol 1.2 or newer")
+        return self
+
+    @model_validator(mode="after")
+    def sequences_are_contiguous_from_the_first(self) -> "SubmitObservationBatchRequest":
+        # A gap inside a batch would make `accepted_through_sequence` ambiguous: the control
+        # plane could not say whether the missing number was lost or never existed.
+        expected = self.first_sequence
+        for record in self.records:
+            if record.sequence != expected:
+                raise ValueError("batch sequences are contiguous from first_sequence")
+            expected += 1
+        return self
+
+
+class ObservationBatchResponse(StrictModel):
+    stream_id: UUID
+    batch_id: UUID
+    accepted_through_sequence: int = Field(ge=0)
 
 
 class ArtifactManifestFile(StrictModel):

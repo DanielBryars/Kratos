@@ -12,7 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from test_executor import T0, FakeClock, JobClient, JobContainer, job_assignment
 
-from kratos_agent.executor import DockerExecutor
+from kratos_agent.executor import DockerExecutor, LogObserver
 from kratos_agent.models import (
     GpuHealth,
     GpuHealthStatus,
@@ -241,6 +241,7 @@ class FakeJobExecutor(DockerExecutor):
         may_start: bool = True,
         on_tick: Callable[[], bool] | None = None,
         tick_seconds: float = 30,
+        observe: LogObserver | None = None,
     ) -> JobExecutionResult:
         self.runs.append((assignment.attempt_id, may_start))
         self.tick_seconds = tick_seconds
@@ -354,6 +355,7 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
             may_start: bool = True,
             on_tick: Callable[[], bool] | None = None,
             tick_seconds: float = 30,
+            observe: LogObserver | None = None,
         ) -> JobExecutionResult:
             nonlocal link_up
             if may_start:
@@ -588,6 +590,7 @@ def test_recorded_attempt_is_supervised_before_any_heartbeat(tmp_path: Path) -> 
             may_start: bool = True,
             on_tick: Callable[[], bool] | None = None,
             tick_seconds: float = 30,
+            observe: LogObserver | None = None,
         ) -> JobExecutionResult:
             events.append(f"supervise may_start={may_start}")
             return super().run_job(assignment, may_start=may_start)

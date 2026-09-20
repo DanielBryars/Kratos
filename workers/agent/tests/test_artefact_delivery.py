@@ -14,6 +14,7 @@ from test_protocol import WORKER_ID, WORKER_SECRET, FakeJobExecutor, capabilitie
 
 from kratos_agent import runner as runner_module
 from kratos_agent.models import (
+    PROTOCOL_VERSION,
     JobAssignment,
     JobExecutionResult,
 )
@@ -104,7 +105,9 @@ class Recorder:
             self.calls.append("manifest")
             payload = json.loads(request.content)
             self.manifest_ids.append(payload["manifest_id"])
-            assert payload["protocol_version"] == "1.1"
+            # Whatever the agent advertises, not a pinned 1.1: artefact transfer requires 1.1 or
+            # newer, and an agent that also streams observations sends 1.2 here.
+            assert payload["protocol_version"] == PROTOCOL_VERSION
             return httpx.Response(
                 200,
                 json={
