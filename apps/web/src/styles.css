@@ -68,6 +68,7 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .job { display: grid; gap: 10px; padding: 18px; border: 1px solid #334154; border-radius: 10px; background: #111a26; color: #9babbc; font-size: 0.9rem; }
 .job-heading { display: flex; justify-content: space-between; gap: 16px; }
 .job strong { color: #eef4fa; }
+.job-identity { overflow-wrap: anywhere; color: #d3dde8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
 .job-image { overflow-wrap: anywhere; color: #8cc0ff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
 .job pre { overflow: auto; max-height: 220px; margin: 0; padding: 12px; border-radius: 8px; color: #bcd0e4; background: #0b1017; white-space: pre-wrap; }
 .job-failure, .badge--job-failed { color: #ff9e9e; }

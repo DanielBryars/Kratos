@@ -63,6 +63,30 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+function formatDuration(milliseconds: number) {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}m ${remainder}s`;
+}
+
+function jobTiming(job: Job) {
+  const submittedAt = new Date(job.submitted_at).getTime();
+  const startedAt = job.started_at ? new Date(job.started_at).getTime() : null;
+  const finishedAt = job.finished_at ? new Date(job.finished_at).getTime() : null;
+  if (startedAt !== null && finishedAt !== null) {
+    return `Waited ${formatDuration(startedAt - submittedAt)} · ran ${formatDuration(finishedAt - startedAt)}`;
+  }
+  if (startedAt !== null) {
+    return `Waited ${formatDuration(startedAt - submittedAt)} · running for ${formatDuration(Date.now() - startedAt)}`;
+  }
+  if (finishedAt !== null) {
+    return `Finished after ${formatDuration(finishedAt - submittedAt)}`;
+  }
+  return `Queued for ${formatDuration(Date.now() - submittedAt)} · completion estimate unavailable`;
+}
+
 export function App() {
   const [service, setService] = useState<Version | null>(null);
   const [status, setStatus] = useState<"checking" | "online" | "offline">("checking");
@@ -373,8 +397,10 @@ export function App() {
                   {jobs.map((job) => (
                     <div className="job" key={job.job_id}>
                       <div className="job-heading"><div><strong>{job.name}</strong><p>{new Date(job.submitted_at).toLocaleString()}</p></div><span className={`badge badge--job-${job.status}`}>{job.status}</span></div>
+                      <p className="job-identity">Run {job.job_id}</p>
                       <p className="job-image">{job.image_reference}</p>
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
+                      <p>{jobTiming(job)}</p>
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
                       {job.stdout && <pre>{job.stdout}</pre>}
                       {job.stderr && <pre className="job-failure">{job.stderr}</pre>}
