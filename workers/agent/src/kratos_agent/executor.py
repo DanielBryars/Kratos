@@ -175,7 +175,8 @@ class DockerExecutor:
             container = self._client.containers.get(container_name)
             if container.status == "created":
                 return _failure(125, "job container was created but never started")
-            started_at = _state_time(container, "StartedAt") or self._clock()
+            observed_start = _state_time(container, "StartedAt")
+            started_at = observed_start or self._clock()
         except docker.errors.NotFound:
             if self._clock() >= assignment.lease_expires_at:
                 return _failure(124, "assignment lease expired before execution", timed_out=True)
@@ -222,9 +223,13 @@ class DockerExecutor:
             except docker.errors.APIError as error:
                 return _failure(125, f"job container could not be started: {error}")
             started_at = self._clock()
+            # Read back rather than assumed: the runtime's own clock is the evidence.
+            container.reload()
+            observed_start = _state_time(container, "StartedAt")
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
+        observed_finish: datetime | None = None
         bound_message = (
             f"execution exceeded {assignment.timeout_seconds} seconds"
             if deadline == runtime_deadline
@@ -254,11 +259,16 @@ class DockerExecutor:
         if failure_message is not None:
             exit_code = 124 if timed_out else 125
             self._kill(container, logical_name)
+            # The kill has happened, so the runtime now knows when it finished.
+            with contextlib.suppress(Exception):
+                container.reload()
+                observed_finish = _state_time(container, "FinishedAt")
         else:
             # A container that has already exited is reported with its real exit status, even
             # when a network outage held the result back beyond the lease.
             exit_code = int(container.wait(timeout=10)["StatusCode"])
             finished_at = _state_time(container, "FinishedAt")
+            observed_finish = finished_at
             if finished_at is not None and finished_at > deadline:
                 # A container this agent killed at its bound finishes just after it; a later
                 # finish means nothing was enforcing the bound at the time.
@@ -273,12 +283,16 @@ class DockerExecutor:
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
+        # Both or neither: an interval with one end missing is not evidence.
+        whole = observed_start is not None and observed_finish is not None
         return JobExecutionResult(
             exit_code=exit_code,
             timed_out=timed_out,
             stdout=stdout,
             stderr=stderr,
             failure_message=failure_message,
+            execution_started_at=observed_start if whole else None,
+            execution_finished_at=observed_finish if whole else None,
         )
 
     def durable_output_support(self) -> str | None:

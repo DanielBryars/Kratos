@@ -7,6 +7,7 @@ from uuid import UUID
 
 import docker
 import pytest
+from pydantic import ValidationError
 
 from kratos_agent.executor import (
     CLEANUP_IMAGE,
@@ -14,7 +15,12 @@ from kratos_agent.executor import (
     EnforcementError,
     ExecutorError,
 )
-from kratos_agent.models import GpuHealthStatus, JobAssignment, JobOutputRequirement
+from kratos_agent.models import (
+    GpuHealthStatus,
+    JobAssignment,
+    JobExecutionResult,
+    JobOutputRequirement,
+)
 
 IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -688,3 +694,75 @@ def test_the_cleanup_image_is_prefetched_before_the_capability_is_offered() -> N
 
     assert executor.durable_output_support() is None
     assert images.pulled == [CLEANUP_IMAGE]
+
+
+def test_a_completed_run_reports_the_runtime_s_own_interval() -> None:
+    clock = FakeClock()
+    started, finished = T0 - timedelta(seconds=40), T0 - timedelta(seconds=10)
+    existing = JobContainer(clock, status="exited", started_at=started, exits_at=finished)
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
+
+    # The container runtime's timestamps, not the agent's clock or the assignment.
+    assert result.execution_started_at == started
+    assert result.execution_finished_at == finished
+
+
+def test_a_failure_before_the_container_started_reports_no_interval() -> None:
+    clock = FakeClock()
+
+    result = job_executor(clock, JobClient(clock)).run_job(job_assignment(), may_start=False)
+
+    assert result.exit_code == 125
+    assert result.execution_started_at is None
+    assert result.execution_finished_at is None
+
+
+def test_an_expired_lease_before_execution_reports_no_interval() -> None:
+    clock = FakeClock()
+
+    result = job_executor(clock, JobClient(clock)).run_job(
+        job_assignment(lease=timedelta(seconds=-1))
+    )
+
+    assert result.timed_out is True
+    assert result.execution_started_at is None
+
+
+def test_a_killed_run_reports_the_interval_the_runtime_recorded() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
+
+    assert result.failure_message == "execution exceeded 120 seconds"
+    # A killed container has a finish time, and it is the runtime's, not the deadline.
+    assert result.execution_started_at == T0 - timedelta(seconds=100)
+    assert result.execution_finished_at == existing.exits_at
+
+
+def test_an_interval_is_never_sent_with_one_end_missing() -> None:
+    with pytest.raises(ValidationError, match="sent as a pair"):
+        JobExecutionResult(
+            exit_code=0,
+            timed_out=False,
+            stdout="",
+            stderr="",
+            execution_started_at=T0,
+        )
+
+
+def test_an_inverted_interval_is_refused_before_it_is_sent() -> None:
+    with pytest.raises(ValidationError, match="finished before it started"):
+        JobExecutionResult(
+            exit_code=0,
+            timed_out=False,
+            stdout="",
+            stderr="",
+            execution_started_at=T0,
+            execution_finished_at=T0 - timedelta(seconds=1),
+        )
