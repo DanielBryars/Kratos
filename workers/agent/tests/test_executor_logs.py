@@ -5,6 +5,7 @@ different shape from the bounded capture used for the result, and a fake that qu
 streaming arguments would let the reader do nothing while every test still passed.
 """
 
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -152,6 +153,58 @@ def test_a_line_split_across_chunks_arrives_once_and_whole() -> None:
 def test_a_final_line_without_a_newline_still_arrives() -> None:
     _, seen, _ = run([(b"2026-09-20T12:00:01Z no trailing newline", None)])
     assert [text for _, _, text in seen] == ["no trailing newline"]
+
+
+def test_output_buffered_until_container_exit_is_drained_after_result() -> None:
+    """A short job may exit before Docker yields its first buffered log chunk.
+
+    Reporting the result must not wait for telemetry, but it also must not tell the daemon reader
+    to discard that finite stream. The reader owns the drain and may finish just after the result.
+    """
+
+    release = threading.Event()
+
+    class ExitBuffered(Container):
+        def __init__(self, clock: Clock) -> None:
+            super().__init__(clock, [])
+            self.exited = threading.Event()
+
+        def reload(self) -> None:
+            super().reload()
+            if self.status == "exited":
+                self.exited.set()
+
+        def logs(self, **options: Any) -> Any:
+            if not options.get("stream"):
+                return b"captured\n"
+
+            def after_exit() -> Any:
+                assert self.exited.wait(timeout=1)
+                assert release.wait(timeout=1)
+                yield (b"2026-09-20T12:00:04Z buffered until exit\n", None)
+
+            self.streamed = True
+            return after_exit()
+
+    clock = Clock()
+    container = ExitBuffered(clock)
+    executor = DockerExecutor(
+        Client(Containers(container, existing=False)), clock=clock, sleep=clock.sleep
+    )
+    seen: list[tuple[Stream, datetime, str]] = []
+    delivered = threading.Event()
+
+    def observe(stream: Stream, at: datetime, text: str) -> None:
+        seen.append((stream, at, text))
+        delivered.set()
+
+    result = executor.run_job(assignment(), tick_seconds=1, observe=observe)
+
+    assert result.exit_code == 0
+    assert not delivered.is_set()
+    release.set()
+    assert delivered.wait(timeout=1)
+    assert [(stream, text) for stream, _, text in seen] == [(Stream.STDOUT, "buffered until exit")]
 
 
 def test_a_broken_log_stream_does_not_fail_the_job() -> None:

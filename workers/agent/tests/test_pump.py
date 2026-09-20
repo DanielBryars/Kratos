@@ -155,7 +155,7 @@ def test_counters_include_records_the_spool_had_to_discard(
 
 # --- Concurrency ----------------------------------------------------------------------------------
 #
-# The executor signals its log reader to stop and does not wait for it, because a result may never
+# The executor leaves its log reader to drain and does not wait for it, because a result may never
 # wait on telemetry. So the reader can still be calling ingest() while the runner takes the counter
 # snapshot and reports the result.
 
