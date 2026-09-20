@@ -533,7 +533,7 @@ class AgentRunner:
             )
         result = None
         authorised = True
-        pump = self._build_pump(state, assignment)
+        pump = None
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
             # The pull can take minutes for a multi-gigabyte image, so it heartbeats too.
             pull_state = [state]
@@ -552,6 +552,11 @@ class AgentRunner:
                 )
                 save_state(self._state_path, state)
         if result is None:
+            # An empty spool becomes retirement-eligible after sixty seconds. Create it only
+            # once a fresh image pull has completed, otherwise a large first pull can let the
+            # courier remove the directory before the workload writes its first observation.
+            # A resumed attempt skips the pull and reaches this point immediately.
+            pump = self._build_pump(state, assignment)
             state, result, authorised = self._supervise(
                 state, assignment, may_start=not resuming, pump=pump
             )
