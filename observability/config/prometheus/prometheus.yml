@@ -1,0 +1,28 @@
+# Prometheus receives metrics only through its OTLP endpoint, from the gateway.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+otlp:
+  # Only stable, low-cardinality identity becomes a label. The gateway has already deleted the run
+  # identifiers from metrics, so nothing per-attempt can reach a series or `target_info` even if
+  # this list were wrong. Run identity lives on logs, traces and MLflow, and an exemplar carries
+  # the association from a metric point to its trace (ADR-015).
+  promote_resource_attributes:
+    - service.name
+    - kratos.worker.id
+  translation_strategy: UnderscoreEscapingWithSuffixes
+
+storage:
+  tsdb:
+    # Accept samples that arrive late because a worker was offline and its collector replayed them.
+    out_of_order_time_window: 30m
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+    # These bound Prometheus's own scrape only. They are deliberately not described as a ceiling
+    # on OTLP ingestion, which they do not affect; that is bounded by the gateway instead.
+    sample_limit: 50000
+    label_limit: 24

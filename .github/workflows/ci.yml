@@ -125,6 +125,32 @@ jobs:
       - run: uv run --python 3.12 mypy train.py tests
       - run: uv run --python 3.12 pytest
 
+  observability:
+    runs-on: ubuntu-latest
+    env:
+      # Every step that touches Compose needs this, including the teardown: the file
+      # deliberately has no default password, so interpolation fails without it.
+      KRATOS_GRAFANA_ADMIN_PASSWORD: ${{ github.run_id }}-ci-only
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh observability/validate.sh
+      # Static validation cannot show that a signal arrives, that no per-run identifier
+      # reaches a metric series, or that an exemplar links a point to its trace. The smoke
+      # service proves all three against the running stack.
+      - name: Start the stack and prove the signal paths
+        working-directory: observability
+        run: |
+          docker compose up -d --wait --wait-timeout 180
+          docker compose run --rm smoke
+      - name: Collect service logs on failure
+        if: failure()
+        working-directory: observability
+        run: docker compose logs --tail 50
+      - name: Stop the stack
+        if: always()
+        working-directory: observability
+        run: docker compose down -v
+
   infrastructure:
     runs-on: ubuntu-latest
     steps:

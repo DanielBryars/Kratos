@@ -1,0 +1,33 @@
+# Single-binary Tempo with local storage. The cloud deployment replaces the backend with Cloud
+# Storage (ADR-009). Block retention is set by a flag in compose.yaml, where Tempo 3 defines it.
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 4000000
+      burst_size_bytes: 8000000
+      max_traces_per_user: 10000
+      max_global_traces_per_user: 10000
+    global:
+      max_bytes_per_trace: 5000000
+
+usage_report:
+  reporting_enabled: false

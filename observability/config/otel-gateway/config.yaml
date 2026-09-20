@@ -1,0 +1,66 @@
+# OpenTelemetry Collector gateway (ADR-009). Workers send OTLP here; nothing else is accepted.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 4194304
+
+processors:
+  # Refuse data before the process is killed for memory, so exhaustion is a visible refusal.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+  # Strip run identity from metrics before it can reach Prometheus. Promotion rules are not
+  # enough: an unpromoted resource attribute still produces one `target_info` series per attempt,
+  # which is the same unbounded growth. Logs and traces keep these attributes, and an exemplar
+  # carries the association from a metric point to its trace (ADR-015).
+  resource/metrics:
+    attributes:
+      - key: kratos.job.id
+        action: delete
+      - key: kratos.attempt.id
+        action: delete
+      - key: kratos.project.id
+        action: delete
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  otlp_http/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+    tls: { insecure: true }
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+    tls: { insecure: true }
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls: { insecure: true }
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs: { level: warn }
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/metrics, batch]
+      exporters: [otlp_http/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/tempo]
