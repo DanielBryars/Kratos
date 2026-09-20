@@ -145,12 +145,14 @@ control plane stops holding the attempt during the pull, the agent abandons it b
 container is created.
 
 The agent records each attempt in its state volume before creating the container, so a missing
-container is reported as a failure rather than run again. It stops a container at the earlier of its
-runtime bound and lease deadline without needing the control plane. Losing the control plane, or a
-temporary Docker or registry error, is logged as `{"status": "retrying"}` and does not end the
-agent: heartbeats continue and the retained result is delivered once the link returns. Heartbeats
-also continue while a job runs, and the agent stops the container if the control plane stops
-returning that attempt. See the
+container is reported as a failure rather than run again. It **kills** a container at the earlier of
+its runtime bound and lease deadline, without needing the control plane and without a grace period,
+so a workload that ignores `SIGTERM` cannot run past its authority. Nothing is signalled: a job
+stopped by Kratos produces no interruption record. Losing the control plane, or a temporary Docker
+or registry error, is logged as `{"status": "retrying"}` and does not end the agent: heartbeats
+continue and the retained result is delivered once the link returns. Heartbeats also continue while
+a job runs, and the agent kills the container if the control plane stops returning that attempt.
+See the
 [worker protocol](../../docs/protocol/worker-v1.md#execution-authority-and-network-loss).
 
 ## Output manifests
@@ -168,9 +170,8 @@ Each visited directory and file is made read-only where this agent is permitted 
 is not, because a job image may write its outputs as any user. Sealing is therefore defence in
 depth rather than the guarantee. A file whose device, inode, size, link count
 or modification or change time differs after hashing is rejected. The builder returns that identity
-with every manifest entry. The uploader SHALL re-check it on the descriptor it sends, or hash again
-immediately before transfer, so the uploaded bytes cannot differ from the manifest.
-
+with every manifest entry, and the uploader re-checks it on the descriptor it sends, so the uploaded
+bytes cannot differ from the manifest.
 
 ## Durable outputs
 
