@@ -7,6 +7,8 @@ services:
     environment:
       DATABASE_URL: postgresql://kratos@postgres:5432/kratos
       RUST_LOG: kratos_control_plane=debug
+      KRATOS_GRAFANA_URL: http://127.0.0.1:13000
+      KRATOS_MLFLOW_URL: http://127.0.0.1:15000
     volumes:
       - ..:/workspaces/kratos:cached
       - cargo-registry:/usr/local/cargo/registry

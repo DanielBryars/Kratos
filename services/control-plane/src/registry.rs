@@ -33,11 +33,26 @@ const REGISTRATION_POLL_SECONDS: u32 = 3;
 const MAX_OPEN_REGISTRATIONS: i64 = 1_000;
 const MAX_VERIFICATIONS_PER_MINUTE: usize = 10;
 const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+const SUCCESSFUL_VERIFICATION_TTL: Duration = Duration::from_secs(60);
+const MAX_CACHED_VERIFICATIONS: usize = 4_096;
 const MAX_LEASE_RECOVERIES_PER_PASS: usize = 100;
+const OBSERVATION_COUNTERS: [&str; 9] = [
+    "dropped.oversize",
+    "dropped.malformed",
+    "dropped.rate",
+    "dropped.budget",
+    "dropped.name_limit",
+    "dropped.delivery_abandoned",
+    "not_exported.metric_name_not_allowed",
+    "not_exported.otlp_unconfigured",
+    "delivery.failures",
+];
+type VerificationCache = HashMap<(Uuid, [u8; 32]), Instant>;
 
 #[derive(Clone)]
 pub(crate) struct VerificationGate {
     attempts: Arc<Mutex<HashMap<Uuid, VecDeque<Instant>>>>,
+    successful: Arc<Mutex<VerificationCache>>,
     permits: Arc<Semaphore>,
 }
 
@@ -45,6 +60,7 @@ impl Default for VerificationGate {
     fn default() -> Self {
         Self {
             attempts: Arc::new(Mutex::new(HashMap::new())),
+            successful: Arc::new(Mutex::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATIONS)),
         }
     }
@@ -57,7 +73,39 @@ impl VerificationGate {
         supplied: String,
         verifier: String,
     ) -> Result<bool, ApiError> {
+        self.verify_with_priority(identifier, supplied, verifier, false)
+            .await
+    }
+
+    async fn verify_priority(
+        &self,
+        identifier: Uuid,
+        supplied: String,
+        verifier: String,
+    ) -> Result<bool, ApiError> {
+        self.verify_with_priority(identifier, supplied, verifier, true)
+            .await
+    }
+
+    async fn verify_with_priority(
+        &self,
+        identifier: Uuid,
+        supplied: String,
+        verifier: String,
+        priority: bool,
+    ) -> Result<bool, ApiError> {
         let now = Instant::now();
+        let supplied_digest: [u8; 32] = Sha256::digest(supplied.as_bytes()).into();
+        {
+            let mut successful = self.successful.lock().await;
+            successful.retain(|_, expires_at| *expires_at > now);
+            if successful
+                .get(&(identifier, supplied_digest))
+                .is_some_and(|expires_at| *expires_at > now)
+            {
+                return Ok(true);
+            }
+        }
         {
             let mut attempts = self.attempts.lock().await;
             let recent = attempts.entry(identifier).or_default();
@@ -73,14 +121,36 @@ impl VerificationGate {
             recent.push_back(now);
         }
 
-        let permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| ApiError::too_many_requests())?;
+        let permit = if priority {
+            Arc::clone(&self.permits)
+                .acquire_owned()
+                .await
+                .map_err(|_| ApiError::internal())?
+        } else {
+            Arc::clone(&self.permits)
+                .try_acquire_owned()
+                .map_err(|_| ApiError::too_many_requests())?
+        };
         let authenticated =
             tokio::task::spawn_blocking(move || credentials::verify(&supplied, &verifier))
                 .await
                 .map_err(|_| ApiError::internal())?;
         drop(permit);
+        if authenticated {
+            let mut successful = self.successful.lock().await;
+            if successful.len() >= MAX_CACHED_VERIFICATIONS
+                && let Some(oldest) = successful
+                    .iter()
+                    .min_by_key(|(_, expires_at)| **expires_at)
+                    .map(|(key, _)| *key)
+            {
+                successful.remove(&oldest);
+            }
+            successful.insert(
+                (identifier, supplied_digest),
+                now + SUCCESSFUL_VERIFICATION_TTL,
+            );
+        }
         Ok(authenticated)
     }
 }
@@ -253,6 +323,8 @@ pub struct JobAssignment {
     pub gpu_index: u32,
     pub timeout_seconds: u32,
     pub lease_expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observation_stream_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub output_requirements: Vec<JobOutputRequirement>,
 }
@@ -267,6 +339,8 @@ pub struct JobResultRequest {
     pub failure_message: Option<String>,
     pub execution_started_at: Option<DateTime<Utc>>,
     pub execution_finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub observation_counters: Option<HashMap<String, i64>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -320,7 +394,7 @@ impl ApiError {
         }
     }
 
-    const fn unauthorized() -> Self {
+    pub(crate) const fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
@@ -431,6 +505,7 @@ struct AssignmentRecord {
     image_reference: String,
     timeout_seconds: i32,
     lease_expires_at: DateTime<Utc>,
+    observation_stream_id: Option<Uuid>,
 }
 
 struct ExpectedHeartbeat<'a> {
@@ -520,6 +595,7 @@ impl TryFrom<AssignmentRecord> for JobAssignment {
             timeout_seconds: u32::try_from(record.timeout_seconds)
                 .map_err(|_| ApiError::internal())?,
             lease_expires_at: record.lease_expires_at,
+            observation_stream_id: record.observation_stream_id,
             output_requirements: Vec::new(),
         })
     }
@@ -567,6 +643,11 @@ pub(crate) fn validate_protocol(version: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::unsupported_protocol())
     }
+}
+
+pub(crate) fn protocol_minor(version: &str) -> Option<u32> {
+    let (major, minor) = version.split_once('.')?;
+    (major == "1").then(|| minor.parse().ok()).flatten()
 }
 
 pub(crate) async fn authenticate_worker(
@@ -732,7 +813,7 @@ fn database(state: &AppState) -> Result<&PgPool, ApiError> {
     state.database.as_ref().ok_or_else(ApiError::unavailable)
 }
 
-fn database_error(error: &sqlx::Error, operation: &'static str) -> ApiError {
+pub(crate) fn database_error(error: &sqlx::Error, operation: &'static str) -> ApiError {
     tracing::error!(%error, operation, "worker registry database operation failed");
     ApiError::internal()
 }
@@ -1480,14 +1561,18 @@ async fn current_or_assign_job(
     let worker_status = worker.0;
     let existing = sqlx::query_as::<_, AssignmentRecord>(
         "SELECT a.id AS attempt_id, j.id AS job_id, j.name, j.image_reference, \
-                j.timeout_seconds, a.lease_expires_at \
+                j.timeout_seconds, a.lease_expires_at, \
+                CASE WHEN split_part($2, '.', 2)::integer >= 2 THEN s.id END \
+                    AS observation_stream_id \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+         LEFT JOIN observation_streams s ON s.attempt_id = a.id \
          WHERE a.worker_id = $1 AND a.status IN ('assigned', 'running') \
            AND j.status IN ('assigned', 'running') \
            AND COALESCE(a.artifact_delivery_expires_at, a.lease_expires_at) > now() \
          ORDER BY a.assigned_at LIMIT 1",
     )
     .bind(worker_id)
+    .bind(&worker.2)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "load active assignment"))?;
@@ -1578,6 +1663,18 @@ async fn current_or_assign_job(
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "create job attempt"))?;
+    let observation_stream_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO observation_streams (id, attempt_id, job_id, worker_id) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(observation_stream_id)
+    .bind(attempt_id)
+    .bind(job_id)
+    .bind(worker_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| database_error(&error, "create observation stream"))?;
     sqlx::query(
         "UPDATE jobs SET status = 'assigned', assigned_worker_id = $2 WHERE id = $1 AND status = 'queued'",
     )
@@ -1619,6 +1716,9 @@ async fn current_or_assign_job(
         gpu_index: 0,
         timeout_seconds: u32::try_from(timeout_seconds).map_err(|_| ApiError::internal())?,
         lease_expires_at,
+        observation_stream_id: protocol_minor(&worker.2)
+            .filter(|minor| *minor >= 2)
+            .map(|_| observation_stream_id),
         output_requirements: load_output_requirements(pool, job_id).await?,
     }))
 }
@@ -1677,7 +1777,7 @@ pub(crate) async fn heartbeat(
     }
     if !state
         .verification_gate
-        .verify(credential_id, supplied, authentication.token_verifier)
+        .verify_priority(credential_id, supplied, authentication.token_verifier)
         .await?
     {
         return Err(ApiError::unauthorized());
@@ -1892,6 +1992,17 @@ pub(crate) async fn report_job_result(
     {
         return Err(ApiError::invalid_request());
     }
+    if result
+        .observation_counters
+        .as_ref()
+        .is_some_and(|counters| {
+            counters
+                .iter()
+                .any(|(name, value)| *value < 0 || !OBSERVATION_COUNTERS.contains(&name.as_str()))
+        })
+    {
+        return Err(ApiError::invalid_request());
+    }
     let mut transaction = pool
         .begin()
         .await
@@ -1947,6 +2058,17 @@ pub(crate) async fn report_job_result(
     let received_at = Utc::now();
     let execution = execution_interval(&result, &attempt, received_at)?;
     if attempt.job_status == "cancelling" {
+        sqlx::query("UPDATE job_attempts SET observation_counters = $2 WHERE id = $1")
+            .bind(attempt_id)
+            .bind(
+                result
+                    .observation_counters
+                    .as_ref()
+                    .map(|counters| json!(counters)),
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| database_error(&error, "record cancelled observation counters"))?;
         acknowledge_cancelled_attempt(&mut transaction, &attempt, execution).await?;
         transaction
             .commit()
@@ -1993,12 +2115,18 @@ pub(crate) async fn report_job_result(
     let finished_at = execution.map_or(received_at, |interval| interval.finished_at);
     sqlx::query(
         "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, $3), \
-                finished_at = $4 WHERE id = $1",
+                finished_at = $4, observation_counters = $5 WHERE id = $1",
     )
     .bind(attempt_id)
     .bind(final_status)
     .bind(started_at)
     .bind(finished_at)
+    .bind(
+        result
+            .observation_counters
+            .as_ref()
+            .map(|counters| json!(counters)),
+    )
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "finish job attempt"))?;
@@ -2068,9 +2196,26 @@ mod tests {
 
     use super::{
         ExecutionInterval, ExpectedHeartbeat, ExpiredAttemptRecord, GpuHealth, GpuHealthEvidence,
-        GpuHealthStatus, JobResultRequest, current_or_assign_job, execution_interval,
-        immutable_sha256_reference, valid_gpu_health,
+        GpuHealthStatus, JobResultRequest, VerificationGate, current_or_assign_job,
+        execution_interval, immutable_sha256_reference, valid_gpu_health,
     };
+
+    #[tokio::test]
+    async fn successful_worker_verification_is_reused_inside_the_short_cache_window() {
+        let credential = credentials::issue(CredentialKind::Worker).unwrap();
+        let gate = VerificationGate::default();
+        for _ in 0..20 {
+            assert!(
+                gate.verify(
+                    credential.id,
+                    credential.plaintext.expose().to_owned(),
+                    credential.verifier.clone(),
+                )
+                .await
+                .unwrap()
+            );
+        }
+    }
 
     fn result_with_interval(
         started_at: Option<DateTime<Utc>>,
@@ -2084,6 +2229,7 @@ mod tests {
             failure_message: None,
             execution_started_at: started_at,
             execution_finished_at: finished_at,
+            observation_counters: None,
         }
     }
 
@@ -2388,7 +2534,11 @@ mod tests {
                         "stderr": "",
                         "failure_message": null,
                         "execution_started_at": execution_started_at,
-                        "execution_finished_at": execution_finished_at
+                        "execution_finished_at": execution_finished_at,
+                        "observation_counters": {
+                            "dropped.rate": 2,
+                            "delivery.failures": 1
+                        }
                     })
                     .to_string(),
                 ))
@@ -2397,12 +2547,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let recorded_attempt: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
-            sqlx::query_as("SELECT started_at, finished_at FROM job_attempts WHERE id = $1")
-                .bind(assignment.attempt_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let recorded_attempt: (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<Value>) =
+            sqlx::query_as(
+                "SELECT started_at, finished_at, observation_counters \
+                 FROM job_attempts WHERE id = $1",
+            )
+            .bind(assignment.attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let recorded_job: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
             sqlx::query_as("SELECT started_at, finished_at FROM jobs WHERE id = $1")
                 .bind(job_id)
@@ -2410,10 +2563,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            recorded_attempt,
+            (recorded_attempt.0, recorded_attempt.1),
             (Some(execution_started_at), Some(execution_finished_at))
         );
-        assert_eq!(recorded_job, recorded_attempt);
+        assert_eq!(recorded_job, (recorded_attempt.0, recorded_attempt.1));
+        assert_eq!(
+            recorded_attempt.2,
+            Some(json!({"dropped.rate": 2, "delivery.failures": 1}))
+        );
 
         let legacy_job_id = insert_job(&pool, owner_id).await;
         let legacy = current_or_assign_job(&pool, worker_id, true, None)
