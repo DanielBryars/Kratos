@@ -185,6 +185,7 @@ pub struct OperatorAttemptIdentity {
     pub attempt_number: i32,
     pub observation_stream: Option<OperatorObservationStream>,
     pub observation_counters: Option<HashMap<String, i64>>,
+    pub structured_result: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -273,6 +274,7 @@ struct OperatorAttemptObservationRecord {
     attempt_id: Uuid,
     attempt_number: i32,
     observation_counters: Option<serde_json::Value>,
+    structured_result: Option<serde_json::Value>,
     stream_id: Option<Uuid>,
     accepted_through_sequence: Option<i64>,
     mlflow_run_id: Option<String>,
@@ -1100,7 +1102,8 @@ async fn job_artifact_visibility(
         .collect();
     let attempts = sqlx::query_as::<_, OperatorAttemptObservationRecord>(
         "SELECT DISTINCT ON (a.job_id) a.job_id, a.id AS attempt_id, a.attempt_number, \
-                a.observation_counters, s.id AS stream_id, s.accepted_through_sequence, s.mlflow_run_id, \
+                a.observation_counters, a.structured_result, s.id AS stream_id, \
+                s.accepted_through_sequence, s.mlflow_run_id, \
                 s.mlflow_created_at, s.mlflow_last_error \
          FROM job_attempts a LEFT JOIN observation_streams s ON s.attempt_id = a.id \
          WHERE a.job_id = ANY($1) ORDER BY a.job_id, a.attempt_number DESC",
@@ -1131,6 +1134,7 @@ async fn job_artifact_visibility(
                     .map(serde_json::from_value)
                     .transpose()
                     .map_err(|_| OperatorError::internal())?,
+                structured_result: attempt.structured_result,
             });
         }
     }
@@ -2315,7 +2319,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "UPDATE job_attempts SET observation_counters = \
-             '{\"dropped.rate\":2}'::jsonb WHERE id = $1",
+             '{\"dropped.rate\":2}'::jsonb, structured_result = \
+             '{\"model\":\"smolvla\",\"final_loss\":0.125}'::jsonb WHERE id = $1",
         )
         .bind(attempt_id)
         .execute(&pool)
@@ -2416,6 +2421,10 @@ mod tests {
         assert_eq!(
             body["current_attempt"]["observation_counters"]["dropped.rate"],
             2
+        );
+        assert_eq!(
+            body["current_attempt"]["structured_result"],
+            json!({"model": "smolvla", "final_loss": 0.125})
         );
         assert_eq!(body["artifacts"][0]["status"], "verified");
         assert_eq!(body["artifacts"][0]["mandatory"], true);

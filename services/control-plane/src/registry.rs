@@ -36,18 +36,33 @@ const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
 const SUCCESSFUL_VERIFICATION_TTL: Duration = Duration::from_secs(60);
 const MAX_CACHED_VERIFICATIONS: usize = 4_096;
 const MAX_LEASE_RECOVERIES_PER_PASS: usize = 100;
-const OBSERVATION_COUNTERS: [&str; 9] = [
-    "dropped.oversize",
-    "dropped.malformed",
-    "dropped.rate",
-    "dropped.budget",
-    "dropped.name_limit",
-    "dropped.delivery_abandoned",
-    "not_exported.metric_name_not_allowed",
-    "not_exported.otlp_unconfigured",
-    "delivery.failures",
-];
+const MAX_OBSERVATION_COUNTERS: usize = 64;
+const MAX_OBSERVATION_COUNTER_NAME_BYTES: usize = 64;
+const MAX_STRUCTURED_RESULT_BYTES: usize = 65_536;
 type VerificationCache = HashMap<(Uuid, [u8; 32]), Instant>;
+
+fn valid_observation_counter_name(name: &str) -> bool {
+    if name.len() > MAX_OBSERVATION_COUNTER_NAME_BYTES {
+        return false;
+    }
+    let Some((namespace, suffix)) = name.split_once('.') else {
+        return false;
+    };
+    if !matches!(namespace, "dropped" | "not_exported" | "delivery") {
+        return false;
+    }
+    suffix.split('.').all(|segment| {
+        let mut bytes = segment.bytes();
+        bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+            && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
+}
+
+fn valid_structured_result(result: &serde_json::Value) -> bool {
+    result.is_object()
+        && serde_json::to_vec(result)
+            .is_ok_and(|encoded| encoded.len() <= MAX_STRUCTURED_RESULT_BYTES)
+}
 
 #[derive(Clone)]
 pub(crate) struct VerificationGate {
@@ -341,6 +356,8 @@ pub struct JobResultRequest {
     pub execution_finished_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub observation_counters: Option<HashMap<String, i64>>,
+    #[serde(default)]
+    pub structured_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1996,10 +2013,15 @@ pub(crate) async fn report_job_result(
         .observation_counters
         .as_ref()
         .is_some_and(|counters| {
-            counters
-                .iter()
-                .any(|(name, value)| *value < 0 || !OBSERVATION_COUNTERS.contains(&name.as_str()))
+            counters.len() > MAX_OBSERVATION_COUNTERS
+                || counters
+                    .iter()
+                    .any(|(name, value)| *value < 0 || !valid_observation_counter_name(name))
         })
+        || result
+            .structured_result
+            .as_ref()
+            .is_some_and(|structured| !valid_structured_result(structured))
     {
         return Err(ApiError::invalid_request());
     }
@@ -2058,7 +2080,9 @@ pub(crate) async fn report_job_result(
     let received_at = Utc::now();
     let execution = execution_interval(&result, &attempt, received_at)?;
     if attempt.job_status == "cancelling" {
-        sqlx::query("UPDATE job_attempts SET observation_counters = $2 WHERE id = $1")
+        sqlx::query(
+            "UPDATE job_attempts SET observation_counters = $2, structured_result = $3 WHERE id = $1",
+        )
             .bind(attempt_id)
             .bind(
                 result
@@ -2066,6 +2090,7 @@ pub(crate) async fn report_job_result(
                     .as_ref()
                     .map(|counters| json!(counters)),
             )
+            .bind(&result.structured_result)
             .execute(&mut *transaction)
             .await
             .map_err(|error| database_error(&error, "record cancelled observation counters"))?;
@@ -2115,7 +2140,7 @@ pub(crate) async fn report_job_result(
     let finished_at = execution.map_or(received_at, |interval| interval.finished_at);
     sqlx::query(
         "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, $3), \
-                finished_at = $4, observation_counters = $5 WHERE id = $1",
+                finished_at = $4, observation_counters = $5, structured_result = $6 WHERE id = $1",
     )
     .bind(attempt_id)
     .bind(final_status)
@@ -2127,6 +2152,7 @@ pub(crate) async fn report_job_result(
             .as_ref()
             .map(|counters| json!(counters)),
     )
+    .bind(&result.structured_result)
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "finish job attempt"))?;
@@ -2230,7 +2256,35 @@ mod tests {
             execution_started_at: started_at,
             execution_finished_at: finished_at,
             observation_counters: None,
+            structured_result: None,
         }
+    }
+
+    #[test]
+    fn observation_counter_names_are_forward_compatible_inside_bounded_namespaces() {
+        assert!(super::valid_observation_counter_name(
+            "dropped.future_limit"
+        ));
+        assert!(super::valid_observation_counter_name(
+            "not_exported.future.sink"
+        ));
+        assert!(super::valid_observation_counter_name(
+            "delivery.future_retry"
+        ));
+        assert!(!super::valid_observation_counter_name("future.counter"));
+        assert!(!super::valid_observation_counter_name("dropped.UPPERCASE"));
+        assert!(!super::valid_observation_counter_name("dropped."));
+    }
+
+    #[test]
+    fn structured_results_are_objects_with_a_hard_encoded_size_limit() {
+        assert!(super::valid_structured_result(&json!({"loss": 0.125})));
+        assert!(!super::valid_structured_result(&json!([
+            "not", "an", "object"
+        ])));
+        assert!(!super::valid_structured_result(
+            &json!({"payload": "x".repeat(super::MAX_STRUCTURED_RESULT_BYTES)})
+        ));
     }
 
     fn bounded_attempt(assigned_at: DateTime<Utc>) -> ExpiredAttemptRecord {
@@ -2537,7 +2591,12 @@ mod tests {
                         "execution_finished_at": execution_finished_at,
                         "observation_counters": {
                             "dropped.rate": 2,
-                            "delivery.failures": 1
+                            "delivery.failures": 1,
+                            "delivery.future_retry": 3
+                        },
+                        "structured_result": {
+                            "model": "smolvla",
+                            "final_loss": 0.125
                         }
                     })
                     .to_string(),
@@ -2556,6 +2615,12 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+        let structured_result: Option<Value> =
+            sqlx::query_scalar("SELECT structured_result FROM job_attempts WHERE id = $1")
+                .bind(assignment.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let recorded_job: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
             sqlx::query_as("SELECT started_at, finished_at FROM jobs WHERE id = $1")
                 .bind(job_id)
@@ -2569,7 +2634,15 @@ mod tests {
         assert_eq!(recorded_job, (recorded_attempt.0, recorded_attempt.1));
         assert_eq!(
             recorded_attempt.2,
-            Some(json!({"dropped.rate": 2, "delivery.failures": 1}))
+            Some(json!({
+                "dropped.rate": 2,
+                "delivery.failures": 1,
+                "delivery.future_retry": 3
+            }))
+        );
+        assert_eq!(
+            structured_result,
+            Some(json!({"model": "smolvla", "final_loss": 0.125}))
         );
 
         let legacy_job_id = insert_job(&pool, owner_id).await;
