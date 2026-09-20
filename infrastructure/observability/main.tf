@@ -28,7 +28,10 @@ resource "terraform_data" "iap_client_required" {
 }
 
 locals {
-  enabled   = var.enable_observability ? 1 : 0
+  enabled = var.enable_observability ? 1 : 0
+  # A budget is managed only when one is asked for and there is an account to bill against. The
+  # API it needs is keyed off the same condition, so the two can never disagree.
+  budget    = var.enable_budget && var.billing_account != "" ? 1 : 0
   mlflow_db = var.enable_observability && var.enable_mlflow_database ? 1 : 0
   # OTLP ingestion is published only when explicitly enabled, because nothing authenticates a
   # worker yet: ADR-009 requires a scoped revocable credential and that decision is open.
@@ -68,8 +71,23 @@ resource "terraform_data" "budget_required" {
   }
 }
 
+# The Billing Budgets API is enabled whenever a budget is managed, and never as part of the
+# observability gate: the budget exists before and outlives the stack, so an API enabled only with
+# the stack would leave the closed-gate apply calling a disabled service.
+resource "google_project_service" "budget" {
+  count = local.budget
+
+  project            = var.project_id
+  service            = "billingbudgets.googleapis.com"
+  disable_on_destroy = false
+}
+
 resource "google_billing_budget" "observability" {
-  count = var.enable_budget && var.billing_account != "" ? 1 : 0
+  count = local.budget
+
+  # Enabling a service is not synchronous, so this is an ordering edge and not decoration: without
+  # it an enabled apply can create the budget while the API is still activating.
+  depends_on = [google_project_service.budget]
 
   billing_account = var.billing_account
   display_name    = "Kratos ${var.project_id}"
@@ -98,6 +116,10 @@ resource "google_billing_budget" "observability" {
     spend_basis       = "FORECASTED_SPEND"
   }
 
+  # Alerts go by email to the billing account's administrators and billing account users, which
+  # is Google's default set and includes whoever owns the account. No notification channel is
+  # created here: a channel is a project resource needing the Monitoring API, and the budget has
+  # to work with the observability gate closed. Add channels here if that set is ever too narrow.
   all_updates_rule {
     monitoring_notification_channels = []
     disable_default_iam_recipients   = false
@@ -109,7 +131,6 @@ resource "google_project_service" "observability" {
     "compute.googleapis.com",
     "iap.googleapis.com",
     "oslogin.googleapis.com",
-    "billingbudgets.googleapis.com",
   ]) : toset([])
 
   project            = var.project_id

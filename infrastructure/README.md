@@ -116,10 +116,21 @@ Compute Engine instance. Its configuration is the bundle in
 [`observability/`](../observability/README.md), applied with `compose.cloud.yaml`, which is the
 overlay that makes that bundle serve a load balancer and keep its data off the boot disk.
 
-`enable_observability` defaults to `false`, and with the gate closed the root plans **no resources
-at all**. Unlike Cloud Run, an instance and a persistent disk bill continuously whether or not
-anyone opens a dashboard, so enabling it is the user's decision and no workflow sets it. CI only
-formats and validates.
+`enable_observability` defaults to `false`. With the gate closed the root plans **nothing that
+bills**: no instance, no disk, no load balancer. Unlike Cloud Run, an instance and a persistent disk
+bill continuously whether or not anyone opens a dashboard, so enabling it is the user's decision and
+no workflow sets it. CI only formats and validates.
+
+One resource is deliberately outside that gate. If `billing_account` is supplied, a closed plan
+creates **two**: a budget for the project and the Billing Budgets API it needs. A budget should
+exist before anything starts spending and should outlive whatever it watches, so gating it behind
+the stack would defeat it. Neither resource bills. With no `billing_account` the closed plan is
+still empty, and an *enabled* plan is refused outright until one is supplied — the stack cannot be
+switched on unwatched.
+
+A budget **alerts; it does not cap**. Spend continues past it. The only hard stop Google offers is
+removing the billing account from the project, which takes the whole project down with it, so it is
+not wired up here.
 
 ### Who applies this
 
@@ -132,14 +143,20 @@ authentication boundary is a larger blast radius than the convenience is worth.
 
 1. **Decide the spend.** One `e2-standard-2`, a 50 GB balanced disk, a load balancer, NAT and
    egress bill continuously. Take the current figures from GCP's price list for your region rather
-   than from this file, and set a budget alert first.
-2. **Create the IAP OAuth client** in the console and keep its identifier and secret. Terraform does
+   than from this file. `monthly_budget` defaults to 300 in the billing account's own currency.
+2. **Check you can manage the budget.** The budget is created against the billing account, not the
+   project, and project-level ownership does not carry that permission. Whoever applies needs
+   **Billing Account Administrator** (`roles/billing.admin`), or Billing Account Costs Manager
+   (`roles/billing.costsManager`), on the account named in `billing_account` — otherwise the apply
+   fails on the budget before it reaches anything else. Alerts then go by email to that account's
+   administrators and billing account users.
+3. **Create the IAP OAuth client** in the console and keep its identifier and secret. Terraform does
    not create it, and an enabled plan **fails** without it rather than creating backend services
    with IAP disabled, which would publish Grafana and MLflow unauthenticated.
-3. **Decide where the OAuth secret lives.** Terraform holds `oauth_client_secret` in state, so the
+4. **Decide where the OAuth secret lives.** Terraform holds `oauth_client_secret` in state, so the
    state bucket is exactly as sensitive as the secret. It is the bucket created by the bootstrap
    root, which is private and versioned; treat access to it accordingly.
-4. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
+5. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
    platform database enabled first.
 
 ### Applying

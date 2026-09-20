@@ -186,12 +186,3 @@ variable "monthly_budget" {
     error_message = "A budget of zero would alert immediately and tell you nothing."
   }
 }
-
-variable "budget_alert_emails" {
-  description = <<-EOT
-    Extra addresses to notify. Billing administrators and the account owner are notified anyway, so
-    this can stay empty.
-  EOT
-  type        = list(string)
-  default     = []
-}
