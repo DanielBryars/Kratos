@@ -50,7 +50,10 @@ services:
     volumes:
       - ./config/loki/loki.yaml:/etc/loki/loki.yaml:ro
       - loki-data:/loki
-    networks: [backend]
+    networks:
+      backend: {}
+      metadata:
+        ipv4_address: 172.30.2.10
     mem_limit: 1g
 
   tempo:
@@ -62,7 +65,10 @@ services:
     volumes:
       - ./config/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
       - tempo-data:/var/tempo
-    networks: [backend]
+    networks:
+      backend: {}
+      metadata:
+        ipv4_address: 172.30.2.11
     mem_limit: 1g
 
   grafana:
@@ -90,7 +96,7 @@ services:
 
   mlflow:
     <<: *hardening
-    image: ghcr.io/mlflow/mlflow:v3.16.1@sha256:6b6ec62130dd9a273b24e53e905bdc728b915fbd2dfb71f2fb7eff9a22f7fa67
+    image: ghcr.io/mlflow/mlflow:v3.16.1-full@sha256:ad683e0bba00a8b3e43f5e3f6c5aede399dc926f6f02a80f17339b5ebd83560f
     # SQLite and a local artefact directory are for this local bundle only. ADR-009 places durable
     # metadata in PostgreSQL and artefacts in Cloud Storage for the cloud deployment.
     command:
@@ -111,7 +117,10 @@ services:
     volumes:
       - mlflow-data:/mlflow
     tmpfs: ["/tmp"]
-    networks: [edge, backend]
+    networks:
+      edge:
+        ipv4_address: 172.30.1.12
+      backend: {}
     ports:
       - "127.0.0.1:${KRATOS_MLFLOW_PORT:-15000}:5000"
     mem_limit: 1g
@@ -135,9 +144,16 @@ services:
     depends_on: [otel-gateway, grafana, mlflow]
 
 networks:
-  edge: {}
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
   backend:
     internal: true
+  metadata:
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
 
 volumes:
   prometheus-data: {}

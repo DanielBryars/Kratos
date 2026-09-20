@@ -204,10 +204,14 @@ Then, once:
 "YOUR_PASSWORD" | gcloud secrets versions add kratos-observability-grafana-admin --data-file=-
 
 # The bundle the instance runs. Re-upload this to update the stack.
-tar -czf observability.tar.gz observability
+tar --exclude='observability/.env' -czf observability.tar.gz observability
 gcloud storage cp observability.tar.gz \
   "gs://$(terraform -chdir=infrastructure/observability output -raw config_bucket)/bundles/observability-current.tar.gz"
 ```
+
+The ignored `observability/.env` file is for local development only and SHALL NOT enter the cloud
+bundle. The exclusion above is deliberate: the instance writes its own private `.env` from Secret
+Manager after extracting the bundle.
 
 Copy the three `required_dns_records` addresses to the DNS provider. Certificate issuance begins
 once those names resolve.
@@ -224,12 +228,12 @@ the configuration is updated and the instance is never recreated.
 - The instance has **no public address**. Egress uses Cloud NAT, and the only ingress rule admits
   Google's load-balancer ranges to the published service ports, with a default deny behind it. So
   Prometheus, Loki and Tempo have no route from outside the VPC.
-- **Containers cannot reach the instance metadata server.** The startup script rejects traffic to
-  `169.254.169.254` from the Docker bridges, so nothing running a workload or a public service can
-  mint the instance's token. The Cloud SQL Auth Proxy is the one component that legitimately needs
-  that identity, for IAM database login, and it is the one component placed on the **host network**
-  so the rule does not cover it. Nothing else is granted the exception, and MLflow reaches it
-  through an explicit host-gateway route rather than by reopening metadata to the bridges.
+- **Metadata access is restricted to the pinned storage clients.** The startup script rejects
+  bridge traffic to `169.254.169.254` except from fixed addresses assigned only to Loki, Tempo and
+  MLflow and the Cloud SQL Auth Proxy, whose Google Cloud clients need short-lived instance
+  credentials for storage or IAM database login. Grafana, Prometheus, the collector and every
+  other bridged container remain blocked. This avoids long-lived service-account keys while
+  keeping every exception explicit and reviewable.
 - **The Cloud SQL overlay is applied only when a database exists.** With `enable_mlflow_database`
   false the startup script omits `compose.cloudsql.yaml` entirely, so the stack never references a
   proxy that was not created and MLflow keeps a SQLite store on the persistent disk. `validate.sh`
