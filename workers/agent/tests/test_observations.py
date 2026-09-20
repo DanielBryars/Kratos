@@ -332,3 +332,69 @@ def test_counters_accumulate_by_reason(collector: ObservationCollector) -> None:
     emit(collector, "y" * MAX_LINE_BYTES)
     assert shown(collector, '{"schema_version":"1.0","record":"nope"}').kind is Kind.LOG
     assert collector.counters == {Drop.OVERSIZE.value: 2, Drop.MALFORMED.value: 1}
+
+
+# --- The first real workload -------------------------------------------------------------------
+#
+# DanielBryars/Kratos.SmolVLA at 0ec53cc is the first workload Kratos will run for its own sake
+# rather than to prove the machinery. Codex named it the agent-side acceptance target, so these
+# are the exact record shapes it emits, taken from its `emit()` calls. If this test starts
+# failing, a real run stops being observable, which is a more serious thing than a unit test.
+
+
+def smolvla_line(record_type: str, **fields: object) -> str:
+    """Exactly how the workload encodes a record: default separators, not compact ones."""
+    return json.dumps({"schema_version": "1.0", "record": record_type, **fields})
+
+
+def test_the_smolvla_workload_stream_is_accepted_whole(
+    collector: ObservationCollector, clock: Clock
+) -> None:
+    params = {
+        "model.id": "lerobot/smolvla_base",
+        "model.revision": "a" * 40,
+        "dataset.id": "lerobot/svla_so100_pickplace",
+        "dataset.revision": "b" * 40,
+        "training.steps": 2000,
+        "training.batch_size": 8,
+    }
+    for name, value in params.items():
+        observation = shown(collector, smolvla_line("param", name=name, value=value))
+        assert observation.kind is Kind.PARAM
+        assert observation.name == name and observation.value == value
+
+    for step in range(1, 5):
+        clock.advance(1)
+        progress = shown(
+            collector, smolvla_line("progress", step=step, total_steps=2000, unit="steps")
+        )
+        assert progress.kind is Kind.PROGRESS and progress.total_steps == 2000
+
+        metric = shown(
+            collector, smolvla_line("metric", name="train.loss", value=1.0 / step, step=step)
+        )
+        assert metric.kind is Kind.METRIC
+        # train.loss is on the allowlist, so it is one of the few names that may become a series.
+        assert metric.metric_series is True
+
+    summary = {
+        "model": {"id": "lerobot/smolvla_base", "revision": "a" * 40},
+        "dataset": {"id": "lerobot/svla_so100_pickplace", "revision": "b" * 40},
+        "steps": 2000,
+        "batch_size": 8,
+        "checkpoint": "smolvla-checkpoint.tar",
+    }
+    result = shown(collector, smolvla_line("result", result=summary))
+    assert result.kind is Kind.RESULT and result.result == summary
+
+    # Nothing in a correct run is refused.
+    assert collector.counters == {}
+
+
+def test_the_workloads_training_output_on_stderr_stays_log_lines(
+    collector: ObservationCollector,
+) -> None:
+    """It forwards lerobot's own output to stderr, which must never be parsed as records."""
+    for line in ("INFO 2026-09-20 step 1 loss 0.42", '{"looks":"like json"}'):
+        assert shown(collector, line, Stream.STDERR).kind is Kind.LOG
+    assert collector.counters == {}
