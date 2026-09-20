@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    artifacts::JobOutputRequirement,
     credentials::{self, CredentialKind, IssuedCredential},
 };
 
@@ -251,6 +252,8 @@ pub struct JobAssignment {
     pub gpu_index: u32,
     pub timeout_seconds: u32,
     pub lease_expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -322,7 +325,7 @@ impl ApiError {
         )
     }
 
-    const fn invalid_request() -> Self {
+    pub(crate) const fn invalid_request() -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_request",
@@ -338,7 +341,7 @@ impl ApiError {
         )
     }
 
-    const fn unavailable() -> Self {
+    pub(crate) const fn unavailable() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "persistence_unavailable",
@@ -346,7 +349,7 @@ impl ApiError {
         )
     }
 
-    const fn conflict(code: &'static str, message: &'static str) -> Self {
+    pub(crate) const fn conflict(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::CONFLICT, code, message)
     }
 
@@ -366,7 +369,7 @@ impl ApiError {
         )
     }
 
-    const fn internal() -> Self {
+    pub(crate) const fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -396,7 +399,17 @@ struct WorkerAuthenticationRecord {
     expires_at: Option<DateTime<Utc>>,
     credential_revoked_at: Option<DateTime<Utc>>,
     status: String,
+}
+
+#[derive(FromRow)]
+struct HeartbeatAuthenticationRecord {
+    token_verifier: String,
+    expires_at: Option<DateTime<Utc>>,
+    credential_revoked_at: Option<DateTime<Utc>>,
+    status: String,
     heartbeat_sequence: i64,
+    protocol_version: String,
+    capabilities: serde_json::Value,
 }
 
 #[derive(FromRow)]
@@ -407,6 +420,12 @@ struct AssignmentRecord {
     image_reference: String,
     timeout_seconds: i32,
     lease_expires_at: DateTime<Utc>,
+}
+
+struct ExpectedHeartbeat<'a> {
+    sequence: i64,
+    protocol_version: &'a str,
+    capabilities: &'a serde_json::Value,
 }
 
 impl TryFrom<AssignmentRecord> for JobAssignment {
@@ -422,8 +441,34 @@ impl TryFrom<AssignmentRecord> for JobAssignment {
             timeout_seconds: u32::try_from(record.timeout_seconds)
                 .map_err(|_| ApiError::internal())?,
             lease_expires_at: record.lease_expires_at,
+            output_requirements: Vec::new(),
         })
     }
+}
+
+async fn load_output_requirements(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<Vec<JobOutputRequirement>, ApiError> {
+    let rows = sqlx::query_as::<_, (String, String, String, bool, i64)>(
+        "SELECT logical_path, role, media_type, mandatory, max_bytes \
+         FROM job_output_requirements WHERE job_id = $1 ORDER BY logical_path",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| database_error(&error, "load job output contract"))?;
+    rows.into_iter()
+        .map(|(logical_path, role, media_type, mandatory, max_bytes)| {
+            Ok(JobOutputRequirement {
+                logical_path,
+                role,
+                media_type,
+                mandatory,
+                max_bytes: u64::try_from(max_bytes).map_err(|_| ApiError::internal())?,
+            })
+        })
+        .collect()
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -435,7 +480,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
-fn validate_protocol(version: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_protocol(version: &str) -> Result<(), ApiError> {
     if version.split_once('.').is_some_and(|(major, minor)| {
         major == "1" && !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
     }) {
@@ -443,6 +488,42 @@ fn validate_protocol(version: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::unsupported_protocol())
     }
+}
+
+pub(crate) async fn authenticate_worker(
+    state: &AppState,
+    headers: &HeaderMap,
+    worker_id: Uuid,
+    operation: &'static str,
+) -> Result<(), ApiError> {
+    let pool = database(state)?;
+    let supplied = bearer(headers)?.to_owned();
+    let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
+        .map_err(|_| ApiError::unauthorized())?;
+    let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
+        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, w.status \
+         FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
+         WHERE c.id = $1 AND c.worker_id = $2",
+    )
+    .bind(credential_id)
+    .bind(worker_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| database_error(&error, operation))?
+    .ok_or_else(ApiError::unauthorized)?;
+    if authentication.credential_revoked_at.is_some()
+        || authentication
+            .expires_at
+            .is_some_and(|expires| expires <= Utc::now())
+        || authentication.status == "revoked"
+        || !state
+            .verification_gate
+            .verify(credential_id, supplied, authentication.token_verifier)
+            .await?
+    {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(())
 }
 
 fn validate_capabilities(capabilities: &WorkerCapabilities) -> Result<(), ApiError> {
@@ -649,7 +730,7 @@ pub(crate) async fn enrol_worker(
     .bind(request.agent_instance_id)
     .bind(request.display_name.trim())
     .bind(&request.protocol_version)
-    .bind(capabilities)
+    .bind(&capabilities)
     .execute(&mut *transaction)
     .await
     .map_err(|error| {
@@ -1057,18 +1138,32 @@ async fn current_or_assign_job(
     pool: &PgPool,
     worker_id: Uuid,
     eligible: bool,
+    expected_heartbeat: Option<ExpectedHeartbeat<'_>>,
 ) -> Result<Option<JobAssignment>, ApiError> {
     let mut transaction = pool
         .begin()
         .await
         .map_err(|error| database_error(&error, "begin job assignment"))?;
-    let worker_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM workers WHERE id = $1 FOR UPDATE")
-            .bind(worker_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|error| database_error(&error, "lock worker for assignment"))?
-            .ok_or_else(ApiError::unauthorized)?;
+    let worker = sqlx::query_as::<_, (String, i64, String, serde_json::Value)>(
+        "SELECT status, heartbeat_sequence, protocol_version, capabilities \
+         FROM workers WHERE id = $1 FOR UPDATE",
+    )
+    .bind(worker_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| database_error(&error, "lock worker for assignment"))?
+    .ok_or_else(ApiError::unauthorized)?;
+    if expected_heartbeat.is_some_and(|expected| {
+        worker.1 != expected.sequence
+            || worker.2 != expected.protocol_version
+            || worker.3 != *expected.capabilities
+    }) {
+        return Err(ApiError::conflict(
+            "stale_sequence",
+            "A newer heartbeat was accepted before scheduling completed.",
+        ));
+    }
+    let worker_status = worker.0;
     let existing = sqlx::query_as::<_, AssignmentRecord>(
         "SELECT a.id AS attempt_id, j.id AS job_id, j.name, j.image_reference, \
                 j.timeout_seconds, a.lease_expires_at \
@@ -1081,11 +1176,14 @@ async fn current_or_assign_job(
     .await
     .map_err(|error| database_error(&error, "load active assignment"))?;
     if let Some(record) = existing {
+        let job_id = record.job_id;
         transaction
             .commit()
             .await
             .map_err(|error| database_error(&error, "commit active assignment"))?;
-        return Ok(Some(record.try_into()?));
+        let mut assignment: JobAssignment = record.try_into()?;
+        assignment.output_requirements = load_output_requirements(pool, job_id).await?;
+        return Ok(Some(assignment));
     }
     if !eligible || worker_status != "idle" {
         transaction
@@ -1096,9 +1194,19 @@ async fn current_or_assign_job(
     }
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
         "SELECT id, name, image_reference, timeout_seconds FROM jobs \
-         WHERE status = 'queued' AND gpu_count = 1 ORDER BY submitted_at \
+         WHERE status = 'queued' AND gpu_count = 1 \
+           AND ( \
+               NOT EXISTS (SELECT 1 FROM job_output_requirements r WHERE r.job_id = jobs.id) \
+               OR EXISTS ( \
+                   SELECT 1 FROM workers w WHERE w.id = $1 \
+                     AND split_part(w.protocol_version, '.', 1) = '1' \
+                     AND split_part(w.protocol_version, '.', 2)::integer >= 1 \
+               ) \
+           ) \
+         ORDER BY submitted_at \
          FOR UPDATE SKIP LOCKED LIMIT 1",
     )
+    .bind(worker_id)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "select queued job"))?;
@@ -1160,6 +1268,7 @@ async fn current_or_assign_job(
         gpu_index: 0,
         timeout_seconds: u32::try_from(timeout_seconds).map_err(|_| ApiError::internal())?,
         lease_expires_at,
+        output_requirements: load_output_requirements(pool, job_id).await?,
     }))
 }
 
@@ -1195,9 +1304,9 @@ pub(crate) async fn heartbeat(
         return Err(ApiError::invalid_request());
     }
 
-    let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
+    let authentication = sqlx::query_as::<_, HeartbeatAuthenticationRecord>(
         "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, \
-                w.status, w.heartbeat_sequence \
+                w.status, w.heartbeat_sequence, w.protocol_version, w.capabilities \
          FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
          WHERE c.id = $1 AND c.worker_id = $2",
     )
@@ -1223,6 +1332,9 @@ pub(crate) async fn heartbeat(
         return Err(ApiError::unauthorized());
     }
 
+    let capabilities =
+        serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
+
     if request.sequence < authentication.heartbeat_sequence {
         return Err(ApiError::conflict(
             "stale_sequence",
@@ -1231,12 +1343,25 @@ pub(crate) async fn heartbeat(
     }
     let state_value = WorkerState::parse(&authentication.status)?;
     if request.sequence == authentication.heartbeat_sequence {
+        if request.protocol_version != authentication.protocol_version
+            || capabilities != authentication.capabilities
+        {
+            return Err(ApiError::conflict(
+                "heartbeat_replay_mismatch",
+                "The heartbeat sequence was replayed with different protocol or capability data.",
+            ));
+        }
         let assignment = current_or_assign_job(
             pool,
             worker_id,
             state_value == WorkerState::Idle
                 && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
                 && !request.capabilities.gpus.is_empty(),
+            Some(ExpectedHeartbeat {
+                sequence: request.sequence,
+                protocol_version: &request.protocol_version,
+                capabilities: &capabilities,
+            }),
         )
         .await?;
         return Ok(Json(HeartbeatResponse {
@@ -1252,19 +1377,18 @@ pub(crate) async fn heartbeat(
         }));
     }
 
-    let capabilities =
-        serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
     let updated = sqlx::query_as::<_, (String, i64)>(
-        "UPDATE workers SET capabilities = $2, heartbeat_sequence = $3, \
-                last_seen_at = now(), last_observed_at = $4, updated_at = now() \
-         WHERE id = $1 AND status <> 'revoked' AND heartbeat_sequence < $3 \
-           AND EXISTS (SELECT 1 FROM worker_credentials c WHERE c.id = $5 \
+        "UPDATE workers SET protocol_version = $2, capabilities = $3, heartbeat_sequence = $4, \
+                last_seen_at = now(), last_observed_at = $5, updated_at = now() \
+         WHERE id = $1 AND status <> 'revoked' AND heartbeat_sequence < $4 \
+           AND EXISTS (SELECT 1 FROM worker_credentials c WHERE c.id = $6 \
                        AND c.worker_id = workers.id AND c.revoked_at IS NULL \
                        AND (c.expires_at IS NULL OR c.expires_at > now())) \
          RETURNING status, heartbeat_sequence",
     )
     .bind(worker_id)
-    .bind(capabilities)
+    .bind(&request.protocol_version)
+    .bind(&capabilities)
     .bind(request.sequence)
     .bind(request.observed_at)
     .bind(credential_id)
@@ -1273,8 +1397,9 @@ pub(crate) async fn heartbeat(
     .map_err(|error| database_error(&error, "update heartbeat"))?;
 
     let Some((status, accepted_sequence)) = updated else {
-        let current = sqlx::query_as::<_, (String, i64)>(
-            "SELECT status, heartbeat_sequence FROM workers WHERE id = $1",
+        let current = sqlx::query_as::<_, (String, i64, String, serde_json::Value)>(
+            "SELECT status, heartbeat_sequence, protocol_version, capabilities \
+             FROM workers WHERE id = $1",
         )
         .bind(worker_id)
         .fetch_optional(pool)
@@ -1285,6 +1410,12 @@ pub(crate) async fn heartbeat(
             return Err(ApiError::unauthorized());
         }
         if current.1 == request.sequence {
+            if current.2 != request.protocol_version || current.3 != capabilities {
+                return Err(ApiError::conflict(
+                    "heartbeat_replay_mismatch",
+                    "The heartbeat sequence was replayed with different protocol or capability data.",
+                ));
+            }
             let current_state = WorkerState::parse(&current.0)?;
             let assignment = current_or_assign_job(
                 pool,
@@ -1292,6 +1423,11 @@ pub(crate) async fn heartbeat(
                 current_state == WorkerState::Idle
                     && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
                     && !request.capabilities.gpus.is_empty(),
+                Some(ExpectedHeartbeat {
+                    sequence: request.sequence,
+                    protocol_version: &request.protocol_version,
+                    capabilities: &capabilities,
+                }),
             )
             .await?;
             return Ok(Json(HeartbeatResponse {
@@ -1319,6 +1455,11 @@ pub(crate) async fn heartbeat(
         response_state == WorkerState::Idle
             && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
             && !request.capabilities.gpus.is_empty(),
+        Some(ExpectedHeartbeat {
+            sequence: request.sequence,
+            protocol_version: &request.protocol_version,
+            capabilities: &capabilities,
+        }),
     )
     .await?;
     Ok(Json(HeartbeatResponse {
@@ -1362,8 +1503,7 @@ pub(crate) async fn report_job_result(
     let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
         .map_err(|_| ApiError::unauthorized())?;
     let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
-        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, \
-                w.status, w.heartbeat_sequence \
+        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, w.status \
          FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
          WHERE c.id = $1 AND c.worker_id = $2",
     )
@@ -1420,6 +1560,35 @@ pub(crate) async fn report_job_result(
         }));
     }
     let succeeded = result.exit_code == 0 && !result.timed_out && result.failure_message.is_none();
+    if succeeded {
+        let missing_artifacts = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM job_output_requirements r \
+             WHERE r.job_id = $1 AND r.mandatory \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM job_artifacts ar \
+                   WHERE ar.output_requirement_id = r.id AND ar.attempt_id = $2 \
+                     AND ar.status = 'verified' AND ar.upload_completed_at IS NOT NULL \
+                     AND ar.verified_at IS NOT NULL \
+                     AND ar.verification_source = 'gcs_metadata' \
+                     AND ar.verified_storage_generation = ar.storage_generation \
+                     AND ar.verified_byte_length = ar.byte_length \
+                     AND ar.verified_byte_length = ar.uploaded_byte_length \
+                     AND ar.verified_crc32c = ar.crc32c \
+                     AND ar.verified_crc32c = ar.uploaded_crc32c \
+               )",
+        )
+        .bind(attempt.0)
+        .bind(attempt_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database_error(&error, "check mandatory job artefacts"))?;
+        if missing_artifacts > 0 {
+            return Err(ApiError::conflict(
+                "artifacts_incomplete",
+                "Mandatory output artefacts have not been durably verified.",
+            ));
+        }
+    }
     let final_status = if succeeded { "succeeded" } else { "failed" };
     sqlx::query(
         "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, assigned_at), \
@@ -1493,7 +1662,7 @@ mod tests {
     };
 
     use super::{
-        GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
+        ExpectedHeartbeat, GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
         immutable_sha256_reference, valid_gpu_health,
     };
 
@@ -1598,11 +1767,11 @@ mod tests {
         let worker_id = insert_worker(&pool, owner_id, "idle").await;
         let job_id = insert_job(&pool, owner_id).await;
 
-        let first = current_or_assign_job(&pool, worker_id, true)
+        let first = current_or_assign_job(&pool, worker_id, true, None)
             .await
             .unwrap()
             .unwrap();
-        let replay = current_or_assign_job(&pool, worker_id, true)
+        let replay = current_or_assign_job(&pool, worker_id, true, None)
             .await
             .unwrap()
             .unwrap();
@@ -1630,8 +1799,8 @@ mod tests {
         let job_id = insert_job(&pool, owner_id).await;
 
         let (first, second) = tokio::join!(
-            current_or_assign_job(&pool, first_worker, true),
-            current_or_assign_job(&pool, second_worker, true),
+            current_or_assign_job(&pool, first_worker, true, None),
+            current_or_assign_job(&pool, second_worker, true, None),
         );
         let assignments: Vec<_> = [first.unwrap(), second.unwrap()]
             .into_iter()
@@ -1646,7 +1815,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let replay = current_or_assign_job(&pool, assigned_worker, true)
+        let replay = current_or_assign_job(&pool, assigned_worker, true, None)
             .await
             .unwrap()
             .unwrap();
@@ -1686,6 +1855,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((attempts, active_attempts, busy_workers), (1, 1, 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scheduler_rejects_heartbeat_superseded_while_waiting_for_worker_lock(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, 'model.pt', 'checkpoint', 'application/octet-stream', true, 1024)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut newer_heartbeat = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE workers SET heartbeat_sequence = 1, protocol_version = '1.1', \
+                    capabilities = '{\"protocol_version\":\"1.1\"}'::jsonb WHERE id = $1",
+        )
+        .bind(worker_id)
+        .execute(&mut *newer_heartbeat)
+        .await
+        .unwrap();
+
+        let scheduler_pool = pool.clone();
+        let mut scheduler = tokio::spawn(async move {
+            let old_capabilities = json!({});
+            current_or_assign_job(
+                &scheduler_pool,
+                worker_id,
+                true,
+                Some(ExpectedHeartbeat {
+                    sequence: 0,
+                    protocol_version: "1.0",
+                    capabilities: &old_capabilities,
+                }),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut scheduler)
+                .await
+                .is_err(),
+            "scheduler should wait for the heartbeat's worker-row lock"
+        );
+        newer_heartbeat.commit().await.unwrap();
+
+        let error = scheduler.await.unwrap().unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "stale_sequence");
+        let job_state: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM job_attempts WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_state, "queued");
+        assert_eq!(attempt_count, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1778,5 +2014,71 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(replacement_status, "assigned");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn output_jobs_require_worker_protocol_one_point_one(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO human_identities (id, provider, provider_subject, display_name) \
+             VALUES ($1, 'test', $2, 'Owner')",
+        )
+        .bind(owner_id)
+        .bind(Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb)",
+        )
+        .bind(worker_id)
+        .bind(owner_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
+             VALUES ($1, $2, 'Training', $3, 120)",
+        )
+        .bind(job_id)
+        .bind(owner_id)
+        .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, 'model.pt', 'checkpoint', 'application/octet-stream', true, 1024)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            current_or_assign_job(&pool, worker_id, true, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE workers SET protocol_version = '1.1' WHERE id = $1")
+            .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let assignment = current_or_assign_job(&pool, worker_id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.job_id, job_id);
+        assert_eq!(assignment.output_requirements.len(), 1);
+        assert_eq!(assignment.output_requirements[0].logical_path, "model.pt");
     }
 }

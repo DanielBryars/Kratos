@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    artifacts::{JobOutputRequirement, validate_output_requirements},
     credentials::{self, CredentialKind},
     human_auth::{HumanIdentity, VerifyError},
     registry::{ErrorResponse, WorkerCapabilities},
@@ -102,6 +103,9 @@ pub struct CreateJobRequest {
     /// Immutable OCI image reference selected and approved by the operator.
     pub image_reference: String,
     pub timeout_seconds: i32,
+    /// Exact output paths and limits approved as part of the immutable job specification.
+    #[serde(default)]
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -120,6 +124,7 @@ pub struct OperatorJobResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub failure_message: Option<String>,
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(FromRow)]
@@ -169,9 +174,10 @@ struct JobRecord {
     failure_message: Option<String>,
 }
 
-impl From<JobRecord> for OperatorJobResponse {
-    fn from(record: JobRecord) -> Self {
-        Self {
+impl JobRecord {
+    fn into_response(self, output_requirements: Vec<JobOutputRequirement>) -> OperatorJobResponse {
+        let record = self;
+        OperatorJobResponse {
             job_id: record.id,
             name: record.name,
             image_reference: record.image_reference,
@@ -186,6 +192,7 @@ impl From<JobRecord> for OperatorJobResponse {
             stdout: record.stdout,
             stderr: record.stderr,
             failure_message: record.failure_message,
+            output_requirements,
         }
     }
 }
@@ -865,6 +872,34 @@ pub(crate) async fn revoke_worker(
 const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, status, assigned_worker_id, \
      submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message";
 
+async fn job_output_requirements(
+    database: &sqlx::PgPool,
+    job_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<JobOutputRequirement>>, OperatorError> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String, String, bool, i64)>(
+        "SELECT job_id, logical_path, role, media_type, mandatory, max_bytes \
+         FROM job_output_requirements WHERE job_id = ANY($1) ORDER BY logical_path",
+    )
+    .bind(job_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    let mut by_job = HashMap::new();
+    for (job_id, logical_path, role, media_type, mandatory, max_bytes) in rows {
+        by_job
+            .entry(job_id)
+            .or_insert_with(Vec::new)
+            .push(JobOutputRequirement {
+                logical_path,
+                role,
+                media_type,
+                mandatory,
+                max_bytes: u64::try_from(max_bytes).map_err(|_| OperatorError::internal())?,
+            });
+    }
+    Ok(by_job)
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/jobs",
@@ -896,6 +931,8 @@ pub(crate) async fn create_job(
     {
         return Err(OperatorError::invalid_request());
     }
+    validate_output_requirements(&request.output_requirements)
+        .map_err(|_| OperatorError::invalid_request())?;
     let id = Uuid::new_v4();
     let mut transaction = database
         .begin()
@@ -914,6 +951,23 @@ pub(crate) async fn create_job(
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+    for output in &request.output_requirements {
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(id)
+        .bind(&output.logical_path)
+        .bind(&output.role)
+        .bind(&output.media_type)
+        .bind(output.mandatory)
+        .bind(i64::try_from(output.max_bytes).map_err(|_| OperatorError::invalid_request())?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    }
     sqlx::query(
         "INSERT INTO audit_events \
          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
@@ -922,7 +976,11 @@ pub(crate) async fn create_job(
     .bind(Uuid::new_v4())
     .bind(operator_id)
     .bind(id)
-    .bind(json!({ "image_reference": request.image_reference, "timeout_seconds": request.timeout_seconds }))
+    .bind(json!({
+        "image_reference": request.image_reference,
+        "timeout_seconds": request.timeout_seconds,
+        "output_count": request.output_requirements.len()
+    }))
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
@@ -930,7 +988,10 @@ pub(crate) async fn create_job(
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok((StatusCode::CREATED, Json(record.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(record.into_response(request.output_requirements)),
+    ))
 }
 
 #[utoipa::path(
@@ -957,7 +1018,17 @@ pub(crate) async fn list_jobs(
         .fetch_all(database)
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok(Json(records.into_iter().map(Into::into).collect()))
+    let job_ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
+    let mut requirements = job_output_requirements(database, &job_ids).await?;
+    Ok(Json(
+        records
+            .into_iter()
+            .map(|record| {
+                let outputs = requirements.remove(&record.id).unwrap_or_default();
+                record.into_response(outputs)
+            })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -993,7 +1064,11 @@ pub(crate) async fn cancel_job(
         .await
         .map_err(|_| OperatorError::internal())?
         .ok_or_else(OperatorError::job_conflict)?;
-    Ok(Json(record.into()))
+    let outputs = job_output_requirements(database, &[record.id])
+        .await?
+        .remove(&record.id)
+        .unwrap_or_default();
+    Ok(Json(record.into_response(outputs)))
 }
 
 async fn authorize_operator(
