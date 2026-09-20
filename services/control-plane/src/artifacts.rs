@@ -8,6 +8,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -55,6 +56,13 @@ pub struct DeclareArtifactManifestRequest {
 #[serde(deny_unknown_fields)]
 pub struct BeginArtifactUploadRequest {
     pub protocol_version: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonArtifactUploadRequest {
+    pub protocol_version: String,
+    pub session_uri_sha256: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -558,16 +566,16 @@ pub(crate) async fn begin_upload(
     let sha256 = artifact.sha256.clone();
     let issued_at = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
         .ok_or_else(ApiError::internal)?;
-    let existing = sqlx::query_as::<_, (String, Uuid, Option<String>, DateTime<Utc>)>(
-        "SELECT state, initiation_id, session_uri, expires_at FROM artifact_upload_grants \
+    let existing = sqlx::query_as::<_, (String, Uuid, Option<String>, DateTime<Utc>, Option<String>)>(
+        "SELECT state, initiation_id, session_uri, expires_at, cancellation_reason FROM artifact_upload_grants \
          WHERE artifact_id = $1 FOR UPDATE",
     )
     .bind(artifact_id)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| ApiError::internal())?;
-    if let Some((grant_state, _, session_uri, expires_at)) = &existing {
-        if grant_state == "active" {
+    if let Some((grant_state, _, session_uri, expires_at, cancellation_reason)) = &existing {
+        if grant_state == "active" && *expires_at > issued_at {
             let session = ResumableUploadSession {
                 uri: session_uri.clone().ok_or_else(ApiError::internal)?,
                 method: "PUT".to_owned(),
@@ -579,10 +587,35 @@ pub(crate) async fn begin_upload(
                 .map_err(|_| ApiError::internal())?;
             return upload_session_response(artifact, session);
         }
+        if grant_state == "active" {
+            sqlx::query(
+                "UPDATE artifact_upload_grants SET state = 'cancel_pending', \
+                        cancel_requested_at = now(), cancellation_reason = 'session_expired' \
+                 WHERE artifact_id = $1 AND state = 'active'",
+            )
+            .bind(artifact_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ApiError::internal())?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ApiError::internal())?;
+            let _ = reconcile_pending_session_cancellations(pool, &storage).await;
+            return Err(ApiError::artifact_storage_unavailable());
+        }
         if grant_state == "initiating" && *expires_at > issued_at {
             return Err(ApiError::artifact_storage_unavailable());
         }
-        if matches!(grant_state.as_str(), "cancel_pending" | "cancelled") {
+        if grant_state == "cancel_pending" {
+            return Err(ApiError::artifact_storage_unavailable());
+        }
+        if grant_state == "cancelled"
+            && !matches!(
+                cancellation_reason.as_deref(),
+                Some("session_expired" | "worker_reported_session_unusable")
+            )
+        {
             return Err(ApiError::conflict(
                 "artifact_not_uploadable",
                 "The artefact upload session was cancelled.",
@@ -702,6 +735,120 @@ pub(crate) async fn begin_upload(
         .await
         .map_err(|_| ApiError::internal())?;
     upload_session_response(artifact, session)
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/abandon-upload",
+    tag = "workers",
+    security(("bearer_credential" = [])),
+    request_body = AbandonArtifactUploadRequest,
+    responses(
+        (status = 204, description = "The matching unusable upload session was abandoned"),
+        (status = 409, description = "The session is unavailable or has already been replaced", body = crate::registry::ErrorResponse),
+        (status = 503, description = "Artifact storage cancellation is pending", body = crate::registry::ErrorResponse)
+    )
+)]
+pub(crate) async fn abandon_upload(
+    State(state): State<AppState>,
+    Path((worker_id, attempt_id, artifact_id)): Path<(Uuid, Uuid, Uuid)>,
+    headers: HeaderMap,
+    payload: Result<Json<AbandonArtifactUploadRequest>, JsonRejection>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    let credential_id =
+        authenticate_worker(&state, &headers, worker_id, "abandon artefact upload").await?;
+    let Json(request) = payload.map_err(|_| ApiError::invalid_request())?;
+    validate_artifact_protocol(&request.protocol_version)?;
+    if request.session_uri_sha256.len() != 64
+        || !request
+            .session_uri_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let storage = state
+        .artifact_storage
+        .clone()
+        .ok_or_else(ApiError::artifact_storage_unavailable)?;
+    let pool = database(&state)?;
+    let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
+    lock_current_worker_authorization(&mut transaction, credential_id, worker_id).await?;
+    attempt_for_worker(&mut transaction, attempt_id, worker_id).await?;
+    let artifact =
+        artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
+    if !matches!(artifact.status.as_str(), "declared" | "uploading")
+        || artifact.upload_completed_at.is_some()
+    {
+        return Err(ApiError::conflict(
+            "artifact_not_uploadable",
+            "The artefact no longer accepts an upload.",
+        ));
+    }
+    let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        "SELECT state, session_uri, cancellation_reason FROM artifact_upload_grants \
+         WHERE artifact_id = $1 FOR UPDATE",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::internal())?
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "upload_session_unavailable",
+            "The upload session is unavailable.",
+        )
+    })?;
+    match grant {
+        (state, Some(session_uri), _) if matches!(state.as_str(), "active" | "cancel_pending") => {
+            let fingerprint = format!("{:x}", Sha256::digest(session_uri.as_bytes()));
+            if fingerprint != request.session_uri_sha256 {
+                return Err(ApiError::conflict(
+                    "upload_session_changed",
+                    "The upload session has already changed.",
+                ));
+            }
+            if state == "active" {
+                sqlx::query(
+                    "UPDATE artifact_upload_grants SET state = 'cancel_pending', \
+                            cancel_requested_at = now(), \
+                            cancellation_reason = 'worker_reported_session_unusable' \
+                     WHERE artifact_id = $1 AND state = 'active' AND session_uri = $2",
+                )
+                .bind(artifact_id)
+                .bind(&session_uri)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| ApiError::internal())?;
+            }
+        }
+        (state, None, Some(reason))
+            if state == "cancelled" && reason == "worker_reported_session_unusable" => {}
+        _ => {
+            return Err(ApiError::conflict(
+                "upload_session_unavailable",
+                "The upload session is unavailable.",
+            ));
+        }
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let _ = reconcile_pending_session_cancellations(pool, &storage).await;
+    let still_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM artifact_upload_grants \
+         WHERE artifact_id = $1 AND state = 'cancel_pending')",
+    )
+    .bind(artifact_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| ApiError::internal())?;
+    if still_pending {
+        Err(ApiError::artifact_storage_unavailable())
+    } else {
+        Ok(axum::http::StatusCode::NO_CONTENT)
+    }
 }
 
 fn upload_session_response(
@@ -1186,6 +1333,7 @@ mod tests {
     };
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use sqlx::PgPool;
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -1241,7 +1389,7 @@ mod tests {
             sha256: &str,
             issued_at: chrono::DateTime<Utc>,
         ) -> Result<ResumableUploadSession, ArtifactStorageError> {
-            self.calls.initiated.fetch_add(1, Ordering::SeqCst);
+            let sequence = self.calls.initiated.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = (media_type, byte_length, sha256);
             if self
                 .calls
@@ -1252,7 +1400,9 @@ mod tests {
                 self.calls.release_initiation.notified().await;
             }
             Ok(ResumableUploadSession {
-                uri: format!("https://storage.googleapis.com/upload/session/{object_key}"),
+                uri: format!(
+                    "https://storage.googleapis.com/upload/session/{sequence}/{object_key}"
+                ),
                 method: "PUT".to_owned(),
                 expires_at: issued_at + TimeDelta::days(7),
             })
@@ -1858,6 +2008,193 @@ mod tests {
         assert_eq!(replay_grant, ("cancelled".to_owned(), None));
         assert_eq!(storage_calls.protected.load(Ordering::SeqCst), 2);
         assert_eq!(storage_calls.deleted.load(Ordering::SeqCst), 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn unusable_upload_session_is_abandoned_and_safely_replaced(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let (router, calls) = app_with_storage(pool.clone(), "ImIEBA==");
+        let declared = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+                    fixture.worker_id, fixture.attempt_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                .header("content-type", "application/json")
+                .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(declared.status(), StatusCode::OK);
+        let declared = response_json(declared).await;
+        let artifact_id =
+            Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+        let base_uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let started = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let started = response_json(started).await;
+        let first_uri = started["session"]["uri"].as_str().unwrap();
+        let first_fingerprint = format!("{:x}", Sha256::digest(first_uri.as_bytes()));
+
+        let wrong_session = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.1",
+                            "session_uri_sha256": "0".repeat(64)
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_session.status(), StatusCode::CONFLICT);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 0);
+
+        let abandon_body = json!({
+            "protocol_version": "1.1",
+            "session_uri_sha256": first_fingerprint
+        });
+        let abandoned = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(abandon_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(abandoned.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+
+        let replacement = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let replacement = response_json(replacement).await;
+        assert_ne!(replacement["session"]["uri"], started["session"]["uri"]);
+        assert_eq!(calls.initiated.load(Ordering::SeqCst), 2);
+
+        let stale_abandon = router
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(abandon_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_abandon.status(), StatusCode::CONFLICT);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn expired_upload_session_is_cancelled_before_replacement(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let (router, calls) = app_with_storage(pool.clone(), "ImIEBA==");
+        let declared = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+                    fixture.worker_id, fixture.attempt_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                .header("content-type", "application/json")
+                .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let declared = response_json(declared).await;
+        let artifact_id =
+            Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+        let upload_uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let started = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let past = Utc::now() - TimeDelta::minutes(1);
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET issued_at = $2, expires_at = $3 \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind(past - TimeDelta::days(7))
+        .bind(past)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let expired = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+
+        let replacement = router
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::OK);
+        assert_eq!(calls.initiated.load(Ordering::SeqCst), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
