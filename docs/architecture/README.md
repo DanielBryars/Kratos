@@ -19,6 +19,7 @@ Status distinguishes a selected direction from a recommendation still under disc
 | Job telemetry and MLflow records without job networking | Proposed | [ADR-015](decisions/015-job-telemetry-without-job-network.md) |
 | SkyPilot as a later cloud-capacity provider | Accepted | [ADR-010](decisions/010-skypilot-boundary.md) |
 | Cloud SQL metadata and Identity Platform human login | Accepted | [ADR-011](decisions/011-metadata-and-human-identity.md) |
+| Invitations and shared project ownership | Accepted | [ADR-017](decisions/017-invitations-and-shared-ownership.md) |
 | Frontend component and data-fetching details | Open | [Technology options](technology-options.md) |
 
 Each decision record SHALL state its status, context, alternatives, rationale, consequences and conditions for reconsideration. Proposed decisions SHALL NOT be treated as approved implementation constraints.

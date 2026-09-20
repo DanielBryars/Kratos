@@ -34,9 +34,20 @@ traffic. The initial public IP is a connector transport path rather than an unau
 endpoint; a private IP SHALL be reconsidered when a VPC is required for other services.
 
 Kratos SHALL use Google Cloud Identity Platform for human authentication. The browser SHALL complete
-the provider login and send the resulting Identity Platform ID token to the Rust API. The API SHALL
-validate the token signature, issuer, audience, expiry and required claims on every authenticated
-request. Kratos SHALL store application roles, project membership and worker ownership in PostgreSQL;
+the provider login and send the resulting Identity Platform ID token to the Rust API.
+
+The API SHALL establish the identity behind that token on **every** authenticated request. For R0.2
+it does so by calling Identity Platform's `accounts:lookup` rather than verifying the token
+locally, and the trade is deliberate in both directions. It fails **closed**: Identity Platform
+being unavailable makes Kratos unavailable to humans, because a request whose identity cannot be
+established is refused rather than assumed. In exchange, an account disabled at the provider is
+observed on the **next** request rather than at the end of a cache lifetime, and a token that has
+been revoked stops working immediately.
+
+Local verification of the signature, issuer, audience, expiry and required claims against cached
+signing keys is a later optimisation. It SHALL be adopted only if it preserves every one of those
+checks and the deliberate acceptance of a provider-disablement window is recorded, because that
+window is the whole of what is being bought. Kratos SHALL store application roles, project membership and worker ownership in PostgreSQL;
 identity-provider login alone SHALL NOT grant project or administrative authority.
 
 Human authentication SHALL initially use Google sign-in. Additional Identity Platform providers MAY
