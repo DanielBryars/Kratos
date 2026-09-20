@@ -90,6 +90,10 @@ function formatDuration(milliseconds: number) {
   return `${minutes}m ${remainder}s`;
 }
 
+function pluralise(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
 function jobTiming(job: Job) {
   const submittedAt = new Date(job.submitted_at).getTime();
   const startedAt = job.started_at ? new Date(job.started_at).getTime() : null;
@@ -410,31 +414,63 @@ export function App() {
     jobs.length,
   );
   const jobsUnavailableMessage = jobSnapshotUnavailableMessage(jobsSnapshotState);
+  const readyWorkerCount = workers.filter((worker) =>
+    worker.connectivity === "online"
+    && worker.state !== "revoked"
+    && worker.state !== "quarantined"
+  ).length;
+  const activeJobCount = jobs.filter((job) =>
+    job.status === "queued"
+    || job.status === "assigned"
+    || job.status === "running"
+    || job.status === "cancelling"
+  ).length;
+  const completedJobCount = jobs.filter((job) => job.status === "succeeded").length;
 
   return (
     <main>
       <header>
-        <div><p className="eyebrow">GPU training platform</p><h1>KRATOS</h1></div>
-        <span className={`status status--${status}`}>{status}</span>
+        <a className="brand" href="#top" aria-label="Kratos home">
+          <span className="brand-mark" aria-hidden="true"><i /><i /><i /><i /></span>
+          <span><span className="eyebrow">GPU training platform</span><h1>KRATOS</h1></span>
+        </a>
+        <div className="header-actions">
+          {user && <span className="identity">{user.email}</span>}
+          <span className={`status status--${status}`}><i aria-hidden="true" />{status}</span>
+        </div>
       </header>
 
-      <section className="hero">
-        <p>Private compute. Cloud control.</p>
-        <h2>Bring the fleet online.</h2>
-        <p className="muted">Register trusted GPU workers, inspect their capabilities, and keep control of where training runs.</p>
+      <section className="hero" id="top">
+        <div className="hero-copy">
+          <p className="hero-kicker">Private compute <span aria-hidden="true">/</span> Cloud control</p>
+          <h2>Train anywhere.<br /><em>Control everything.</em></h2>
+          <p className="muted">Run immutable GPU workloads across trusted machines, with one cloud view of scheduling, health, and durable outputs.</p>
+          {user && (
+            <nav className="hero-actions" aria-label="Quick actions">
+              <a className="button-link" href="#work-queue">Schedule workload <span aria-hidden="true">→</span></a>
+              <a className="text-link" href="#fleet">Inspect fleet</a>
+            </nav>
+          )}
+        </div>
+        <div className="hero-signal" aria-hidden="true">
+          <span className="signal-orbit signal-orbit--outer" />
+          <span className="signal-orbit signal-orbit--inner" />
+          <span className={`signal-core signal-core--${status}`} />
+          <span className="signal-label">CONTROL<br />{status.toUpperCase()}</span>
+        </div>
       </section>
 
       <section className="grid">
         <article className="card service-card" aria-labelledby="control-plane-heading">
-          <div><p className="label" id="control-plane-heading">Control plane</p><p className="value">{service?.name ?? "Waiting for API"}</p></div>
+          <div className="service-state"><span className={`service-pulse service-pulse--${status}`} /><div><p className="label" id="control-plane-heading">Control plane</p><p className="value">{service?.name ?? "Waiting for API"}</p></div></div>
           <div><p className="label">Version</p><p className="value">{service?.version ?? "—"}</p></div>
-          <a href="/swagger-ui/" target="_blank" rel="noreferrer">Open API</a>
+          <a className="text-link" href="/swagger-ui/" target="_blank" rel="noreferrer">Open API <span aria-hidden="true">↗</span></a>
         </article>
 
         <article className="card operator-card" aria-labelledby="operator-heading">
           <div className="card-heading">
-            <div><p className="label">Operator access</p><h3 id="operator-heading">Worker registration</h3></div>
-            {user && <span className="identity">{user.email}</span>}
+            <div><p className="label">Operator access</p><h3 id="operator-heading">Operations console</h3></div>
+            {user && <span className="console-state"><i aria-hidden="true" /> Live updates</span>}
           </div>
           {authStatus === "loading" && <p className="muted compact">Loading secure sign-in…</p>}
           {authStatus === "unavailable" && <p className="notice notice--error">Operator sign-in is not available in this environment.</p>}
@@ -446,8 +482,13 @@ export function App() {
           )}
           {authStatus === "ready" && user && (
             <>
-              <div className="registration-section">
-                <div><p className="label">Fleet</p><h3>Registered machines</h3></div>
+              <div className="overview" aria-label="Operations overview">
+                <div><span>Ready compute</span><strong>{readyWorkerCount}</strong><small>{pluralise(workers.length, "registered worker")}</small></div>
+                <div><span>Active queue</span><strong>{activeJobCount}</strong><small>{activeJobCount === 0 ? "Nothing waiting" : pluralise(activeJobCount, "job")}</small></div>
+                <div><span>Successful runs</span><strong>{completedJobCount}</strong><small>{pluralise(jobs.length, "run")} recorded</small></div>
+              </div>
+              <div className="registration-section" id="fleet">
+                <div className="section-heading"><div><p className="label">Fleet</p><h3>Registered machines</h3></div><span className="section-count">{pluralise(workers.length, "machine")}</span></div>
                 {workers.length === 0 && <p className="muted compact">No machines have registered yet.</p>}
                 <div className="worker-grid">
                   {workers.map((worker) => (
@@ -462,45 +503,53 @@ export function App() {
                       <p>Last heartbeat: {worker.last_seen_at ? new Date(worker.last_seen_at).toLocaleString() : "never"}</p>
                       <div className="worker-groups">{worker.compute_groups.map((group) => <span className="badge" key={group.id}>{group.name}</span>)}</div>
                       {worker.state !== "revoked" && (
-                        <div className="worker-controls">
-                          <input aria-label={`Compute group for ${worker.display_name}`} value={groupNames[worker.worker_id] ?? "Home"} maxLength={100} onChange={(event) => setGroupNames((current) => ({ ...current, [worker.worker_id]: event.target.value }))} />
-                          <button type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "approve")}>{worker.state === "unapproved" || worker.state === "quarantined" ? "Approve and add" : "Add group"}</button>
-                          {worker.state !== "quarantined" && <button className="button-secondary" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "quarantine")}>Quarantine</button>}
-                          <button className="button-danger" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "revoke")}>Revoke</button>
-                        </div>
+                        <details className="worker-management">
+                          <summary>Manage machine</summary>
+                          <div className="worker-controls">
+                            <input aria-label={`Compute group for ${worker.display_name}`} value={groupNames[worker.worker_id] ?? "Home"} maxLength={100} onChange={(event) => setGroupNames((current) => ({ ...current, [worker.worker_id]: event.target.value }))} />
+                            <button type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "approve")}>{worker.state === "unapproved" || worker.state === "quarantined" ? "Approve and add" : "Add group"}</button>
+                            {worker.state !== "quarantined" && <button className="button-secondary" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "quarantine")}>Quarantine</button>}
+                            <button className="button-danger" type="button" disabled={workerActionId !== null} onClick={() => void updateWorker(worker.worker_id, "revoke")}>Revoke</button>
+                          </div>
+                        </details>
                       )}
                     </div>
                   ))}
                 </div>
               </div>
-              <div className="registration-section">
-                <div><p className="label">Work queue</p><h3>Schedule GPU work</h3></div>
+              <div className="registration-section" id="work-queue">
+                <div className="section-heading">
+                  <div><p className="label">Work queue</p><h3>Schedule GPU work</h3></div>
+                  <button className="button-secondary button-compact" type="button" disabled={jobAction} onClick={loadDurableTrainingPreset}>Load training example</button>
+                </div>
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
                 <div className="job-form">
-                  <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /></label>
-                  <label>Immutable image<input value={jobImage} onChange={(event) => setJobImage(event.target.value)} /></label>
-                  <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
-                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                  <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /><small>Make it easy to recognise later.</small></label>
+                  <label>Immutable image<input value={jobImage} spellCheck={false} onChange={(event) => setJobImage(event.target.value)} /><small>Public registry image pinned with <code>@sha256</code>.</small></label>
+                  <label>Runtime limit<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /><small>30–3,600 seconds.</small></label>
+                  <button className="queue-button" type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
                 </div>
                 <div className="output-contract">
-                  <label className="output-toggle">
-                    <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => setDurableOutputEnabled(event.target.checked)} />
-                    Require a durable output
-                  </label>
-                  <p className="output-help">The path must exactly match the file your container writes beneath `/kratos/outputs`.</p>
-                  <button className="button-secondary" type="button" disabled={jobAction} onClick={loadDurableTrainingPreset}>Load reviewed training example</button>
+                  <div className="output-contract-heading">
+                    <label className="output-toggle">
+                      <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => setDurableOutputEnabled(event.target.checked)} />
+                      <span><strong>Keep an output</strong><small>Upload and verify a model, checkpoint, or other result.</small></span>
+                    </label>
+                    <span className={`contract-state ${durableOutputEnabled ? "contract-state--enabled" : ""}`}>{durableOutputEnabled ? "Configured" : "Optional"}</span>
+                  </div>
                   {durableOutputEnabled && (
-                    <div className="output-fields">
-                      <label>Path<input value={durableOutputPath} maxLength={240} onChange={(event) => setDurableOutputPath(event.target.value)} /></label>
+                    <><p className="output-help">The path must exactly match the file your container writes beneath <code>/kratos/outputs</code>.</p><div className="output-fields">
+                      <label>File path<input value={durableOutputPath} maxLength={240} onChange={(event) => setDurableOutputPath(event.target.value)} /></label>
                       <label>Role<input value={durableOutputRole} maxLength={32} onChange={(event) => setDurableOutputRole(event.target.value)} /></label>
                       <label>Media type<input value={durableOutputMediaType} maxLength={127} onChange={(event) => setDurableOutputMediaType(event.target.value)} /></label>
                       <label>Maximum MiB<input type="number" min={1} max={5120} value={durableOutputMaxMiB} onChange={(event) => setDurableOutputMaxMiB(Number(event.target.value))} /></label>
-                    </div>
+                    </div></>
                   )}
                 </div>
                 {jobsSnapshotState === "loading" && <p className="muted compact">Loading jobs and output status…</p>}
                 {jobsSnapshotState === "empty" && <p className="muted compact">No jobs have been submitted.</p>}
                 {jobsUnavailableMessage && <p className="notice notice--error" role="status">{jobsUnavailableMessage}</p>}
+                <div className="run-heading"><div><p className="label">History</p><h3>Recent runs</h3></div><span className="section-count">{pluralise(jobs.length, "run")}</span></div>
                 <div className="job-list">
                   {jobs.map((job) => (
                     <div className="job" key={job.job_id}>
@@ -510,8 +559,7 @@ export function App() {
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
                       <p>{jobTiming(job)}</p>
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
-                      {job.stdout && <pre>{job.stdout}</pre>}
-                      {job.stderr && <pre className="job-failure">{job.stderr}</pre>}
+                      {(job.stdout || job.stderr) && <details className="run-output"><summary>View container output</summary><div className="terminal"><div className="terminal-bar"><i /><i /><i /><span>container output</span></div>{job.stdout && <pre>{job.stdout}</pre>}{job.stderr && <pre className="job-failure">{job.stderr}</pre>}</div></details>}
                       <div className="artifact-list" aria-label={`Outputs for ${job.name}`}>
                         <div className="artifact-list-heading"><strong>Outputs</strong><span>{job.output_requirements.length} requested</span></div>
                         {job.output_requirements.length === 0 && <p className="artifact-unavailable">No durable outputs were requested for this job.</p>}
