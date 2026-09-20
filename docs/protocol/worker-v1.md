@@ -261,7 +261,7 @@ contain every mandatory exact path, MAY contain declared optional paths, and SHA
 undeclared path. Replaying the same UUID and content returns the same artefact identifiers and object
 keys. A changed replay or second manifest conflicts.
 
-The control plane exposes two replay-safe transfer calls:
+The control plane exposes three replay-safe transfer calls:
 
 - `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading`. The control
   plane signs and performs the XML resumable-initiation `POST`, including generation-match zero and
@@ -269,6 +269,17 @@ The control plane exposes two replay-safe transfer calls:
   replayed calls SHALL NOT initiate in parallel; a call during the short durable `initiating` window
   is retryable, and calls after activation return the same session.
   The worker SHALL keep the session URI private and upload only the declared bytes through it.
+- `PUT .../artifacts/{artifact_id}/abandon-upload` consumes a resumable session that GCS has rejected
+  with 400, 404 or 410. The request SHALL contain protocol version `1.1` and
+  `session_uri_sha256`, calculated over the exact UTF-8 session URI bytes and encoded as 64
+  lowercase hexadecimal digits. The URI itself SHALL NOT be copied into the request body. A 204
+  response means the matching cancellation was consumed and the worker SHOULD call the upload
+  endpoint for a replacement. A 503 means durable cancellation is pending and the worker SHOULD
+  retry abandon. A 409 `upload_session_changed` means the fingerprint is stale; the worker SHALL
+  discard that local URI and reload current manifest/session state. Matching abandon replays SHALL
+  return 204, including after the secret URI has been removed. A late request SHALL NOT cancel a
+  newer session. The upload endpoint applies the same cancellation-before-replacement rule to an
+  expired session and returns 503 until cancellation is consumed.
 - `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
   returned byte length and CRC32C, then independently reads that exact object generation from GCS.
   A matching retry returns the stored verified response; different evidence conflicts. An

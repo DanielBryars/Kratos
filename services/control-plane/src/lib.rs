@@ -26,9 +26,9 @@ mod registry;
 
 use artifact_storage::{ArtifactStorageClient, ResumableUploadSession};
 use artifacts::{
-    ArtifactManifestFile, ArtifactManifestResponse, ArtifactResponse, BeginArtifactUploadRequest,
-    BeginArtifactUploadResponse, CompleteArtifactUploadRequest, DeclareArtifactManifestRequest,
-    JobOutputRequirement,
+    AbandonArtifactUploadRequest, ArtifactManifestFile, ArtifactManifestResponse, ArtifactResponse,
+    BeginArtifactUploadRequest, BeginArtifactUploadResponse, CompleteArtifactUploadRequest,
+    DeclareArtifactManifestRequest, JobOutputRequirement,
 };
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
@@ -98,6 +98,7 @@ pub(crate) struct AppState {
         registry::report_job_result,
         artifacts::declare_manifest,
         artifacts::begin_upload,
+        artifacts::abandon_upload,
         artifacts::complete_upload
     ),
     components(schemas(
@@ -112,8 +113,8 @@ pub(crate) struct AppState {
         OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
         VerifiedArtifactEvidence, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
-        DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
-        ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
+        DeclareArtifactManifestRequest, BeginArtifactUploadRequest, AbandonArtifactUploadRequest,
+        CompleteArtifactUploadRequest, ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
         ResumableUploadSession
     )),
     tags(
@@ -334,6 +335,10 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/upload",
             put(artifacts::begin_upload),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/abandon-upload",
+            put(artifacts::abandon_upload),
         )
         .route(
             "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/complete-upload",
