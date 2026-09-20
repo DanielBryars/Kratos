@@ -17,6 +17,7 @@ import {
   type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
+import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
 
 type Version = { name: string; version: string };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
@@ -133,7 +134,20 @@ export function App() {
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
+  const [durableOutputEnabled, setDurableOutputEnabled] = useState(false);
+  const [durableOutputPath, setDurableOutputPath] = useState("model.pt");
+  const [durableOutputRole, setDurableOutputRole] = useState("model");
+  const [durableOutputMediaType, setDurableOutputMediaType] = useState("application/x-pytorch");
+  const [durableOutputMaxMiB, setDurableOutputMaxMiB] = useState(1);
   const [jobAction, setJobAction] = useState(false);
+  const durableOutputValid = !durableOutputEnabled || (
+    durableOutputPath.trim().length > 0
+    && durableOutputRole.trim().length > 0
+    && durableOutputMediaType.trim().length > 0
+    && Number.isInteger(durableOutputMaxMiB)
+    && durableOutputMaxMiB >= 1
+    && durableOutputMaxMiB <= 5120
+  );
 
   useEffect(() => {
     fetch("/api/v1/version")
@@ -335,7 +349,13 @@ export function App() {
       const response = await fetch("/api/v1/operator/jobs", {
         method: "POST",
         headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ name: jobName, image_reference: jobImage, timeout_seconds: jobTimeout }),
+        body: JSON.stringify(buildJobSubmission(jobName, jobImage, jobTimeout, {
+          enabled: durableOutputEnabled,
+          logicalPath: durableOutputPath,
+          role: durableOutputRole,
+          mediaType: durableOutputMediaType,
+          maxMiB: durableOutputMaxMiB,
+        })),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as ApiError;
@@ -347,6 +367,23 @@ export function App() {
       setMessage(error instanceof Error ? error.message : "The job could not be queued.");
     } finally {
       setJobAction(false);
+    }
+  }
+
+  function selectDurableTrainingPreset(enabled: boolean) {
+    setDurableOutputEnabled(enabled);
+    if (enabled) {
+      setJobName(DURABLE_TRAINING_PRESET.name);
+      setJobImage(DURABLE_TRAINING_PRESET.imageReference);
+      setJobTimeout(DURABLE_TRAINING_PRESET.timeoutSeconds);
+      setDurableOutputPath(DURABLE_TRAINING_PRESET.output.logicalPath);
+      setDurableOutputRole(DURABLE_TRAINING_PRESET.output.role);
+      setDurableOutputMediaType(DURABLE_TRAINING_PRESET.output.mediaType);
+      setDurableOutputMaxMiB(DURABLE_TRAINING_PRESET.output.maxMiB);
+    } else {
+      setJobName("RTX 5090 matrix check");
+      setJobImage(DEMO_WORKLOAD_IMAGE);
+      setJobTimeout(120);
     }
   }
 
@@ -447,9 +484,24 @@ export function App() {
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
                 <div className="job-form">
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /></label>
-                  <label>Immutable image<input value={jobImage} onChange={(event) => setJobImage(event.target.value)} /></label>
+                  <label>Immutable image<input value={jobImage} readOnly={durableOutputEnabled} onChange={(event) => setJobImage(event.target.value)} /></label>
                   <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
-                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim()} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                  <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
+                </div>
+                <div className="output-contract">
+                  <label className="output-toggle">
+                    <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => selectDurableTrainingPreset(event.target.checked)} />
+                    Use durable training preset
+                  </label>
+                  <p className="output-help">Pins the reviewed CUDA training image and requires its `model.pt` checkpoint.</p>
+                  {durableOutputEnabled && (
+                    <div className="output-fields">
+                      <label>Path<input value={durableOutputPath} readOnly /></label>
+                      <label>Role<input value={durableOutputRole} readOnly /></label>
+                      <label>Media type<input value={durableOutputMediaType} readOnly /></label>
+                      <label>Maximum MiB<input type="number" value={durableOutputMaxMiB} readOnly /></label>
+                    </div>
+                  )}
                 </div>
                 {jobsSnapshotState === "loading" && <p className="muted compact">Loading jobs and output status…</p>}
                 {jobsSnapshotState === "empty" && <p className="muted compact">No jobs have been submitted.</p>}

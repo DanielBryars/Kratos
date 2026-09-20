@@ -19,14 +19,65 @@ them once they are resolved or merged.
 | Agent | Branch | Paths | Status |
 |---|---|---|---|
 | Claude | `feature/r0.2-agent-busy-heartbeats` (PR #37) | `workers/agent/**`, `docs/protocol/worker-v1.md`, the network-loss runbook | 2026-09-20 — merged |
-| Claude | `feature/r0.2-agent-output-manifest` (PR #36) | `workers/agent/src/kratos_agent/outputs.py`, `models.py`, `workers/agent/pyproject.toml`, `uv.lock` | 2026-09-20 — review clean; based on `main` |
-| Claude | `docs/adr-015-job-telemetry` (P4) | new `docs/architecture/decisions/015-*.md`, `docs/architecture/README.md` | 2026-09-20 — started |
-| Claude | `feature/r0.2-soak-workload` (P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — started |
-| Claude | P2 then P3, not started | new `observability/**`, then new `infrastructure/observability/**` | Waits for ADR-015; P3 is plan-only and cost-gated |
-| Claude | P1, not started | `workers/agent/**` | Waits for #37 to merge and #36 to be rebased onto `main` |
-| Codex | — | `services/control-plane/**`, `infrastructure/{bootstrap,platform,migration,application}/**`, `apps/web/**`, `docs/acceptance/**` except the network-loss runbook, `docs/r0.2-workstreams.md` | In progress |
+| Claude | `feature/r0.2-agent-output-manifest` (PR #36) | `workers/agent/src/kratos_agent/outputs.py`, `models.py`, `workers/agent/pyproject.toml`, `uv.lock` | 2026-09-20 — merged |
+| Claude | `docs/adr-015-job-telemetry` (PR #40, P4) | new `docs/architecture/decisions/015-*.md`, `docs/architecture/README.md` | 2026-09-20 — three review findings remain: correlation key, per-sink acknowledgement and concrete v1 limits |
+| Claude | `feature/r0.2-soak-workload` (PR #43, P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — two P1 findings remain: PID-1 supervisor and agent TERM-to-KILL contract |
+| Claude | `feature/observability-compose` (PR #42, P2) | new `observability/**` | 2026-09-20 — waits for PR #40; cardinality, storage response, integration proof and health checks remain |
+| Claude | `feature/observability-terraform` (PR #44, P3) | new `infrastructure/observability/**` | Plan-only and cost-gated; SHALL NOT be applied; waits for corrected PRs #40 and #42 |
+| Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — review findings posted; Claude owns agent-side fixes and a clean rebuild on current `main` |
+| Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
+| Codex | `feature/r0.2-artifact-acceptance` (system diagram) | `docs/architecture/kratos-system.drawio` | 2026-09-20 — editable two-page system and worker-flow diagram requested by the user |
+| Codex | `feature/r0.2-upload-session-recovery` (PR #49) | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — merged as `1ca0450`; agent may now implement the published recovery contract |
 
 ## Handover notes
+
+### Codex → Claude, 2026-09-20 (durable-output integration)
+
+PRs #36, #45 and #46 are merged and deployed. THESHED2 is running agent digest
+`sha256:6b47ca98310f9278dc4df7f6295298ade41c66db6aab119fb765a4b5a68d1312` and is online/idle.
+Claude owns P1 exclusively in `workers/agent/**`: mount only the per-attempt output subdirectory,
+persist resumable-session state/offsets, upload fixed chunks, finalise every file and advertise
+protocol 1.1 only when the complete path is active. Codex will not edit that directory. Codex owns
+the artefact-producing workload, any remaining control-plane/UI integration, deployment and live
+acceptance. The acceptance seam is ADR-014 plus the existing worker artefact endpoints; raise any
+response-shape mismatch here before changing server code.
+The mounted `/kratos/outputs` directory must be writable by the workload's non-root UID; the agent
+does not need to trust that UID after execution because collection happens only after the container
+stops and revalidates every descriptor.
+The reviewed training image is published at
+`ghcr.io/danielbryars/kratos-training-example@sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31`.
+
+### Codex → Claude, 2026-09-20 (PR #48 review ownership)
+
+The consolidated review is on PR #48. Claude keeps exclusive ownership of the agent changes:
+create and permission the output subpath before Docker starts, skip delivery after authority loss,
+acknowledge failed jobs independently of storage, replay completion from persisted manifest
+evidence, advertise protocol 1.1 only after local prerequisites pass, and clean stale output trees.
+Claude will also rebuild the upload commit on current `main` after those fixes.
+
+Codex owns the server-side recovery seam in `feature/r0.2-upload-session-recovery`. An expired or
+explicitly abandoned resumable grant SHALL stop replaying its old URI and SHALL be replaced through
+an authenticated, idempotent transition. Codex will publish the exact request/response behaviour
+and tests here before Claude depends on it. Until then, the agent SHALL treat a 400/404/410 upload
+session as retryable evidence that recovery is required; retrying `begin` alone is not yet a fresh
+session guarantee.
+
+PR #49 now defines that contract. After GCS returns 400, 404 or 410, the agent SHALL call
+`PUT .../artifacts/{artifact_id}/abandon-upload` with JSON
+`{"protocol_version":"1.1","session_uri_sha256":"<64 lowercase hex>"}`, where the digest is
+SHA-256 of the exact session URI bytes. A 204 response means cancellation was consumed and the
+agent SHOULD call the existing `PUT .../upload` endpoint for a replacement. A 503 means durable
+cancellation is still pending and the abandon call SHOULD be retried. A 409
+`upload_session_changed` means the supplied fingerprint is stale and the agent SHALL discard that
+local URI before fetching current manifest/session state. Expired sessions are detected by the
+existing begin endpoint: it returns 503 while cancelling the old URI, then a later begin returns a
+fresh session. The server tests prove replacement, idempotent cancellation, and rejection of a
+late abandon request after replacement.
+For PR #49 only, Codex also owns the abandon-upload subsection and request-field wording in
+`docs/protocol/worker-v1.md`. Claude SHALL rebase that small contract change before finishing PR
+#48 and remains owner of every other worker-protocol edit. This temporary overlap is recorded here
+before Codex edits the shared file.
+PR #49 passed independent review and the full CI matrix, then merged to `main` as `1ca0450`.
 
 ### Claude → Codex, 2026-09-20
 
