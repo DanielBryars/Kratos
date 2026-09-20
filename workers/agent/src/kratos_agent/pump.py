@@ -32,6 +32,11 @@ DEFAULT_BATCH_INTERVAL_SECONDS = 2.0
 # What goes to the control plane, and so to MLflow. Log lines belong to the OTLP path.
 _DELIVERED_TO_CONTROL_PLANE = (Kind.PARAM, Kind.METRIC, Kind.PROGRESS)
 
+# Attempts that failed, in their own namespace: a retryable exception is not a lost record.
+FAILURE_COUNTER = "delivery.failures"
+# Records the agent accepted and then gave up on, counted as records rather than as events.
+ABANDONED_COUNTER = "dropped.delivery_abandoned"
+
 
 @dataclass(frozen=True)
 class Delivery:
@@ -141,13 +146,17 @@ class ObservationPump:
         except Exception:  # noqa: BLE001
             self._failures += 1
 
-    def drain(self, *, passes: int = 8) -> None:
-        """Try to deliver what is left, without letting a broken link hold up a job result."""
-        for _ in range(passes):
-            if not self._spool.pending(CONTROL_PLANE_SINK):
-                return
-            if not self.deliver(force=True).sent:
-                return
+    def pending(self) -> bool:
+        """Whether anything is still waiting for the control plane.
+
+        Read by the agent-level pump that keeps delivering after an attempt is terminal. It is
+        never a reason to delay a result: the control plane accepts late batches for a stream that
+        already exists, so undelivered telemetry outlives the attempt rather than holding it open.
+        """
+        try:
+            return self._spool.pending(CONTROL_PLANE_SINK)
+        except Exception:  # noqa: BLE001
+            return False
 
     # --- What it has to report --------------------------------------------------------------------
 
@@ -156,20 +165,32 @@ class ObservationPump:
         return self._result
 
     def counters(self) -> dict[str, int]:
-        """The drop counters, plus anything the spool had to discard to stay bounded.
+        """A snapshot of what was refused, discarded or failed, as at this moment.
+
+        Taken when the result is reported, which is before delivery has necessarily finished. It
+        is a snapshot rather than a final account on purpose: waiting for the spool to drain would
+        make a telemetry outage hold a job result open, and ADR-015 forbids exactly that. Delivery
+        failures after this point stay in the agent's own logs until a later protocol version can
+        update the counters after a result.
 
         Returned empty when nothing was counted, because the result omits the field rather than
         sending an empty object.
         """
         counters = dict(self._collector.counters)
         try:
-            discarded = sum(gap.count for gap in self._spool.gaps(CONTROL_PLANE_SINK))
+            # Records the spool accepted and then discarded to stay bounded. Distinct from
+            # `dropped.budget`, which is a line refused on the way in: this is a record that was
+            # taken, promised to a sink and then given up on, and its value is a record count.
+            abandoned = sum(gap.count for gap in self._spool.gaps(CONTROL_PLANE_SINK))
         except Exception:  # noqa: BLE001
-            discarded = 0
-        if discarded:
-            counters[Drop.BUDGET.value] = counters.get(Drop.BUDGET.value, 0) + discarded
+            abandoned = 0
+        if abandoned:
+            counters[ABANDONED_COUNTER] = counters.get(ABANDONED_COUNTER, 0) + abandoned
         if self._failures:
-            counters["dropped.delivery_failed"] = self._failures
+            # Attempts that failed, not records that were lost. A retryable exception says
+            # nothing about whether the record eventually arrived, so it must not be counted in
+            # the `dropped.` namespace where it would read as loss.
+            counters[FAILURE_COUNTER] = self._failures
         return counters
 
 

@@ -291,9 +291,11 @@ class JobResultResponse(StrictModel):
     status: str
 
 
-# Two namespaces, and the control plane persists whatever it is given: `dropped.` is a line
-# nobody will see, `not_exported.` is a line that was kept but that one sink did not take.
-OBSERVATION_COUNTER_NAME = re.compile(r"^(dropped|not_exported)\.[a-z][a-z0-9_]{0,63}$")
+# Three namespaces, and the control plane persists whatever it is given. `dropped.` is a line
+# rejected from its intended forwarding path. `not_exported.` is a line intentionally not
+# sent to one named sink. `delivery.` is about the sending itself rather than about any
+# line, so a failed request is never mistaken for a lost record.
+OBSERVATION_COUNTER_NAME = re.compile(r"^(dropped|not_exported|delivery)\.[a-z][a-z0-9_]{0,63}$")
 
 
 class ObservationRecord(StrictModel):

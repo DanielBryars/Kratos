@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 from kratos_agent.observations import Drop, ObservationCollector, Stream
-from kratos_agent.pump import CONTROL_PLANE_SINK, ObservationPump, batch_records
+from kratos_agent.pump import (
+    ABANDONED_COUNTER,
+    CONTROL_PLANE_SINK,
+    FAILURE_COUNTER,
+    ObservationPump,
+    batch_records,
+)
 from kratos_agent.spool import Batch, ObservationSpool
 
 AT = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
@@ -162,7 +168,7 @@ def test_a_broken_spool_does_not_raise_into_supervision(
 
     monkeypatch.setattr(ObservationSpool, "next_batch", explode)
     assert pump.deliver(force=True).sent is False
-    assert pump.counters()["dropped.delivery_failed"] >= 1
+    assert pump.counters()[FAILURE_COUNTER] >= 1
 
 
 def test_a_hostile_line_does_not_raise(tmp_path: Path, clock: Clock, link: Link) -> None:
@@ -190,26 +196,46 @@ def test_a_refused_batch_is_abandoned_and_reassembled(
     assert link.batches[0].first_sequence == 1
 
 
-def test_drain_sends_what_is_left_and_gives_up_on_a_dead_link(
-    tmp_path: Path, clock: Clock, link: Link
-) -> None:
+def test_delivery_continues_across_many_batches(tmp_path: Path, clock: Clock, link: Link) -> None:
     pump = build(tmp_path, clock, link)
     for step in range(250):
         # The clock moves as it would in a real run: without it the classifier's rate limiter
-        # refuses everything past its hundred-record burst, and there is nothing left to drain.
+        # refuses everything past its hundred-record burst.
         clock.advance(0.1)
         pump.ingest(Stream.STDOUT, AT, record(record="progress", step=step))
 
-    pump.drain()
-    assert not link.fail_with
+    while pump.pending():
+        clock.advance(5)
+        if not pump.deliver().sent:
+            break
     assert len(link.batches) >= 3, "more than one batch is needed for 250 records"
     assert not pump.counters(), "a paced workload should lose nothing"
 
-    for step in range(250, 300):
-        clock.advance(0.1)
-        pump.ingest(Stream.STDOUT, AT, record(record="progress", step=step))
-    link.fail_with = RuntimeError("gone")
-    pump.drain()  # must return rather than spin
+
+def test_an_undelivered_spool_does_not_hold_a_result_open(
+    tmp_path: Path, clock: Clock, link: Link
+) -> None:
+    """The lifecycle rule: a telemetry outage must never delay a job result.
+
+    The pump reports what it knows at this moment and keeps the rest for an agent-level pump that
+    outlives the attempt. The control plane accepts late batches for a stream that already exists.
+    """
+    pump = build(tmp_path, clock, link)
+    pump.ingest(Stream.STDOUT, AT, record(record="progress", step=1))
+    link.fail_with = RuntimeError("control plane unreachable")
+    pump.deliver(force=True)
+
+    # Still owed, and the caller can see that without being made to wait for it.
+    assert pump.pending() is True
+    snapshot = pump.counters()
+    assert snapshot[FAILURE_COUNTER] == 1
+    assert ABANDONED_COUNTER not in snapshot, "a failed attempt is not a discarded record"
+
+    # And it is still deliverable afterwards, which is what makes the snapshot acceptable.
+    link.fail_with = None
+    clock.advance(10)
+    assert pump.deliver().sent is True
+    assert pump.pending() is False
 
 
 # --- Counters -----------------------------------------------------------------------------------

@@ -414,6 +414,10 @@ record and still forwarded as a log line.
 or configuration rather than any fault in it. It makes no stronger promise about any other sink,
 and SHALL NOT be presented as loss.
 
+**`delivery.`** is about the sending rather than about any line. A request that failed and will be
+retried says nothing about whether its records eventually arrived, so it SHALL NOT be counted in
+`dropped.`, where it would read as loss.
+
 | Counter | Meaning |
 |---|---|
 | `dropped.oversize` | A line over 8 KiB including its newline, refused whole rather than truncated |
@@ -423,7 +427,23 @@ and SHALL NOT be presented as loss.
 | `dropped.name_limit` | A new metric or parameter name beyond the per-attempt cap |
 | `not_exported.metric_name_not_allowed` | Delivered to the control plane, and so to MLflow, but kept off the OpenTelemetry metric path |
 | `not_exported.otlp_unconfigured` | A log line for an attempt with no collector configured; it reaches nothing beyond the existing bounded stdout capture |
+| `dropped.delivery_abandoned` | Records the agent accepted and then discarded to stay bounded. The value is a count of **records**, not of events |
+| `delivery.failures` | Attempts to send that failed and will be retried. Not a count of lost records |
 
 Counters are execution evidence: they SHALL accompany the result even when every observation was
 dropped, so a gap is a number an operator can read rather than silence they have to infer. A
 deployment SHALL NOT treat the absence of this field as an error; it means nothing was counted.
+
+They are a **snapshot taken when the result is reported**, not a final account.
+
+### Telemetry never holds a result open
+
+An agent SHALL submit `JobExecutionResult` as soon as supervision and output evidence are ready,
+**regardless of the state of the observation link**. It SHALL NOT wait for the spool to drain, and
+SHALL NOT delay execution authority, worker availability or result acknowledgement for telemetry.
+
+Undelivered records outlive the attempt. The agent SHALL keep delivering them from its bounded
+spool after the attempt is terminal, and the control plane SHALL accept late idempotent batches for
+a stream that already exists. Delivery failures after the result is reported therefore do not
+appear in `observation_counters`; they remain visible in the agent's own logs until a later
+protocol version can update counters after a result.
