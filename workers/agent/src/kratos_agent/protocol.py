@@ -26,9 +26,12 @@ from kratos_agent.models import (
     HeartbeatResponse,
     JobExecutionResult,
     JobResultResponse,
+    ObservationBatchResponse,
+    ObservationRecord,
     RegistrationCreatedResponse,
     RegistrationRequest,
     RegistrationStatusResponse,
+    SubmitObservationBatchRequest,
     WorkerCapabilities,
 )
 
@@ -42,6 +45,7 @@ ResponseModel = TypeVar(
     JobResultResponse,
     ArtifactManifestResponse,
     BeginArtifactUploadResponse,
+    ObservationBatchResponse,
 )
 
 
@@ -165,6 +169,33 @@ class WorkerProtocolClient:
             json=result.model_dump(mode="json"),
         )
         return self._parse(response, JobResultResponse)
+
+    def submit_observation_batch(
+        self,
+        worker_id: UUID,
+        credential: str,
+        stream_id: UUID,
+        batch_id: UUID,
+        first_sequence: int,
+        records: tuple[ObservationRecord, ...],
+    ) -> ObservationBatchResponse:
+        """Deliver one contiguous batch, addressed by the stream the control plane allocated.
+
+        The batch identifier comes from the caller rather than being minted here, because it was
+        written down before the first attempt to send: an exact replay has to carry the identity
+        it carried the first time, or the control plane answers 409 instead of acknowledging.
+        """
+        request = SubmitObservationBatchRequest(
+            protocol_version=PROTOCOL_VERSION,
+            first_sequence=first_sequence,
+            records=records,
+        )
+        response = self._client.put(
+            f"/api/v1/workers/{worker_id}/observation-streams/{stream_id}/batches/{batch_id}",
+            headers={"Authorization": f"Bearer {credential}"},
+            json=request.model_dump(mode="json"),
+        )
+        return self._parse(response, ObservationBatchResponse)
 
     def declare_artifact_manifest(
         self,
