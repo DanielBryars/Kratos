@@ -33,8 +33,10 @@ use artifacts::{
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
     ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, CreateJobRequest,
-    OperatorJobResponse, OperatorWorkerResponse, PendingRegistrationResponse,
-    RegistrationDecisionResponse, WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
+    OperatorArtifactListResponse, OperatorArtifactResponse, OperatorArtifactStatus,
+    OperatorAttemptIdentity, OperatorJobResponse, OperatorWorkerResponse,
+    PendingRegistrationResponse, RegistrationDecisionResponse, VerifiedArtifactEvidence,
+    WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
@@ -86,6 +88,7 @@ pub(crate) struct AppState {
         operator::revoke_worker,
         operator::create_job,
         operator::list_jobs,
+        operator::list_job_artifacts,
         operator::cancel_job,
         registry::enrol_worker,
         registry::request_registration,
@@ -105,7 +108,9 @@ pub(crate) struct AppState {
         RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
         ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,
         ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
-        WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, JobAssignment,
+        WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, OperatorArtifactResponse,
+        OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
+        VerifiedArtifactEvidence, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
         ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
@@ -286,6 +291,10 @@ pub fn app_with_dependencies(
             post(operator::cancel_job),
         )
         .route(
+            "/api/v1/operator/jobs/{job_id}/artifacts",
+            get(operator::list_job_artifacts),
+        )
+        .route(
             "/api/v1/operator/workers/{worker_id}/approve",
             post(operator::approve_worker),
         )
@@ -358,7 +367,10 @@ pub async fn reconcile_artifact_protections(
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
     use tower::ServiceExt;
 
     use super::app;
@@ -385,6 +397,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), 200);
+        let document = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&document).unwrap();
+        assert_eq!(
+            document["components"]["schemas"]["VerifiedArtifactEvidence"]["properties"]["storage_generation"]
+                ["type"],
+            "string"
+        );
     }
 
     #[tokio::test]

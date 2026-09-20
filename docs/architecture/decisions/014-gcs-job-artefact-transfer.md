@@ -158,6 +158,24 @@ hold as part of its later audited flow. An
 object rejected for a size, checksum or metadata mismatch SHOULD also be deleted immediately at its
 exact generation; lifecycle cleanup is the fallback when immediate cleanup is unavailable.
 
+### Operator visibility
+
+An authenticated operator MAY list the declared artefacts for a job they own through
+`GET /api/v1/operator/jobs/{job_id}/artifacts`. The response SHALL distinguish declaration, upload,
+verification and rejection state and SHALL expose both the worker-declared size/checksums and the
+authoritative storage evidence only after verification succeeds. A protection-pending artefact SHALL
+be presented as `verifying`, never as verified.
+
+The normal operator job list SHALL include the same visibility data in one owner-scoped batch. It
+SHALL identify the latest attempt even when that attempt has not declared a manifest, and SHALL show
+only that attempt's artefacts as current. Outputs from an older retry SHALL NOT be promoted as the
+current attempt's output. Cloud Storage generations SHALL cross the JSON boundary as decimal strings
+because their valid range exceeds JavaScript's exact integer range.
+
+The operator response SHALL NOT include a bucket, object key, resumable session URI or read
+credential. An absent declaration, a failed status request and an artefact without verified evidence
+SHALL remain visibly distinct in the web interface. Direct download authority remains deferred.
+
 ## Alternatives
 
 | Option | Assessment |

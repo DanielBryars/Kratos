@@ -20,6 +20,7 @@ check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --all-features -- -D warnings
     cargo test --workspace
+    pnpm web:test
     pnpm web:typecheck
     pnpm web:build
     cd workers/agent && uv run ruff format --check .
