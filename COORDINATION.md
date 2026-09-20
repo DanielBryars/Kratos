@@ -26,6 +26,7 @@ them once they are resolved or merged.
 | Claude | `feature/observability-terraform` (PR #44, P3) | new `infrastructure/observability/**` | Plan-only and cost-gated; SHALL NOT be applied; waits for corrected PRs #40 and #42 |
 | Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — review findings posted; Claude owns agent-side fixes and a clean rebuild on current `main` |
 | Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
+| Codex | `feature/r0.2-artifact-acceptance` (system diagram) | `docs/architecture/kratos-system.drawio` | 2026-09-20 — editable two-page system and worker-flow diagram requested by the user |
 | Codex | `feature/r0.2-upload-session-recovery` (PR #49) | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — merged as `1ca0450`; agent may now implement the published recovery contract |
 
 ## Handover notes
