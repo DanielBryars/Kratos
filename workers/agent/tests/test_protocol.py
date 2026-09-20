@@ -3,13 +3,14 @@ import json
 import os
 import stat
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from test_executor import T0, FakeClock, JobClient, JobContainer, job_assignment
 
 from kratos_agent.executor import DockerExecutor
 from kratos_agent.models import (
@@ -272,12 +273,18 @@ def result_acknowledgement() -> httpx.Response:
     )
 
 
-def enrolled_state(state_path: Path, *, started_attempt_id: UUID | None = None) -> AgentState:
+def enrolled_state(
+    state_path: Path,
+    *,
+    started_attempt_id: UUID | None = None,
+    started_assignment: JobAssignment | None = None,
+) -> AgentState:
     state = AgentState(
         agent_instance_id=UUID(int=1),
         worker_id=WORKER_ID,
         worker_credential=WORKER_SECRET,
         started_attempt_id=started_attempt_id,
+        started_assignment=started_assignment,
     )
     save_state(state_path, state)
     return state
@@ -371,7 +378,10 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
         state = runner.step(state)
 
     assert executor.prepared == [ATTEMPT_ID]
-    assert executor.runs == [(ATTEMPT_ID, True), (ATTEMPT_ID, False)]
+    # The container is created once. Every later pass only resumes it: once per step during
+    # the outage, then before and after the heartbeat that finally gets through.
+    assert executor.runs[0] == (ATTEMPT_ID, True)
+    assert executor.runs[1:] == [(ATTEMPT_ID, False)] * 3
     assert executor.authorised == [True, True]
     assert len(delivered) == 1
     assert executor.removed == [ATTEMPT_ID]
@@ -520,3 +530,147 @@ def test_only_an_explicit_rejection_withdraws_authority_mid_job(
 
     assert executor.authorised == [authorised]
     assert updated.next_sequence == 1
+
+
+def unreachable(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError("network is unreachable", request=request)
+
+
+def test_restart_during_an_outage_still_enforces_the_runtime_bound(tmp_path: Path) -> None:
+    # The agent restarts with no route to the control plane while its container, started 100
+    # seconds earlier with a 120-second bound, is still running.
+    clock = FakeClock()
+    container = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
+    executor = DockerExecutor(JobClient(clock, container), clock=clock, sleep=clock.sleep)
+    assignment = job_assignment()
+    state_path = tmp_path / "agent.json"
+    enrolled_state(
+        state_path, started_attempt_id=assignment.attempt_id, started_assignment=assignment
+    )
+    restarted = load_state(state_path)
+    assert restarted is not None
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(unreachable)
+    ) as client:
+        after = job_runner(client, state_path, executor).step(restarted)
+
+    assert container.killed is True
+    assert container.exits_at == T0 + timedelta(seconds=20)
+    # The result could not be delivered, so the attempt stays recorded for replay.
+    assert after.started_assignment == assignment
+    assert load_state(state_path) == after
+
+
+def test_recorded_attempt_is_supervised_before_any_heartbeat(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class RecordingExecutor(FakeJobExecutor):
+        def run_job(
+            self,
+            assignment: JobAssignment,
+            *,
+            may_start: bool = True,
+            on_tick: Callable[[], bool] | None = None,
+            tick_seconds: float = 30,
+        ) -> JobExecutionResult:
+            events.append(f"supervise may_start={may_start}")
+            return super().run_job(assignment, may_start=may_start)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            events.append("heartbeat")
+            return heartbeat_response(request, assigned=True)
+        events.append("result")
+        return result_acknowledgement()
+
+    assignment = JobAssignment.model_validate(
+        heartbeat_response(
+            httpx.Request("PUT", "https://control.example/heartbeat", json={"sequence": 0}),
+            assigned=True,
+        ).json()["assignment"]
+    )
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(
+        state_path, started_attempt_id=assignment.attempt_id, started_assignment=assignment
+    )
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        after = job_runner(client, state_path, RecordingExecutor()).step(state)
+
+    assert events == [
+        "supervise may_start=False",
+        "heartbeat",
+        "supervise may_start=False",
+        "result",
+    ]
+    assert after.started_assignment is None
+    assert after.started_attempt_id is None
+
+
+def test_capability_failure_during_a_job_does_not_abandon_supervision(tmp_path: Path) -> None:
+    collections = 0
+
+    def flaky_capabilities() -> WorkerCapabilities:
+        nonlocal collections
+        collections += 1
+        if collections == 2:
+            raise RuntimeError("nvidia-smi did not respond")
+        return capabilities()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            return heartbeat_response(request, assigned=True)
+        return result_acknowledgement()
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = FakeJobExecutor()
+    executor.ticks = 2
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        after = AgentRunner(
+            client,
+            "GPU host",
+            state_path,
+            None,
+            capability_collector=flaky_capabilities,
+            executor=executor,
+        ).step(state)
+
+    assert executor.authorised == [True, True]
+    assert after.next_sequence == 2
+    assert after.started_assignment is None
+
+
+def test_capability_failure_between_jobs_does_not_end_the_agent(tmp_path: Path) -> None:
+    def failing_capabilities() -> WorkerCapabilities:
+        raise RuntimeError("nvidia-smi did not respond")
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(unreachable)
+    ) as client:
+        after = AgentRunner(
+            client,
+            "GPU host",
+            state_path,
+            None,
+            capability_collector=failing_capabilities,
+            executor=FakeJobExecutor(),
+        ).step(state)
+
+    assert after == state
+
+
+def test_recorded_assignment_survives_a_state_round_trip(tmp_path: Path) -> None:
+    assignment = job_assignment()
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(
+        state_path, started_attempt_id=assignment.attempt_id, started_assignment=assignment
+    )
+
+    assert load_state(state_path) == state

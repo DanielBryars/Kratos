@@ -152,7 +152,7 @@ class JobContainer:
         self.exit_code = exit_code
         self.started_at = started_at
         self.exits_at = exits_at
-        self.stopped = False
+        self.killed = False
         self.attrs: dict[str, Any] = {}
         self._publish()
 
@@ -177,9 +177,15 @@ class JobContainer:
         return {"StatusCode": self.exit_code}
 
     def stop(self, *, timeout: int) -> None:
-        assert timeout == 10
-        self.stopped = True
+        # SIGTERM followed by a grace period, which a workload may simply sit out.
+        self.clock.now += timedelta(seconds=timeout)
+        self.kill()
+
+    def kill(self) -> None:
+        self.killed = True
         self.status = "exited"
+        self.exits_at = self.clock.now
+        self._publish()
 
     def logs(self, *, stdout: bool, stderr: bool) -> bytes:
         return b"completed\n" if stdout else b""
@@ -316,7 +322,7 @@ def test_exited_container_is_reported_not_restarted_after_lease_expiry() -> None
     assert (result.exit_code, result.timed_out, result.failure_message) == (0, False, None)
     assert result.stdout == "completed\n"
     assert client.containers.options is None
-    assert existing.stopped is False
+    assert existing.killed is False
 
 
 def test_missing_container_is_never_started_twice() -> None:
@@ -350,7 +356,7 @@ def test_resumed_container_is_stopped_when_its_lease_expires() -> None:
     result = job_executor(clock, JobClient(clock, existing)).run_job(assignment, may_start=False)
 
     assert clock.now == T0 + timedelta(seconds=20)
-    assert existing.stopped is True
+    assert existing.killed is True
     assert (result.exit_code, result.timed_out) == (124, True)
     assert result.failure_message == "assignment lease expired during execution"
 
@@ -364,7 +370,7 @@ def test_resumed_container_keeps_its_original_runtime_bound() -> None:
     )
 
     assert clock.now == T0 + timedelta(seconds=20)
-    assert existing.stopped is True
+    assert existing.killed is True
     assert result.failure_message == "execution exceeded 120 seconds"
 
 
@@ -425,7 +431,7 @@ def test_heartbeats_continue_while_the_container_runs() -> None:
 
     assert ticks == [T0 + timedelta(seconds=seconds) for seconds in (30, 60, 90)]
     assert (result.exit_code, result.timed_out, result.failure_message) == (0, False, None)
-    assert existing.stopped is False
+    assert existing.killed is False
 
 
 def test_container_is_stopped_when_the_control_plane_closes_its_attempt() -> None:
@@ -437,7 +443,7 @@ def test_container_is_stopped_when_the_control_plane_closes_its_attempt() -> Non
     )
 
     assert clock.now == T0 + timedelta(seconds=30)
-    assert existing.stopped is True
+    assert existing.killed is True
     assert (result.exit_code, result.timed_out) == (125, False)
     assert result.failure_message == "control plane no longer holds this attempt"
 
@@ -454,6 +460,39 @@ def test_slow_heartbeat_does_not_extend_the_runtime_bound() -> None:
         job_assignment(), may_start=False, on_tick=slow_tick, tick_seconds=30
     )
 
-    assert existing.stopped is True
+    assert existing.killed is True
     assert result.failure_message == "execution exceeded 120 seconds"
     assert clock.now <= T0 + timedelta(seconds=120 + 15)
+
+
+def test_workload_ignoring_sigterm_gets_no_time_beyond_its_bound() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0)
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
+
+    assert existing.killed is True
+    assert existing.exits_at == T0 + timedelta(seconds=120)
+    assert result.failure_message == "execution exceeded 120 seconds"
+
+
+def test_container_killed_at_its_bound_is_described_the_same_way_when_reported_later() -> None:
+    # The first report was lost, so a later pass finds the container already killed, a moment
+    # after its deadline. That is enforcement, not an unsupervised overrun.
+    clock = FakeClock()
+    existing = JobContainer(
+        clock,
+        status="exited",
+        exit_code=137,
+        started_at=T0 - timedelta(seconds=300),
+        exits_at=T0 - timedelta(seconds=178),
+    )
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
+
+    assert (result.exit_code, result.timed_out) == (124, True)
+    assert result.failure_message == "execution exceeded 120 seconds"

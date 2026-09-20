@@ -22,6 +22,8 @@ IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 64 * 1024
 MAX_FAILURE_MESSAGE_CHARS = 1_000
 SUPERVISION_POLL_SECONDS = 1.0
+# How late a bound may be enforced: one poll plus one in-flight heartbeat and its collection.
+ENFORCEMENT_TOLERANCE = timedelta(seconds=30)
 ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 
@@ -131,6 +133,9 @@ class DockerExecutor:
 
         ``on_tick`` is called about every ``tick_seconds`` while the container runs. Returning
         false means the control plane no longer holds the attempt, which ends its authority.
+
+        Authority ends without a grace period: the container is killed, not asked to stop,
+        so a workload that ignores SIGTERM cannot run past its bound.
         """
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
@@ -190,6 +195,11 @@ class DockerExecutor:
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
+        bound_message = (
+            f"execution exceeded {assignment.timeout_seconds} seconds"
+            if deadline == runtime_deadline
+            else "assignment lease expired during execution"
+        )
         tick = timedelta(seconds=tick_seconds)
         next_tick = self._clock() + tick
         timed_out = False
@@ -201,11 +211,7 @@ class DockerExecutor:
             now = self._clock()
             if now >= deadline:
                 timed_out = True
-                failure_message = (
-                    f"execution exceeded {assignment.timeout_seconds} seconds"
-                    if deadline == runtime_deadline
-                    else "assignment lease expired during execution"
-                )
+                failure_message = bound_message
                 break
             if on_tick is not None and now >= next_tick:
                 authorised = on_tick()
@@ -218,18 +224,24 @@ class DockerExecutor:
         if failure_message is not None:
             exit_code = 124 if timed_out else 125
             try:
-                container.stop(timeout=10)
+                container.kill()
             except Exception:
-                failure_message = f"{failure_message}; container stop failed"
+                failure_message = f"{failure_message}; container kill failed"
         else:
             # A container that has already exited is reported with its real exit status, even
             # when a network outage held the result back beyond the lease.
             exit_code = int(container.wait(timeout=10)["StatusCode"])
             finished_at = _state_time(container, "FinishedAt")
             if finished_at is not None and finished_at > deadline:
+                # A container this agent killed at its bound finishes just after it; a later
+                # finish means nothing was enforcing the bound at the time.
                 timed_out = True
                 exit_code = 124
-                failure_message = "execution continued beyond its authority while unsupervised"
+                failure_message = (
+                    bound_message
+                    if finished_at <= deadline + ENFORCEMENT_TOLERANCE
+                    else "execution continued beyond its authority while unsupervised"
+                )
         stdout = self._bounded_log(container, stdout=True, stderr=False)
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
