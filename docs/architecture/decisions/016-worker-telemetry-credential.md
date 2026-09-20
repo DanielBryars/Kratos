@@ -58,7 +58,8 @@ The control plane SHALL mint a **telemetry token**: a JWT signed with a Kratos-o
 | `aud` | the telemetry gateway's origin |
 | `sub` | the worker identifier |
 | `exp` | at most **15 minutes** after issue |
-| `kratos.project` | the owning identity, so the gateway can attribute and limit by tenant |
+| `kratos.project` | the owning identity |
+| `kratos.stream` | the observation stream this token may write to |
 
 It SHALL be returned on the heartbeat the worker already sends, not from a new endpoint. The
 heartbeat is authenticated, rate-limited and happens every thirty seconds, so a token issued on it
@@ -66,18 +67,46 @@ is refreshed roughly thirty times within its own lifetime and costs no additiona
 A worker that cannot heartbeat stops receiving tokens, which is the same condition under which it
 stops receiving work.
 
+`kratos.stream` is what makes the token *scoped* rather than merely *identified*. The control plane
+allocates an observation stream with each attempt, so it SHALL issue a token naming the stream of
+the attempt that worker currently holds, and SHALL NOT issue one when the worker holds no
+attempt. A worker therefore cannot write to a stream it was never assigned, which a token carrying
+only worker and project identity would have permitted: those say who is speaking, not what they may
+say it about.
+
 The token SHALL authorise **ingestion only**. There is no telemetry read path for a worker, and the
 gateway SHALL NOT accept a telemetry token on any route but OTLP ingestion.
 
-### The gateway verifies it offline
+### The gateway verifies it offline, and identity comes from the claims
 
-The gateway SHALL verify the signature, `iss`, `aud` and `exp` using the `oidc` authenticator
-extension against a JWKS the control plane publishes at a public, cacheable endpoint. Verification
-SHALL NOT call the control plane per request.
+The gateway SHALL verify the signature, `iss`, `aud` and `exp` with the Collector's `oidc`
+authenticator extension. Verification SHALL NOT call the control plane per request: that is what
+keeps the control plane off the telemetry path, so the gateway can validate every push while the
+control plane is unavailable and an observation is never lost because it was busy.
 
-This is what keeps the control plane off the telemetry path: the gateway can validate every push
-while the control plane is unavailable, and an observation is never lost because the control plane
-was busy.
+**Publishing the keys is a contract, not a URL.** The `oidc` extension performs OpenID Connect
+discovery against `issuer_url` by default; a JWKS address alone does not satisfy it. The control
+plane SHALL therefore serve a discovery document at `{iss}/.well-known/openid-configuration`
+carrying at least `issuer`, `jwks_uri`, `id_token_signing_alg_values_supported` and
+`response_types_supported`, with `issuer` exactly equal to the token's `iss`, and SHALL serve the
+JWK Set at `jwks_uri`. Both SHALL be publicly readable and cacheable; neither carries a secret.
+
+Discovery happens when the extension starts. A gateway that cannot reach the discovery document at
+startup therefore fails to start rather than accepting unverified data, which is the behaviour to
+want. The deployment SHALL NOT place the discovery document behind IAP, because the gateway is not
+a human.
+
+**Where a public discovery document is unacceptable**, the extension's `public_keys_file` mode
+SHALL be used instead: the JWK Set is distributed to the instance as a file and discovery is
+disabled. That trades an endpoint for a distribution and rotation procedure, and this decision
+does not choose it by default because a rotation that has to reach a file on a VM is a rotation
+that will one day not reach it.
+
+**Identity SHALL be derived from the validated claims, never from what the worker sent.** The
+gateway SHALL overwrite the worker, project and stream resource attributes on every accepted
+request from `auth.claims.*`, using the Collector's `from_context` attribute source. A resource
+attribute a worker supplies is an assertion by the sender and SHALL NOT establish authorisation or
+attribution; only a claim the gateway verified may do that.
 
 ### Revocation is by expiry, and that is a deliberate limit
 
@@ -97,19 +126,61 @@ decision rejects above, or a revocation list the gateway polls, which is a cache
 staleness problem and more moving parts. Where immediate revocation genuinely matters — job
 assignment, artefact upload, database access — the control plane already provides it.
 
-### The token reaches the collector as a file, not as configuration
+### The token reaches the gateway through a loopback proxy
 
-The agent SHALL write the current token to a file in its own private state directory, with
-`0600` permissions, replaced atomically. The worker-local collector SHALL read it with the
-`bearertokenauth` extension's `filename` option, which re-reads the file when it changes, and
-SHALL attach it to its OTLP exporter.
+A short-lived token has to be replaced without restarting the collector, because a restart discards
+the durable queue ADR-015 depends on. The Collector's `bearertokenauth` extension cannot do this:
+its `filename` option parses a token from a file, and the extension is documented as *static* token
+authentication. Nothing in it promises to notice the file changing. An earlier draft of this
+decision assumed it did, which would have produced a stack that worked for fifteen minutes and then
+stopped, in a way no test of the happy path would catch.
 
-A file rather than an environment variable or a configuration field, because the token is refreshed
-every thirty seconds and neither of those can be updated without restarting the collector, which
-would discard the durable queue ADR-015 depends on.
+The agent SHALL therefore run a **token-injecting proxy** on loopback. The collector exports OTLP to
+the proxy with no credential of its own; the proxy reads the current token **per outbound request**
+from the file the agent replaces atomically, sets the `Authorization` header, and forwards to the
+gateway over HTTPS.
 
-The agent SHALL NOT log the token, and it SHALL NOT be written into the collector's configuration,
-an image, or Terraform state.
+The proxy SHALL return the gateway's status to the collector rather than absorbing it. That is the
+property that matters: the collector's durable queue stays authoritative, so a rejected or failed
+push is retried by the queue that ADR-015 made the acknowledgement boundary, and the proxy holds no
+state of its own that could disagree with it.
+
+The token SHALL be written with `0600` permissions to the agent's private state directory and
+replaced atomically. The agent SHALL NOT log it, and it SHALL NOT be written into the collector's
+configuration, an image, or Terraform state.
+
+### Signing, keys and rotation
+
+Tokens SHALL be signed with **RS256**, and the header SHALL carry a `kid` matching a key in the
+published JWK Set. RS256 is chosen because it is the algorithm every JWT verifier supports,
+including the one behind the `oidc` extension; a faster curve is not worth a compatibility question
+on a path whose whole purpose is to be verified by someone else's code. The discovery document's
+`id_token_signing_alg_values_supported` SHALL list exactly the algorithms in use, and the gateway
+SHALL reject any token whose `alg` is not among them. `alg: none` SHALL be rejected unconditionally.
+
+The private key SHALL live in Secret Manager and be read by the control plane at startup. It SHALL
+NOT appear in an image, in Terraform state, in logs, or in any response. The public JWK Set carries
+no secret and is served publicly.
+
+**Rotation SHALL publish before it signs.** A new key is added to the JWK Set and allowed to
+propagate for at least the JWKS cache lifetime before any token is signed with it; otherwise a
+gateway holding a cached set rejects every token minted in the gap. A retired key SHALL remain in
+the set for at least the maximum token lifetime plus that same cache lifetime, so tokens already
+issued under it continue to verify until they expire. Both keys are valid during the overlap, which
+is the point of it.
+
+### When the control plane is unavailable
+
+Past fifteen minutes with no reachable control plane, a worker holds no valid telemetry token and
+the gateway SHALL reject its pushes. Nothing about the job changes: ADR-015 forbids telemetry from
+interrupting execution, the agent keeps supervising, the lease is enforced locally, and the
+control-plane observation path is a different sink with its own durable spool.
+
+Rejected pushes remain the collector's responsibility, held in its persistent queue and retried
+under its own limits until they succeed or that queue's bounds discard them. A worker that has been
+unable to reach the control plane for fifteen minutes has usually also stopped receiving work, so
+in practice the telemetry it cannot send is telemetry about a job that is finishing or already
+finished.
 
 ### Transport
 
@@ -136,6 +207,9 @@ storing it.
 | Mutual TLS with a per-worker client certificate | Genuinely strong and needs no token plumbing, but it adds a certificate authority, issuance and a renewal path to a system whose whole worker-enrolment story is already built around bearer credentials. Worth revisiting if workers ever need to authenticate to something other than Kratos. |
 | Proxy OTLP through the control plane | Reuses the existing authentication exactly, but puts every observation through Cloud Run, which is the argument ADR-014 already made against routing artefact bytes that way. It also makes a control-plane outage a telemetry outage. |
 | An opaque token the gateway introspects | Allows immediate revocation, at the cost of a control-plane call per push — the dependency this decision exists to avoid. |
+| `bearertokenauth` reading the token file directly | What an earlier draft assumed. The extension is documented as static token authentication and does not promise to re-read the file, so the stack would work until the first token expired. Rejected on the documentation rather than on taste. |
+| Restarting the collector on each rotation | Removes the proxy, but discards the durable queue every fifteen minutes, which is the one thing ADR-015 made the acknowledgement boundary. |
+| A token scoped only to the worker | Simpler to mint, but it authorises writing to any stream, including another attempt's. Identity is not scope. |
 | A revocation list the gateway polls | Gains faster revocation than expiry alone, but it is still a cache with a staleness window, and it adds an endpoint, a poller and a failure mode for a token that grants only ingestion. |
 
 ## Consequences
@@ -147,7 +221,13 @@ storing it.
 - The gateway's clock matters. `exp` is checked against it, so an instance with a badly wrong clock
   rejects every token or accepts expired ones; the observability instance already runs NTP through
   Container-Optimized OS, and this makes that a dependency rather than a detail.
-- The agent gains one more file in its state directory and one more thing to keep out of logs.
+- The agent gains one more file in its state directory, one more thing to keep out of logs, and a
+  loopback proxy process to run and supervise. That proxy is new code on the worker, and it is the
+  real cost of this decision: it must be small, must add no state, and must pass the gateway's
+  answer back unchanged.
+- The gateway's configuration gains an authenticator and a resource processor that overwrites
+  identity from claims. Both are Collector features rather than bespoke code, but the second is
+  what makes the scope enforceable, so it is not optional.
 - ADR-015's OTLP sink becomes implementable, and its second cursor stops being theoretical.
 - A revoked worker retains ingestion for up to fifteen minutes, as set out above.
 - The worker-local collector becomes a component the agent must configure and supervise, which is
@@ -155,8 +235,8 @@ storing it.
 
 ## Deliberately deferred
 
-This decision does not define the worker-local collector's own configuration, its queue sizing or
-how the agent supervises it; nor per-tenant ingestion quotas at the gateway, which the
+This decision does not define the worker-local collector's own configuration, its queue sizing, the
+loopback proxy's implementation, or how the agent supervises either; nor per-tenant ingestion quotas at the gateway, which the
 `kratos.project` claim makes possible but which need their own limits; nor how the gateway's
 authenticator is configured in Terraform, which follows once the shape here is accepted.
 
