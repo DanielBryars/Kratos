@@ -29,12 +29,19 @@ The second migration adds `workers.last_observed_at`. `last_seen_at` records whe
 accepted a heartbeat, while `last_observed_at` records when the worker says it collected the report.
 Keeping both prevents clock skew on a home machine from changing the server-side liveness decision.
 
+The R0.2 artefact migration adds immutable per-job output requirements, one manifest per attempt and
+its declared files. Composite foreign keys keep every manifest, attempt and requirement within one
+job. A `verified` file requires complete upload evidence plus matching generation, length and CRC32C
+observed by the server-side Cloud Storage verifier; PostgreSQL rejects a bare status transition.
+
 ## Runtime operations
 
 The enrolment exchange SHALL lock the bootstrap row, create the worker and scoped credential, mark
 the bootstrap credential as consumed, and write the audit event in one transaction. The heartbeat
 update SHALL change capabilities only when its sequence is newer. Repeating the accepted sequence
-is idempotent; sending an older sequence returns a conflict.
+and identical protocol/capability observation is idempotent. Reusing that sequence with different
+observation data or sending an older sequence returns a conflict. Job assignment revalidates the
+accepted sequence and observation under the same worker-row lock used to change scheduling state.
 
 The service SHALL look up a credential by its non-secret random identifier before running Argon2id.
 Known identifiers are rate limited and share a bounded verification pool. Missing identifiers are
