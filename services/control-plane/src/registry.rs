@@ -1477,9 +1477,20 @@ pub(crate) async fn report_job_result(
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode, header::AUTHORIZATION},
+    };
+    use chrono::{Duration, Utc};
+    use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tower::ServiceExt;
     use uuid::Uuid;
+
+    use crate::{
+        app,
+        credentials::{self, CredentialKind},
+    };
 
     use super::{
         GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
@@ -1503,6 +1514,52 @@ mod tests {
             error_type: None,
             detail: None,
         }
+    }
+
+    async fn insert_owner(pool: &PgPool) -> Uuid {
+        let owner_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO human_identities (id, provider, provider_subject, display_name) \
+             VALUES ($1, 'test', $2, 'Owner')",
+        )
+        .bind(owner_id)
+        .bind(Uuid::new_v4().to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        owner_id
+    }
+
+    async fn insert_worker(pool: &PgPool, owner_id: Uuid, status: &str) -> Uuid {
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', $4, '{}'::jsonb)",
+        )
+        .bind(worker_id)
+        .bind(owner_id)
+        .bind(Uuid::new_v4())
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap();
+        worker_id
+    }
+
+    async fn insert_job(pool: &PgPool, owner_id: Uuid) -> Uuid {
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
+             VALUES ($1, $2, 'Matrix check', $3, 120)",
+        )
+        .bind(job_id)
+        .bind(owner_id)
+        .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .execute(pool)
+        .await
+        .unwrap();
+        job_id
     }
 
     #[test]
@@ -1537,39 +1594,9 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn queued_job_is_atomically_replayed_to_one_worker(pool: PgPool) {
-        let owner_id = Uuid::new_v4();
-        let worker_id = Uuid::new_v4();
-        let job_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO human_identities (id, provider, provider_subject, display_name) \
-             VALUES ($1, 'test', $2, 'Owner')",
-        )
-        .bind(owner_id)
-        .bind(Uuid::new_v4().to_string())
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb)",
-        )
-        .bind(worker_id)
-        .bind(owner_id)
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-             VALUES ($1, $2, 'Matrix check', $3, 120)",
-        )
-        .bind(job_id)
-        .bind(owner_id)
-        .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
-        .execute(&pool)
-        .await
-        .unwrap();
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
 
         let first = current_or_assign_job(&pool, worker_id, true)
             .await
@@ -1593,5 +1620,163 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, ("assigned".to_owned(), "busy".to_owned(), 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn concurrent_scheduler_replay_creates_one_active_attempt(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let first_worker = insert_worker(&pool, owner_id, "idle").await;
+        let second_worker = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
+
+        let (first, second) = tokio::join!(
+            current_or_assign_job(&pool, first_worker, true),
+            current_or_assign_job(&pool, second_worker, true),
+        );
+        let assignments: Vec<_> = [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].job_id, job_id);
+
+        let assigned_worker: Uuid =
+            sqlx::query_scalar("SELECT assigned_worker_id FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let replay = current_or_assign_job(&pool, assigned_worker, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.attempt_id, assignments[0].attempt_id);
+
+        let duplicate = sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, lease_expires_at) \
+             VALUES ($1, $2, 2, $3, now() + interval '5 minutes')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .bind(if assigned_worker == first_worker {
+            second_worker
+        } else {
+            first_worker
+        })
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            duplicate
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("job_attempts_one_active_job")
+        );
+
+        let (attempts, active_attempts, busy_workers): (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(DISTINCT a.id), \
+                    count(DISTINCT a.id) FILTER (WHERE a.status IN ('assigned', 'running')), \
+                    count(DISTINCT w.id) FILTER (WHERE w.status = 'busy') \
+             FROM jobs j LEFT JOIN job_attempts a ON a.job_id = j.id \
+             CROSS JOIN workers w WHERE j.id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((attempts, active_attempts, busy_workers), (1, 1, 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn late_result_cannot_overwrite_replacement_attempt(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let lost_worker = insert_worker(&pool, owner_id, "idle").await;
+        let replacement_worker = insert_worker(&pool, owner_id, "busy").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        let lost_attempt = Uuid::new_v4();
+        let replacement_attempt = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, assigned_at, lease_expires_at, finished_at) \
+             VALUES ($1, $2, 1, $3, 'failed', now() - interval '10 minutes', \
+                     now() - interval '5 minutes', now() - interval '5 minutes'), \
+                    ($4, $2, 2, $5, 'assigned', now(), now() + interval '5 minutes', NULL)",
+        )
+        .bind(lost_attempt)
+        .bind(job_id)
+        .bind(lost_worker)
+        .bind(replacement_attempt)
+        .bind(replacement_worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'assigned', assigned_worker_id = $2 WHERE id = $1")
+            .bind(job_id)
+            .bind(replacement_worker)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier, expires_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(credential.id)
+        .bind(lost_worker)
+        .bind(&credential.verifier)
+        .bind(Utc::now() + Duration::minutes(10))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app(None, Some(pool.clone()))
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{lost_worker}/job-attempts/{lost_attempt}/result"
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "stdout": "stale completion",
+                        "stderr": "",
+                        "failure_message": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["status"], "failed");
+
+        let job: (String, Option<Uuid>, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT status, assigned_worker_id, exit_code, stdout FROM jobs WHERE id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            job,
+            ("assigned".to_owned(), Some(replacement_worker), None, None)
+        );
+        let replacement_status: String =
+            sqlx::query_scalar("SELECT status FROM job_attempts WHERE id = $1")
+                .bind(replacement_attempt)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(replacement_status, "assigned");
     }
 }
