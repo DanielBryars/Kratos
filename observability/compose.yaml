@@ -35,6 +35,8 @@ services:
       - --storage.tsdb.retention.time=15d
       - --storage.tsdb.retention.size=4GB
       - --web.enable-otlp-receiver
+      # Exemplars are how a metric point reaches its trace without a per-run label.
+      - --enable-feature=exemplar-storage
     volumes:
       - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus

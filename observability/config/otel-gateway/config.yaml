@@ -15,6 +15,18 @@ processors:
     check_interval: 1s
     limit_mib: 384
     spike_limit_mib: 96
+  # Strip run identity from metrics before it can reach Prometheus. Promotion rules are not
+  # enough: an unpromoted resource attribute still produces one `target_info` series per attempt,
+  # which is the same unbounded growth. Logs and traces keep these attributes, and an exemplar
+  # carries the association from a metric point to its trace (ADR-015).
+  resource/metrics:
+    attributes:
+      - key: kratos.job.id
+        action: delete
+      - key: kratos.attempt.id
+        action: delete
+      - key: kratos.project.id
+        action: delete
   batch:
     send_batch_size: 1024
     send_batch_max_size: 2048
@@ -42,7 +54,7 @@ service:
   pipelines:
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, resource/metrics, batch]
       exporters: [otlp_http/prometheus]
     logs:
       receivers: [otlp]

@@ -100,9 +100,28 @@ def main() -> int:
                             "scope": scope,
                             "metrics": [
                                 {
-                                    "name": "kratos.smoke.loss",
-                                    "gauge": {
-                                        "dataPoints": [{"timeUnixNano": str(now), "asDouble": 0.25}]
+                                    "name": "kratos.smoke.steps",
+                                    # A monotonic sum, which is what Prometheus stores exemplars
+                                    # against; a gauge point carries none.
+                                    "sum": {
+                                        "aggregationTemporality": 2,
+                                        "isMonotonic": True,
+                                        "dataPoints": [
+                                            {
+                                                "timeUnixNano": str(now),
+                                                "asDouble": 0.25,
+                                                # The association a per-run label would have
+                                                # provided, without a series per attempt.
+                                                "exemplars": [
+                                                    {
+                                                        "timeUnixNano": str(now),
+                                                        "asDouble": 0.25,
+                                                        "traceId": trace_id,
+                                                        "spanId": span_id,
+                                                    }
+                                                ],
+                                            }
+                                        ],
                                     },
                                 }
                             ],
@@ -191,7 +210,7 @@ def main() -> int:
 
     def metric() -> Any:
         """The series itself must stay narrow; a per-run label would be a series per attempt."""
-        query = urllib.parse.quote("kratos_smoke_loss")
+        query = urllib.parse.quote("kratos_smoke_steps_total")
         series = call(f"{PROMETHEUS}/api/v1/query?query={query}")["data"]["result"]
         if not series:
             return None
@@ -201,11 +220,31 @@ def main() -> int:
             raise SystemExit(f"FAILED: per-run labels on a metric series: {sorted(forbidden)}")
         return labels
 
-    def run_association() -> Any:
-        """Job and attempt reach the run through target_info, not through the series labels."""
-        query = urllib.parse.quote(f'target_info{{kratos_attempt_id="{attempt_id}"}}')
-        series = call(f"{PROMETHEUS}/api/v1/query?query={query}")["data"]["result"]
-        return series[0]["metric"]["kratos_job_id"] if series else None
+    def no_run_identity_anywhere() -> Any:
+        """No Prometheus series may carry a per-run identifier, target_info included.
+
+        An unpromoted resource attribute still lands on target_info, which is one series per
+        attempt and exactly the growth this is meant to prevent.
+        """
+        for label in ("kratos_job_id", "kratos_attempt_id", "kratos_project_id"):
+            found = call(f"{PROMETHEUS}/api/v1/label/{label}/values")["data"]
+            if found:
+                raise SystemExit(f"FAILED: {label} reached Prometheus with values {found}")
+        series = call(f"{PROMETHEUS}/api/v1/query?query=target_info")["data"]["result"]
+        return sorted(series[0]["metric"]) if series else ["target_info absent"]
+
+    def exemplar() -> Any:
+        """The metric point still reaches its trace, through an exemplar rather than a label."""
+        start = (now - 3_600_000_000_000) // 1_000_000_000
+        found = call(
+            f"{PROMETHEUS}/api/v1/query_exemplars"
+            f"?query=kratos_smoke_steps_total&start={start}&end={now // 1_000_000_000 + 60}"
+        )["data"]
+        for series in found:
+            for item in series.get("exemplars", []):
+                if item.get("labels", {}).get("trace_id") == trace_id:
+                    return item["labels"]["trace_id"]
+        return None
 
     def log_line() -> Any:
         query = urllib.parse.quote(
@@ -253,8 +292,11 @@ def main() -> int:
         "identity": identity,
         "trace_id": trace_id,
         "prometheus_series": eventually("metric did not reach Prometheus", metric),
-        "prometheus_run_association": eventually(
-            "target_info did not associate the run", run_association
+        "prometheus_target_info_labels": eventually(
+            "a per-run identifier reached Prometheus", no_run_identity_anywhere
+        ),
+        "prometheus_exemplar_trace": eventually(
+            "the metric point carried no exemplar to its trace", exemplar
         ),
         "loki_line": eventually("log record did not reach Loki", log_line),
         "tempo_span": eventually("span did not reach Tempo", span),

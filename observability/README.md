@@ -22,7 +22,11 @@ sh observability/validate.sh
 ```
 
 This checks the Compose file and every service configuration with that component's own validator,
-at the pinned digests, and fails if any image is not pinned. CI runs it on every change.
+at the pinned digests, and fails if any image is not pinned.
+
+CI runs that, and then **starts the stack and runs the smoke service**, because static validation
+cannot show that a signal arrives, that no per-run identifier reaches a metric series, or that an
+exemplar links a point to its trace.
 
 ## Run it
 
@@ -56,11 +60,13 @@ read-only. MLflow's host-header middleware is left enabled and given an explicit
 preinstall is disabled, because it otherwise downloads unpinned plugins at startup.
 
 **Identity (MON-018).** `service.name` and the Kratos worker, job and attempt identifiers travel as
-OTLP resource attributes. Only `service.name` and the worker identifier become Prometheus labels or
-Loki index labels: a per-run identifier as a metric label would create a new series for every
-attempt across the fleet, which no workload-label rule bounds. Job and attempt identity stays in
-Loki structured metadata and on traces, and ADR-015 carries the association onto metrics through
-exemplars instead. Prometheus also enforces sample, label-count and label-length ceilings.
+OTLP resource attributes. The **gateway deletes the job, attempt and project identifiers from
+metrics** before they can reach Prometheus. Declining to promote them is not enough on its own: an
+unpromoted resource attribute still lands on `target_info`, which is one series per attempt and
+exactly the growth this prevents. Job and attempt identity stays in Loki structured metadata and on
+traces and in MLflow, and a metric point reaches its trace through an **exemplar**. The smoke test
+fails if any of those identifiers appears on a Prometheus series, `target_info` included, and
+asserts the exemplar resolves to the span that produced the point.
 
 **Retention and cardinality (MON-019).** Prometheus keeps 15 days or 4 GB, whichever comes first,
 and accepts samples up to 30 minutes late so a worker that was offline can replay. Loki keeps 7
@@ -70,9 +76,17 @@ collector has a memory limiter, so exhaustion is a visible refusal rather than a
 
 Only Prometheus has an enforced **byte** ceiling. Loki, Tempo, MLflow and Grafana are bounded by
 age and by ingestion rate, which bounds how fast they can grow but not the absolute bytes on disk,
-and MLflow has no automatic cleanup at all: a run and its artefacts stay until deleted. Treat the
-figures below as a floor, watch the volumes, and do not rely on this bundle to stop filling a disk.
-Deriving real byte ceilings is part of the cloud deployment, not of this rehearsal.
+and MLflow has no automatic cleanup at all: a run and its artefacts stay until deleted. Compose
+cannot impose a quota on a local volume, so the policy is alert-and-act rather than a hard ceiling:
+
+```shell
+sh observability/budget.sh        # or: sh observability/budget.sh 512
+```
+
+It reports what each volume holds and exits non-zero when one is over budget, printing the ordered
+response — shorten retention first, then delete unreferenced MLflow runs and run `mlflow gc`, and
+only then raise the budget and record why. Run it from a timer on any host that keeps this stack
+for longer than a demonstration. Deriving real byte ceilings belongs to the cloud deployment.
 
 **Containers.** Every service runs read-only, drops all capabilities, sets `no-new-privileges`, has
 a memory limit and uses bounded local logging.
