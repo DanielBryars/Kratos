@@ -75,28 +75,8 @@ services:
       - --artifacts-destination=gs://${KRATOS_TELEMETRY_BUCKET:?the telemetry bucket must be named}/mlflow
       - --serve-artifacts
       - --allowed-hosts=${KRATOS_MLFLOW_HOST:?the public MLflow host must be named},mlflow:5000
-    volumes: []
+    volumes:
+      # Holds the SQLite store when no Cloud SQL database is enabled; unused when one is.
+      - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/mlflow:/var/lib/mlflow
     ports:
       - "5000:5000"
-    depends_on:
-      cloud-sql-proxy:
-        condition: service_started
-
-  # MLflow reaches Cloud SQL through the proxy using the instance's own identity, so no database
-  # password exists anywhere.
-  cloud-sql-proxy:
-    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.18.2@sha256:fc224915ef435afeb5b2a9421260a0d31986d5c8b7c7f5783c7f5d5885700cd2
-    restart: unless-stopped
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    command:
-      - --address=0.0.0.0
-      - --port=5432
-      - --auto-iam-authn
-      - ${KRATOS_MLFLOW_INSTANCE:?the Cloud SQL instance connection name must be supplied}
-    networks: [backend]
-    mem_limit: 256m
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }

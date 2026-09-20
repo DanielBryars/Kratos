@@ -178,9 +178,14 @@ gcloud storage cp observability.tar.gz \
 ```
 
 Copy the three `required_dns_records` addresses to the DNS provider. Certificate issuance begins
-once those names resolve. The instance re-reads the bundle object every few minutes and restarts
-the stack when its generation changes, so replacing that object is how the configuration is
-updated; the instance is not recreated.
+once those names resolve.
+
+**The order above is safe.** Terraform is applied before the bundle and the secret exist, so the
+first boot finds neither. The startup script installs a systemd timer, exits cleanly when either
+is missing, and the timer retries every five minutes, so the stack starts by itself once you have
+uploaded them — no reboot and no second apply. That same timer is what picks up a replaced bundle:
+it compares the object's generation and restarts the stack when it changes, so re-uploading is how
+the configuration is updated and the instance is never recreated.
 
 ### What this root commits to
 
@@ -188,8 +193,18 @@ updated; the instance is not recreated.
   Google's load-balancer ranges to the published service ports, with a default deny behind it. So
   Prometheus, Loki and Tempo have no route from outside the VPC.
 - **Containers cannot reach the instance metadata server.** The startup script rejects traffic to
-  `169.254.169.254` from the Docker bridges, so a compromised service cannot mint the instance's
-  token. The Cloud SQL Auth Proxy uses the host network namespace instead.
+  `169.254.169.254` from the Docker bridges, so nothing running a workload or a public service can
+  mint the instance's token. The Cloud SQL Auth Proxy is the one component that legitimately needs
+  that identity, for IAM database login, and it is the one component placed on the **host network**
+  so the rule does not cover it. Nothing else is granted the exception, and MLflow reaches it
+  through an explicit host-gateway route rather than by reopening metadata to the bridges.
+- **The Cloud SQL overlay is applied only when a database exists.** With `enable_mlflow_database`
+  false the startup script omits `compose.cloudsql.yaml` entirely, so the stack never references a
+  proxy that was not created and MLflow keeps a SQLite store on the persistent disk. `validate.sh`
+  asserts that the default rendering contains no proxy at all.
+- **Each data directory is owned by the user its image runs as** — Prometheus 65534, Loki and Tempo
+  10001, Grafana 472 — because these services are not root and a root-owned bind mount would leave
+  their data path unwritable.
 - Grafana and MLflow sit behind IAP, restricted to `iap_member`. **OTLP ingestion is a separate
   gate, `enable_otlp_ingress`, and is off**: nothing authenticates a worker sending telemetry yet,
   so publishing it would expose unauthenticated ingestion. Until ADR-009's scoped worker credential
@@ -200,7 +215,9 @@ updated; the instance is not recreated.
 - Its data disk is only formatted when it carries **no filesystem signature**. `fsck` exiting
   non-zero because it corrected errors never triggers a reformat.
 - Compose is fetched as a pinned binary and verified against a recorded SHA-256 before it runs,
-  because Container-Optimized OS ships no Compose plugin.
+  because Container-Optimized OS ships no Compose plugin. The Google Cloud CLI helper, which runs
+  on the host network and can read the secret and mint the token, is pinned by digest for the same
+  reason.
 - Prometheus, Loki, Tempo and Grafana keep their state on the persistent disk; Loki chunks, Tempo
   blocks and MLflow artefacts go to Cloud Storage; MLflow metadata goes to Cloud SQL over the Auth
   Proxy with IAM authentication, so no database password exists.

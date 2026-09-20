@@ -42,6 +42,8 @@ locals {
     "${var.project_id}:${var.region}:${var.mlflow_database_instance}"
   ) : ""
   # IAM database authentication: the proxy supplies the credential, so no password exists.
+  # With no database the store is a file on the persistent disk, and the startup script leaves the
+  # Cloud SQL overlay out entirely, so nothing references a proxy that was never created.
   mlflow_database_uri = var.enable_mlflow_database ? (
     "postgresql://${local.mlflow_database_user}@cloud-sql-proxy:5432/mlflow"
   ) : "sqlite:////var/lib/mlflow/mlflow.db"

@@ -1,22 +1,32 @@
 #!/bin/bash
-# Kratos observability instance startup. Runs on every boot; every step is idempotent.
+# Kratos observability instance startup. Runs on every boot and, through the timer it installs,
+# every few minutes afterwards. Every step is idempotent, and it exits 0 when the bundle or the
+# secret is not yet present so that the timer simply tries again: the documented order applies
+# Terraform first and uploads the bundle afterwards, so the first boot legitimately finds neither.
 set -euo pipefail
 
 DATA_DEVICE=/dev/disk/by-id/google-observability-data
 DATA_ROOT=/mnt/disks/data
 BUNDLE_DIR="$DATA_ROOT/bundle"
 COMPOSE=/var/lib/kratos/docker-compose
+# Pinned: this helper runs on the host network and can mint the instance token and read the
+# Grafana secret, so it must not float on a mutable tag.
+CLOUD_CLI="gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:409a43ae520cd0acff8185636a4df9a656a44df2c7d58b99300eeed81142c5a2"
 
 metadata() {
   curl -sf -H Metadata-Flavor:Google \
     "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1"
 }
 
+gcloud_helper() {
+  docker run --rm --network host "$@" "$CLOUD_CLI" gcloud "${@:$#}" 2>/dev/null
+}
+
 # --- Block containers from reaching the instance metadata server.
 # The instance identity can read the config bucket, write telemetry objects and log in to Cloud
-# SQL. A workload or a compromised service in any container must not be able to mint that token,
-# so the bridge networks cannot route to the metadata address at all. The Cloud SQL Auth Proxy
-# needs it, and reaches it over the host network namespace instead.
+# SQL. A workload or a compromised service in a bridged container must not be able to mint that
+# token. The Cloud SQL Auth Proxy genuinely needs it, so it runs on the host network instead,
+# which this rule does not cover; everything else stays on the bridges and stays blocked.
 if ! iptables -C DOCKER-USER -d 169.254.169.254 -j REJECT 2>/dev/null; then
   iptables -I DOCKER-USER -d 169.254.169.254 -j REJECT
 fi
@@ -31,7 +41,45 @@ fi
 fsck.ext4 -p "$DATA_DEVICE" || [ $? -le 2 ]
 mkdir -p "$DATA_ROOT"
 mountpoint -q "$DATA_ROOT" || mount -o discard,defaults "$DATA_DEVICE" "$DATA_ROOT"
-mkdir -p "$DATA_ROOT"/{prometheus,loki,tempo,grafana} "$BUNDLE_DIR" /var/lib/kratos
+mkdir -p "$DATA_ROOT"/{prometheus,loki,tempo,grafana,mlflow} "$BUNDLE_DIR" /var/lib/kratos
+
+# --- Each service runs as a non-root user from its own image, so the directory it writes into
+# must belong to that user. A root-owned bind mount leaves the data path unwritable and the
+# service crash-looping. These are the users the pinned images declare.
+chown -R 65534:65534 "$DATA_ROOT/prometheus"   # prom/prometheus runs as nobody
+chown -R 10001:10001 "$DATA_ROOT/loki" "$DATA_ROOT/tempo"
+chown -R 472:0 "$DATA_ROOT/grafana"            # grafana runs as uid 472
+chmod 0750 "$DATA_ROOT"/{prometheus,loki,tempo,grafana}
+
+# --- Install the reconciliation timer on first boot, so a replaced bundle is picked up without
+# anyone rebooting the instance. The unit runs this same script.
+if [ ! -f /etc/systemd/system/kratos-observability.timer ]; then
+  cat > /etc/systemd/system/kratos-observability.service <<'UNIT'
+[Unit]
+Description=Reconcile the Kratos observability stack
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/kratos/startup.sh
+UNIT
+  cat > /etc/systemd/system/kratos-observability.timer <<'UNIT'
+[Unit]
+Description=Re-read the observability bundle and reconcile the stack
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+  install -m 0755 "$0" /var/lib/kratos/startup.sh
+  systemctl daemon-reload
+  systemctl enable --now kratos-observability.timer
+fi
 
 # --- Container-Optimized OS ships no Compose plugin, so fetch the pinned binary once and verify
 # it against the checksum Terraform supplies. An unverified binary is never executed.
@@ -46,13 +94,15 @@ fi
 
 # --- Fetch the observability bundle, and re-fetch when its generation changes.
 BUNDLE_OBJECT="$(metadata config-bundle)"
-CURRENT_GENERATION="$(docker run --rm --network host \
-  gcr.io/google.com/cloudsdktool/google-cloud-cli:stable \
+CURRENT_GENERATION="$(docker run --rm --network host "$CLOUD_CLI" \
   gcloud storage ls --format='value(generation)' "$BUNDLE_OBJECT" 2>/dev/null || true)"
+if [ -z "$CURRENT_GENERATION" ]; then
+  echo "no bundle at $BUNDLE_OBJECT yet; the timer will retry"
+  exit 0
+fi
 RECORDED_GENERATION="$(cat "$DATA_ROOT/bundle.generation" 2>/dev/null || true)"
-if [ -n "$CURRENT_GENERATION" ] && [ "$CURRENT_GENERATION" != "$RECORDED_GENERATION" ]; then
-  docker run --rm --network host -v "$DATA_ROOT:/data" \
-    gcr.io/google.com/cloudsdktool/google-cloud-cli:stable \
+if [ "$CURRENT_GENERATION" != "$RECORDED_GENERATION" ]; then
+  docker run --rm --network host -v "$DATA_ROOT:/data" "$CLOUD_CLI" \
     gcloud storage cp "$BUNDLE_OBJECT" /data/bundle.tar.gz
   rm -rf "$BUNDLE_DIR"
   mkdir -p "$BUNDLE_DIR"
@@ -64,11 +114,14 @@ fi
 # It is never written into an image, the bundle, or Terraform state.
 GRAFANA_SECRET="$(metadata grafana-secret)"
 umask 077
-docker run --rm --network host \
-  gcr.io/google.com/cloudsdktool/google-cloud-cli:stable \
+if ! docker run --rm --network host "$CLOUD_CLI" \
   gcloud secrets versions access latest --secret="$GRAFANA_SECRET" \
-  > /var/lib/kratos/grafana-password
+  > /var/lib/kratos/grafana-password 2>/dev/null; then
+  echo "no version of secret $GRAFANA_SECRET yet; the timer will retry"
+  exit 0
+fi
 
+MLFLOW_INSTANCE="$(metadata mlflow-instance)"
 {
   echo "KRATOS_GRAFANA_ADMIN_USER=$(metadata grafana-user)"
   echo "KRATOS_GRAFANA_ADMIN_PASSWORD=$(cat /var/lib/kratos/grafana-password)"
@@ -77,8 +130,15 @@ docker run --rm --network host \
   echo "KRATOS_GRAFANA_HOST=$(metadata grafana-host)"
   echo "KRATOS_MLFLOW_HOST=$(metadata mlflow-host)"
   echo "KRATOS_MLFLOW_DATABASE_URI=$(metadata mlflow-database-uri)"
-  echo "KRATOS_MLFLOW_INSTANCE=$(metadata mlflow-instance)"
+  echo "KRATOS_MLFLOW_INSTANCE=${MLFLOW_INSTANCE}"
 } > "$BUNDLE_DIR/.env"
 
+# The Cloud SQL overlay is applied only when a database was actually provisioned. Without it the
+# stack must not reference the proxy at all, or Compose fails to interpolate before anything runs.
+OVERLAYS=(-f compose.yaml -f compose.cloud.yaml)
+if [ -n "$MLFLOW_INSTANCE" ]; then
+  OVERLAYS+=(-f compose.cloudsql.yaml)
+fi
+
 cd "$BUNDLE_DIR"
-"$COMPOSE" -f compose.yaml -f compose.cloud.yaml up -d --remove-orphans
+"$COMPOSE" "${OVERLAYS[@]}" up -d --remove-orphans
