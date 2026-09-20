@@ -1,6 +1,6 @@
 # ADR-017 — Inviting a second person, and what ownership means once there is one
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-20
 
 ## Context
@@ -154,7 +154,7 @@ it to be discovered.
 ### Limits
 
 An invitation SHALL expire within a bounded window, defaulting to the same order as an enrolment
-credential rather than days. The number of unconsumed invitations for a scope SHALL be bounded, so
+credential rather than days. The number of unconsumed invitations for a project SHALL be bounded, so
 a compromised console session cannot mint an unbounded supply of ways in.
 
 ## Acceptance conditions
@@ -219,7 +219,8 @@ Identity Platform token revocation rather than a Kratos change.
 
 ## Conditions for reconsideration
 
-Reconsider if invitations ever go to people outside a circle the owner already trusts, if more than
-one boundary is needed and a scope stops being a fair model of a project, if attribution needs to
-survive a person being removed, or if anyone asks for an access level between viewer and owner —
+Reconsider if invitations ever go to people outside a circle the owner already trusts, if more
+than one project is needed and a single default project stops being a fair model of the work,
+if attribution needs to survive a person being removed, or if anyone asks for an access level
+between viewer and owner —
 at which point the unreachable `'member'` role is where that belongs.
