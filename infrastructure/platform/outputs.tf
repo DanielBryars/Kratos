@@ -13,6 +13,16 @@ output "migration_service_account" {
   value       = google_service_account.database_migration.email
 }
 
+output "artifact_bucket" {
+  description = "Private bucket used for durable job artifacts."
+  value       = google_storage_bucket.artifacts.name
+}
+
+output "artifact_upload_signer_service_account" {
+  description = "Create-only identity used through IAM signBlob; it has no persistent key."
+  value       = google_service_account.artifact_upload_signer.email
+}
+
 output "database_enabled" {
   description = "Whether this platform state manages a billable Cloud SQL instance."
   value       = var.enable_database

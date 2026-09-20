@@ -16,7 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    artifacts::{JobOutputRequirement, validate_output_requirements},
+    artifacts::{
+        JobOutputRequirement, cancel_job_upload_sessions, cancel_worker_upload_sessions,
+        reconcile_pending_session_cancellations, validate_output_requirements,
+    },
     credentials::{self, CredentialKind},
     human_auth::{HumanIdentity, VerifyError},
     registry::{ErrorResponse, WorkerCapabilities, reconcile_expired_attempts},
@@ -814,6 +817,9 @@ async fn change_worker_state(
         .execute(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+        cancel_worker_upload_sessions(&mut transaction, worker_id, "worker_or_credential_revoked")
+            .await
+            .map_err(|_| OperatorError::internal())?;
     }
     sqlx::query(
         "INSERT INTO audit_events \
@@ -831,6 +837,11 @@ async fn change_worker_state(
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
+    if target_state == "revoked"
+        && let Some(storage) = &state.artifact_storage
+    {
+        reconcile_pending_session_cancellations(database, storage).await;
+    }
     Ok(Json(WorkerActionResponse {
         worker_id,
         state: target_state.to_owned(),
@@ -1058,6 +1069,10 @@ pub(crate) async fn cancel_job(
     reconcile_expired_attempts(database)
         .await
         .map_err(|_| OperatorError::internal())?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
     let query = format!(
         "UPDATE jobs SET \
              status = CASE WHEN status IN ('assigned', 'running', 'cancelling') \
@@ -1072,10 +1087,20 @@ pub(crate) async fn cancel_job(
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(job_id)
         .bind(operator_id)
-        .fetch_optional(database)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
         .ok_or_else(OperatorError::job_conflict)?;
+    cancel_job_upload_sessions(&mut transaction, job_id, "job_cancellation_requested")
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    if let Some(storage) = &state.artifact_storage {
+        reconcile_pending_session_cancellations(database, storage).await;
+    }
     let outputs = job_output_requirements(database, &[record.id])
         .await?
         .remove(&record.id)

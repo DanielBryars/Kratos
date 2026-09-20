@@ -3,6 +3,12 @@
 **Status:** Accepted for R0.2
 **Date:** 2026-09-20
 
+Implementation note: the R0.2 control plane uses keyless GCS V4 signing through IAM Credentials
+`signBlob`, performs each resumable-initiation request itself, and returns one replay-safe session per
+artefact. It finalizes worker-reported uploads from authoritative object metadata through a durable
+protection-pending reconciler. Automated cleanup removes unverified objects after seven days;
+downloads and project retention remain deferred.
+
 ## Context
 
 R0.2 must preserve the outputs of a real training job after its worker is unavailable. Home and
@@ -29,26 +35,39 @@ Credentials API, but SHALL NOT hold or export its private key. Neither the worke
 container SHALL receive a Google service-account key, OAuth refresh token or bucket-wide access
 token.
 
-After accepting an output manifest, the control plane SHALL return one HTTPS V4 signed URL per
-approved object. Each URL SHALL:
+After accepting an output manifest, the control plane SHALL create one resumable session per approved
+object. It SHALL construct an HTTPS V4 signed initiation request which:
 
 - initiate a resumable upload for one deterministic object name;
 - expire after ten minutes;
-- include the required resumable-upload and metadata headers in its signature; and
-- include the `ifGenerationMatch=0` precondition so a retry cannot replace an existing object.
+- include the required resumable-upload and metadata headers in its signature;
+- sign `x-goog-if-generation-match: 0`, the XML API precondition that prevents replacement; and
+- sign `x-upload-content-length` with the exact declared byte length.
 
-Completing the initial request returns a Cloud Storage resumable-session URI. That URI is a bearer
-credential scoped to the one object. The agent SHALL store it only in its protected state directory,
-redact it from logs and status messages, and remove it after acknowledgement or permanent failure.
+The control plane SHALL send that signed request itself so a worker cannot replay it to create parallel
+sessions. Before contacting GCS it SHALL commit an `initiating` record with a unique initiation ID.
+While that record is fresh, concurrent or replayed calls SHALL NOT contact GCS. After GCS responds,
+the control plane SHALL persist and return only the resulting Cloud Storage resumable-session URI;
+later replays SHALL return the same URI. That URI is a bearer credential scoped to
+the one object. The agent SHALL store it only in its protected state directory, redact it from logs
+and status messages, and remove it after acknowledgement or permanent failure.
 It SHALL cancel the session when abandoning a transfer while it can still reach Cloud Storage. A
 session can remain usable for up to one week if a disconnected worker cannot cancel it; it cannot
 read, list, delete or write a different object, and an incomplete session does not publish an object.
+If the process stops after GCS creates a session but before PostgreSQL stores its URI, that session is
+unreachable by any worker. The durable `initiating` record suppresses retry fan-out for fifteen
+minutes; a later retry may create one replacement, while the unreachable GCS session expires without
+publishing an object. This cross-system orphan window cannot be made atomic and is an explicit bounded
+cleanup risk.
 
-The control plane SHALL issue or renew upload authority only for the authenticated worker that owns
+The control plane SHALL create or return upload authority only for the authenticated worker that owns
 the attempt, while the attempt is in an authorised output-transfer state. Revoking the worker or
-cancelling the job SHALL prevent new URLs. Previously issued URLs and session URIs remain usable
-until expiry or cancellation, so the deterministic object scope, generation precondition and
-server-side finalisation check are part of the security boundary.
+cancelling the job SHALL prevent new sessions. Previously returned session URIs remain usable until
+expiry or cancellation, so the deterministic object scope, generation precondition, declared length
+and server-side finalisation check are part of the security boundary.
+Worker or credential revocation, job cancellation, lease abandonment and artefact rejection SHALL
+atomically mark every reachable session `cancel_pending`. A reconciler SHALL cancel each URI at GCS,
+then erase it and record `cancelled`; transient cancellation failure SHALL remain retryable.
 
 ### Container-to-cloud flow
 
@@ -62,7 +81,9 @@ server-side finalisation check are part of the security boundary.
    the output limits, and calculate each file's byte length, SHA-256 digest and CRC32C checksum. It
    SHALL submit this manifest to the authenticated attempt endpoint before any upload begins.
 4. The control plane SHALL validate the manifest against the immutable job output contract and
-   persist an artefact record before returning signed initiation URLs. Object names SHALL use opaque
+   persist an artefact record before creating one resumable session. The control plane SHALL perform
+   the signed GCS initiation request itself; replayable signed initiation authority SHALL never be
+   exposed to a worker. Object names SHALL use opaque
    artefact identifiers under
    `v1/projects/{project_id}/jobs/{job_id}/attempts/{attempt_id}/artefacts/{artefact_id}`. A
    container-supplied filename SHALL remain metadata and SHALL NOT become a storage key.
@@ -98,8 +119,10 @@ PostgreSQL SHALL remain the authoritative catalogue. An artefact record SHALL in
 - rejection or deletion reason where applicable.
 
 The database SHALL enforce uniqueness for an attempt's logical path and artefact identifier. Upload
-grants SHALL record their artefact, recipient worker, issue time and expiry for audit, but SHALL NOT
-store signed URLs or resumable-session URIs. Object metadata SHALL contain only non-secret Kratos
+grants SHALL record their artefact, recipient worker, issue time, expiry and the one resumable session
+URI needed for authenticated idempotent replay. The URI SHALL be treated as a bearer secret, returned
+only to that worker, redacted from logs and deleted with the artefact record. Signed initiation URLs
+SHALL NOT be persisted or returned. Object metadata SHALL contain only non-secret Kratos
 identifiers and checksums. User-facing downloads SHALL require project authorisation before the
 control plane creates a separate short-lived, read-only URL.
 
@@ -126,13 +149,22 @@ recorded generation precondition. A reconciliation process SHALL inspect stale `
 verify a completed deterministic object where possible, or mark the transfer failed without
 presenting partial data as valid.
 
+After metadata passes verification, the control plane SHALL durably record the exact generation and a
+`protection_pending` action before placing its temporary hold. The API retry path and a background
+reconciler SHALL repeat that idempotent action until the hold is confirmed, and only then publish the
+artefact as `verified`. The lifecycle rule therefore removes abandoned uploads while leaving verified
+objects intact without leaking an untracked hold after a crash. Retention deletion SHALL clear that
+hold as part of its later audited flow. An
+object rejected for a size, checksum or metadata mismatch SHOULD also be deleted immediately at its
+exact generation; lifecycle cleanup is the fallback when immediate cleanup is unavailable.
+
 ## Alternatives
 
 | Option | Assessment |
 |---|---|
 | Proxy all bytes through the Rust control plane | Centralises authorisation, but adds Cloud Run bandwidth, timeout, memory and scaling pressure to large home-network transfers. |
 | Give each worker a service-account key | Simple client support, but creates a persistent, exportable cloud credential with a broad rotation and incident-response burden. |
-| Downscoped OAuth access tokens | Credential Access Boundaries can restrict a short-lived token to a Cloud Storage prefix and remain a valid later option. Per-object signed initiation URLs grant less authority for the small R0.2 manifest and avoid sending a general API token. |
+| Downscoped OAuth access tokens | Credential Access Boundaries can restrict a short-lived token to a Cloud Storage prefix and remain a valid later option. Control-plane-created per-object sessions grant less authority for the small R0.2 manifest and avoid sending a general API token. |
 | Direct upload from the training container | Breaks the no-network workload boundary and exposes upload authority to user code. |
 | Store outputs only through MLflow | Couples job completion to the experiment-tracking service and obscures Kratos project authorisation and transfer state. |
 | Worker-local outputs only | Cannot meet durable completion, cross-worker recovery or cloud history requirements. |
@@ -144,7 +176,7 @@ presenting partial data as valid.
   retention, while the control plane remains authoritative for permission and completion.
 - Direct worker-to-GCS transfer avoids routing large artefacts through Cloud Run and supports
   interrupted residential links.
-- Signed URLs and session URIs are secrets even though they are narrow. Redaction, protected local
+- Session URIs are secrets even though they are narrow. Redaction, protected local
   state and expiry tests are release requirements.
 - A successful container exit and a successful job become distinct events; the UI must show the
   output-transfer phase and its progress.
@@ -161,7 +193,7 @@ offline reconciliation and recovery on another worker remain R0.4 scope.
 
 ## Conditions for reconsideration
 
-Reconsider the transfer mechanism if per-job file counts make signed URL issuance material, if a
+Reconsider the transfer mechanism if per-job file counts make signed initiation material, if a
 supported backend is not Cloud Storage, if resumable-session expiry cannot satisfy a project policy,
 or if measured Cloud Storage/API cost and throughput favour a downscoped-token or gateway design.
 Reconsider limits and retention from measured model sizes, residential upload rates and accepted

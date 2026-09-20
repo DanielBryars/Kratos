@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    artifacts::JobOutputRequirement,
+    artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions},
     credentials::{self, CredentialKind, IssuedCredential},
 };
 
@@ -350,6 +350,14 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn artifact_storage_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_storage_unavailable",
+            "Artifact storage is temporarily unavailable.",
+        )
+    }
+
     pub(crate) const fn conflict(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::CONFLICT, code, message)
     }
@@ -512,7 +520,7 @@ pub(crate) async fn authenticate_worker(
     headers: &HeaderMap,
     worker_id: Uuid,
     operation: &'static str,
-) -> Result<(), ApiError> {
+) -> Result<Uuid, ApiError> {
     let pool = database(state)?;
     let supplied = bearer(headers)?.to_owned();
     let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
@@ -537,6 +545,37 @@ pub(crate) async fn authenticate_worker(
             .verification_gate
             .verify(credential_id, supplied, authentication.token_verifier)
             .await?
+    {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(credential_id)
+}
+
+pub(crate) async fn lock_current_worker_authorization(
+    transaction: &mut Transaction<'_, Postgres>,
+    credential_id: Uuid,
+    worker_id: Uuid,
+) -> Result<(), ApiError> {
+    let worker_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM workers WHERE id = $1 FOR UPDATE")
+            .bind(worker_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .ok_or_else(ApiError::unauthorized)?;
+    let credential = sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+        "SELECT expires_at, revoked_at FROM worker_credentials \
+         WHERE id = $1 AND worker_id = $2 FOR UPDATE",
+    )
+    .bind(credential_id)
+    .bind(worker_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::internal())?
+    .ok_or_else(ApiError::unauthorized)?;
+    if worker_status == "revoked"
+        || credential.1.is_some()
+        || credential.0.is_some_and(|expires| expires <= Utc::now())
     {
         return Err(ApiError::unauthorized());
     }
@@ -1171,6 +1210,9 @@ async fn close_expired_attempt(
     } else {
         "Execution lease expired and the bounded attempt limit was reached."
     };
+    cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_lease_expired")
+        .await
+        .map_err(|error| database_error(&error, "cancel expired attempt upload sessions"))?;
 
     sqlx::query(
         "UPDATE job_attempts SET status = $2, finished_at = now(), terminal_reason = $3 \
@@ -1249,6 +1291,9 @@ async fn acknowledge_cancelled_attempt(
     attempt: &ExpiredAttemptRecord,
 ) -> Result<(), ApiError> {
     let reason = "Cancellation completed when the worker acknowledged execution had stopped.";
+    cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_cancelled")
+        .await
+        .map_err(|error| database_error(&error, "cancel acknowledged attempt upload sessions"))?;
     sqlx::query(
         "UPDATE job_attempts SET status = 'cancelled', \
                 started_at = COALESCE(started_at, assigned_at), finished_at = now(), \

@@ -75,6 +75,8 @@ jobs:
           database_enabled="$(terraform output -raw database_enabled)"
           echo "runtime_service_account=$(terraform output -raw runtime_service_account)" >> "$GITHUB_OUTPUT"
           echo "migration_service_account=$(terraform output -raw migration_service_account)" >> "$GITHUB_OUTPUT"
+          echo "artifact_bucket=$(terraform output -raw artifact_bucket)" >> "$GITHUB_OUTPUT"
+          echo "artifact_upload_signer_service_account=$(terraform output -raw artifact_upload_signer_service_account)" >> "$GITHUB_OUTPUT"
           echo "database_enabled=$database_enabled" >> "$GITHUB_OUTPUT"
           if [[ "$database_enabled" == "true" ]]; then
             echo "database_connection_name=$(terraform output -raw database_connection_name)" >> "$GITHUB_OUTPUT"
@@ -121,6 +123,8 @@ jobs:
             -var="region=${{ vars.GCP_REGION }}" \
             -var="container_image=${{ steps.image.outputs.reference }}" \
             -var="runtime_service_account=${{ steps.platform.outputs.runtime_service_account }}" \
+            -var="artifact_bucket=${{ steps.platform.outputs.artifact_bucket }}" \
+            -var="artifact_upload_signer_service_account=${{ steps.platform.outputs.artifact_upload_signer_service_account }}" \
             -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}" \
             -var="identity_platform_api_key=${{ vars.KRATOS_IDENTITY_PLATFORM_API_KEY }}" \
             -var="bootstrap_operator_email=${{ vars.KRATOS_BOOTSTRAP_OPERATOR_EMAIL }}" \

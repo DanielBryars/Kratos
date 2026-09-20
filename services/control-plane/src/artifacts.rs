@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Json,
     extract::{Path, State, rejection::JsonRejection},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue, header},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    registry::{ApiError, authenticate_worker, validate_protocol},
+    artifact_storage::{ArtifactStorageError, ResumableUploadSession},
+    registry::{
+        ApiError, authenticate_worker, lock_current_worker_authorization, validate_protocol,
+    },
 };
 
 const MAX_FILES: usize = 100;
@@ -89,11 +92,18 @@ pub struct ArtifactManifestResponse {
     pub artifacts: Vec<ArtifactResponse>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BeginArtifactUploadResponse {
+    pub artifact: ArtifactResponse,
+    pub session: ResumableUploadSession,
+}
+
 #[derive(FromRow)]
 struct AttemptRecord {
     job_id: Uuid,
     owner_identity_id: Uuid,
     status: String,
+    job_status: String,
 }
 
 #[derive(FromRow)]
@@ -117,10 +127,16 @@ struct ArtifactRecord {
     sha256: String,
     crc32c: String,
     object_key: String,
+    storage_bucket: Option<String>,
     status: String,
     storage_generation: Option<i64>,
     uploaded_byte_length: Option<i64>,
     uploaded_crc32c: Option<String>,
+    verified_storage_generation: Option<i64>,
+    verified_byte_length: Option<i64>,
+    verified_crc32c: Option<String>,
+    verified_sha256: Option<String>,
+    protection_pending: bool,
     upload_started_at: Option<DateTime<Utc>>,
     upload_completed_at: Option<DateTime<Utc>>,
 }
@@ -140,8 +156,8 @@ impl TryFrom<ArtifactRecord> for ArtifactResponse {
             sha256: record.sha256,
             crc32c: record.crc32c,
             object_key: record.object_key,
-            verification_pending: record.status == "uploading"
-                && record.upload_completed_at.is_some(),
+            verification_pending: record.protection_pending
+                || (record.status == "uploading" && record.upload_completed_at.is_some()),
             status: record.status,
             storage_generation: record.storage_generation,
             upload_started_at: record.upload_started_at,
@@ -248,9 +264,9 @@ async fn attempt_for_worker(
     worker_id: Uuid,
 ) -> Result<AttemptRecord, ApiError> {
     let record = sqlx::query_as::<_, AttemptRecord>(
-        "SELECT a.job_id, j.owner_identity_id, a.status \
+        "SELECT a.job_id, j.owner_identity_id, a.status, j.status AS job_status \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
-         WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a",
+         WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
     .bind(attempt_id)
     .bind(worker_id)
@@ -258,7 +274,9 @@ async fn attempt_for_worker(
     .await
     .map_err(|_| ApiError::internal())?
     .ok_or_else(|| ApiError::conflict("attempt_unavailable", "The job attempt is unavailable."))?;
-    if !matches!(record.status.as_str(), "assigned" | "running") {
+    if !matches!(record.status.as_str(), "assigned" | "running")
+        || !matches!(record.job_status.as_str(), "assigned" | "running")
+    {
         return Err(ApiError::conflict(
             "attempt_not_active",
             "The job attempt no longer accepts artefact changes.",
@@ -274,7 +292,8 @@ async fn load_artifacts(
     sqlx::query_as::<_, ArtifactRecord>(
         "SELECT id, logical_path, role, media_type, mandatory, byte_length, sha256, crc32c, \
                 object_key, status, storage_generation, uploaded_byte_length, uploaded_crc32c, \
-                upload_started_at, upload_completed_at \
+                upload_started_at, upload_completed_at, storage_bucket, verified_storage_generation, \
+                verified_byte_length, verified_crc32c, verified_sha256, protection_pending \
          FROM job_artifacts WHERE manifest_id = $1 ORDER BY logical_path",
     )
     .bind(manifest_id)
@@ -479,7 +498,8 @@ async fn artifact_for_worker(
         "SELECT ar.id, ar.logical_path, ar.role, ar.media_type, ar.mandatory, ar.byte_length, \
                 ar.sha256, ar.crc32c, ar.object_key, ar.status, ar.storage_generation, \
                 ar.uploaded_byte_length, ar.uploaded_crc32c, ar.upload_started_at, \
-                ar.upload_completed_at \
+                ar.upload_completed_at, ar.storage_bucket, ar.verified_storage_generation, \
+                ar.verified_byte_length, ar.verified_crc32c, ar.verified_sha256, ar.protection_pending \
          FROM job_artifacts ar JOIN job_attempts a ON a.id = ar.attempt_id \
          WHERE ar.id = $1 AND ar.attempt_id = $2 AND a.worker_id = $3 FOR UPDATE OF ar",
     )
@@ -498,48 +518,229 @@ async fn artifact_for_worker(
     tag = "workers",
     security(("bearer_credential" = [])),
     request_body = BeginArtifactUploadRequest,
-    responses((status = 200, description = "Upload state started or replayed", body = ArtifactResponse))
+    responses(
+        (status = 200, description = "One control-plane-created resumable upload session returned", body = BeginArtifactUploadResponse),
+        (status = 503, description = "Artifact storage is unavailable", body = crate::registry::ErrorResponse)
+    )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn begin_upload(
     State(state): State<AppState>,
     Path((worker_id, attempt_id, artifact_id)): Path<(Uuid, Uuid, Uuid)>,
     headers: HeaderMap,
     payload: Result<Json<BeginArtifactUploadRequest>, JsonRejection>,
-) -> Result<Json<ArtifactResponse>, ApiError> {
-    authenticate_worker(&state, &headers, worker_id, "authenticate artefact upload").await?;
+) -> Result<(HeaderMap, Json<BeginArtifactUploadResponse>), ApiError> {
+    let credential_id =
+        authenticate_worker(&state, &headers, worker_id, "authenticate artefact upload").await?;
     let Json(request) = payload.map_err(|_| ApiError::invalid_request())?;
     validate_artifact_protocol(&request.protocol_version)?;
+    let storage = state
+        .artifact_storage
+        .clone()
+        .ok_or_else(ApiError::artifact_storage_unavailable)?;
     let pool = database(&state)?;
     let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
+    lock_current_worker_authorization(&mut transaction, credential_id, worker_id).await?;
     attempt_for_worker(&mut transaction, attempt_id, worker_id).await?;
     let artifact =
         artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
-    let artifact = match artifact.status.as_str() {
-        "declared" => {
-            sqlx::query(
-                "UPDATE job_artifacts SET status = 'uploading', upload_started_at = now() \
-                 WHERE id = $1",
-            )
-            .bind(artifact_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| ApiError::internal())?;
-            artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?
+    if !matches!(artifact.status.as_str(), "declared" | "uploading")
+        || artifact.upload_completed_at.is_some()
+    {
+        return Err(ApiError::conflict(
+            "artifact_not_uploadable",
+            "The artefact no longer accepts an upload.",
+        ));
+    }
+    let object_key = artifact.object_key.clone();
+    let media_type = artifact.media_type.clone();
+    let byte_length = u64::try_from(artifact.byte_length).map_err(|_| ApiError::internal())?;
+    let sha256 = artifact.sha256.clone();
+    let issued_at = DateTime::<Utc>::from_timestamp_micros(Utc::now().timestamp_micros())
+        .ok_or_else(ApiError::internal)?;
+    let existing = sqlx::query_as::<_, (String, Uuid, Option<String>, DateTime<Utc>)>(
+        "SELECT state, initiation_id, session_uri, expires_at FROM artifact_upload_grants \
+         WHERE artifact_id = $1 FOR UPDATE",
+    )
+    .bind(artifact_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::internal())?;
+    if let Some((grant_state, _, session_uri, expires_at)) = &existing {
+        if grant_state == "active" {
+            let session = ResumableUploadSession {
+                uri: session_uri.clone().ok_or_else(ApiError::internal)?,
+                method: "PUT".to_owned(),
+                expires_at: *expires_at,
+            };
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ApiError::internal())?;
+            return upload_session_response(artifact, session);
         }
-        "uploading" | "verified" => artifact,
-        _ => {
+        if grant_state == "initiating" && *expires_at > issued_at {
+            return Err(ApiError::artifact_storage_unavailable());
+        }
+        if matches!(grant_state.as_str(), "cancel_pending" | "cancelled") {
             return Err(ApiError::conflict(
                 "artifact_not_uploadable",
-                "The artefact no longer accepts an upload.",
+                "The artefact upload session was cancelled.",
             ));
         }
-    };
-    let artifact = artifact.try_into()?;
+    }
+    let initiation_id = Uuid::new_v4();
+    let initiation_deadline = issued_at + chrono::TimeDelta::minutes(15);
+    if existing.is_some() {
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'initiating', initiation_id = $2, \
+                    initiation_attempts = initiation_attempts + 1, session_uri = NULL, \
+                    issued_at = $3, expires_at = $4, activated_at = NULL, \
+                    cancel_requested_at = NULL, cancelled_at = NULL, cancellation_reason = NULL \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind(initiation_id)
+        .bind(issued_at)
+        .bind(initiation_deadline)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    } else {
+        sqlx::query(
+            "INSERT INTO artifact_upload_grants \
+             (id, artifact_id, worker_id, bucket_name, object_key, state, initiation_id, \
+              issued_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, 'initiating', $6, $7, $8)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(artifact_id)
+        .bind(worker_id)
+        .bind(storage.bucket())
+        .bind(&object_key)
+        .bind(initiation_id)
+        .bind(issued_at)
+        .bind(initiation_deadline)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    }
     transaction
         .commit()
         .await
         .map_err(|_| ApiError::internal())?;
-    Ok(Json(artifact))
+
+    let session = storage
+        .initiate_resumable_upload(&object_key, &media_type, byte_length, &sha256, issued_at)
+        .await
+        .map_err(|_| ApiError::artifact_storage_unavailable())?;
+
+    let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
+    let authorization =
+        match lock_current_worker_authorization(&mut transaction, credential_id, worker_id).await {
+            Ok(()) => attempt_for_worker(&mut transaction, attempt_id, worker_id)
+                .await
+                .map(|_| ()),
+            Err(error) => Err(error),
+        };
+    if let Err(error) = authorization {
+        mark_initiated_session_for_cancellation(
+            &mut transaction,
+            artifact_id,
+            initiation_id,
+            &session,
+            "authority_ended_during_initiation",
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        let _ = storage.cancel_resumable_upload(&session.uri).await;
+        let _ = reconcile_pending_session_cancellations(pool, &storage).await;
+        return Err(error);
+    }
+    artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
+    let activated = sqlx::query(
+        "UPDATE artifact_upload_grants SET state = 'active', session_uri = $3, \
+                expires_at = $4, activated_at = now() \
+         WHERE artifact_id = $1 AND state = 'initiating' AND initiation_id = $2",
+    )
+    .bind(artifact_id)
+    .bind(initiation_id)
+    .bind(&session.uri)
+    .bind(session.expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::internal())?
+    .rows_affected();
+    if activated != 1 {
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        let _ = storage.cancel_resumable_upload(&session.uri).await;
+        return Err(ApiError::conflict(
+            "upload_initiation_superseded",
+            "The upload initiation was superseded.",
+        ));
+    }
+    sqlx::query(
+        "UPDATE job_artifacts SET status = 'uploading', storage_bucket = $2, \
+                upload_started_at = COALESCE(upload_started_at, $3) WHERE id = $1",
+    )
+    .bind(artifact_id)
+    .bind(storage.bucket())
+    .bind(issued_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::internal())?;
+    let artifact =
+        artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    upload_session_response(artifact, session)
+}
+
+fn upload_session_response(
+    artifact: ArtifactRecord,
+    session: ResumableUploadSession,
+) -> Result<(HeaderMap, Json<BeginArtifactUploadResponse>), ApiError> {
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response_headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    Ok((
+        response_headers,
+        Json(BeginArtifactUploadResponse {
+            artifact: artifact.try_into()?,
+            session,
+        }),
+    ))
+}
+
+async fn mark_initiated_session_for_cancellation(
+    transaction: &mut Transaction<'_, Postgres>,
+    artifact_id: Uuid,
+    initiation_id: Uuid,
+    session: &ResumableUploadSession,
+    reason: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "UPDATE artifact_upload_grants SET state = 'cancel_pending', session_uri = $3, \
+                expires_at = $4, cancel_requested_at = now(), cancellation_reason = $5 \
+         WHERE artifact_id = $1 AND state = 'initiating' AND initiation_id = $2",
+    )
+    .bind(artifact_id)
+    .bind(initiation_id)
+    .bind(&session.uri)
+    .bind(session.expires_at)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::internal())?;
+    Ok(())
 }
 
 #[utoipa::path(
@@ -549,11 +750,13 @@ pub(crate) async fn begin_upload(
     security(("bearer_credential" = [])),
     request_body = CompleteArtifactUploadRequest,
     responses(
-        (status = 200, description = "Upload completion recorded idempotently; storage verification remains pending", body = ArtifactResponse),
+        (status = 200, description = "Upload metadata independently verified and artifact finalized", body = ArtifactResponse),
         (status = 409, description = "Completion conflicts with stored evidence", body = crate::registry::ErrorResponse),
-        (status = 422, description = "Completion evidence is invalid", body = crate::registry::ErrorResponse)
+        (status = 422, description = "Completion evidence is invalid", body = crate::registry::ErrorResponse),
+        (status = 503, description = "Artifact storage verification is unavailable", body = crate::registry::ErrorResponse)
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn complete_upload(
     State(state): State<AppState>,
     Path((worker_id, attempt_id, artifact_id)): Path<(Uuid, Uuid, Uuid)>,
@@ -575,6 +778,10 @@ pub(crate) async fn complete_upload(
     {
         return Err(ApiError::invalid_request());
     }
+    let storage = state
+        .artifact_storage
+        .clone()
+        .ok_or_else(ApiError::artifact_storage_unavailable)?;
     let pool = database(&state)?;
     let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
     let artifact =
@@ -596,41 +803,383 @@ pub(crate) async fn complete_upload(
                 "The upload was already completed with different evidence.",
             ));
         }
+        if artifact.status == "verified" {
+            consume_completed_upload_session(&mut transaction, artifact_id)
+                .await
+                .map_err(|_| ApiError::internal())?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ApiError::internal())?;
+            return Ok(Json(artifact.try_into()?));
+        }
+        if artifact.status != "uploading" {
+            return Err(ApiError::conflict(
+                "artifact_verification_failed",
+                "The stored object did not match the declared artefact.",
+            ));
+        }
+    } else {
+        attempt_for_worker(&mut transaction, attempt_id, worker_id).await?;
+    }
+    if artifact.status != "uploading" || artifact.storage_bucket.is_none() {
+        return Err(ApiError::conflict(
+            "artifact_not_uploading",
+            "The artefact upload has not been started.",
+        ));
+    }
+    if artifact.upload_completed_at.is_none() {
+        sqlx::query(
+            "UPDATE job_artifacts SET storage_generation = $2, uploaded_byte_length = $3, \
+                    uploaded_crc32c = $4, upload_completed_at = now() WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .bind(request.storage_generation)
+        .bind(i64::try_from(request.byte_length).map_err(|_| ApiError::invalid_request())?)
+        .bind(&request.crc32c)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    }
+    let bucket = artifact
+        .storage_bucket
+        .clone()
+        .ok_or_else(ApiError::internal)?;
+    let object_key = artifact.object_key.clone();
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ApiError::internal())?;
+
+    let observed = storage
+        .object_metadata(&bucket, &object_key, request.storage_generation)
+        .await
+        .map_err(|error| match error {
+            ArtifactStorageError::Unavailable
+            | ArtifactStorageError::NotFound
+            | ArtifactStorageError::InvalidResponse => ApiError::artifact_storage_unavailable(),
+        })?;
+    let expected_length =
+        i64::try_from(request.byte_length).map_err(|_| ApiError::invalid_request())?;
+    let verified = observed.bucket == bucket
+        && observed.object_key == object_key
+        && observed.generation == request.storage_generation
+        && observed.byte_length == expected_length
+        && observed.crc32c == request.crc32c
+        && observed.sha256 == request.sha256;
+
+    let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
+    let artifact =
+        artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
+    let evidence_unchanged = artifact.storage_bucket.as_deref() == Some(bucket.as_str())
+        && artifact.object_key == object_key
+        && artifact.storage_generation == Some(request.storage_generation)
+        && artifact.uploaded_byte_length == Some(expected_length)
+        && artifact.uploaded_crc32c.as_deref() == Some(request.crc32c.as_str());
+    if !evidence_unchanged {
+        return Err(ApiError::conflict(
+            "upload_completion_mismatch",
+            "The upload was already completed with different evidence.",
+        ));
+    }
+    if artifact.status == "verified" {
+        consume_completed_upload_session(&mut transaction, artifact_id)
+            .await
+            .map_err(|_| ApiError::internal())?;
         transaction
             .commit()
             .await
             .map_err(|_| ApiError::internal())?;
         return Ok(Json(artifact.try_into()?));
     }
-    attempt_for_worker(&mut transaction, attempt_id, worker_id).await?;
     if artifact.status != "uploading" {
         return Err(ApiError::conflict(
-            "artifact_not_uploading",
-            "The artefact upload has not been started.",
+            "artifact_verification_failed",
+            "The stored object did not match the declared artefact.",
+        ));
+    }
+    if !verified {
+        sqlx::query(
+            "UPDATE job_artifacts SET status = 'rejected', rejected_at = now(), \
+                    state_reason = 'gcs_metadata_mismatch', protection_pending = false, \
+                    verified_storage_generation = NULL, verified_byte_length = NULL, \
+                    verified_crc32c = NULL, verified_sha256 = NULL, verification_source = NULL, \
+                    verified_at = NULL WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::internal())?;
+        cancel_artifact_upload_session(&mut transaction, artifact_id, "artifact_metadata_rejected")
+            .await
+            .map_err(|_| ApiError::internal())?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ApiError::internal())?;
+        let _ = storage
+            .delete_object(&bucket, &object_key, request.storage_generation)
+            .await;
+        reconcile_pending_session_cancellations(pool, &storage).await;
+        return Err(ApiError::conflict(
+            "artifact_verification_failed",
+            "The stored object did not match the declared artefact.",
+        ));
+    }
+    let proof_matches = artifact.verified_storage_generation == Some(observed.generation)
+        && artifact.verified_byte_length == Some(observed.byte_length)
+        && artifact.verified_crc32c.as_deref() == Some(observed.crc32c.as_str())
+        && artifact.verified_sha256.as_deref() == Some(observed.sha256.as_str());
+    if artifact.protection_pending && !proof_matches {
+        return Err(ApiError::conflict(
+            "upload_completion_mismatch",
+            "The upload was already verified with different evidence.",
         ));
     }
     sqlx::query(
-        "UPDATE job_artifacts SET storage_generation = $2, uploaded_byte_length = $3, \
-                uploaded_crc32c = $4, upload_completed_at = now() WHERE id = $1",
+        "UPDATE job_artifacts SET verified_storage_generation = $2, \
+                verified_byte_length = $3, verified_crc32c = $4, verified_sha256 = $5, \
+                verification_source = 'gcs_metadata', verified_at = COALESCE(verified_at, now()), \
+                protection_pending = true, state_reason = 'gcs_protection_pending' \
+         WHERE id = $1",
     )
     .bind(artifact_id)
-    .bind(request.storage_generation)
-    .bind(i64::try_from(request.byte_length).map_err(|_| ApiError::invalid_request())?)
-    .bind(&request.crc32c)
+    .bind(observed.generation)
+    .bind(observed.byte_length)
+    .bind(&observed.crc32c)
+    .bind(&observed.sha256)
     .execute(&mut *transaction)
     .await
     .map_err(|_| ApiError::internal())?;
-    let completed =
+    transaction
+        .commit()
+        .await
+        .map_err(|_| ApiError::internal())?;
+
+    storage
+        .protect_verified_object(&bucket, &object_key, request.storage_generation)
+        .await
+        .map_err(|_| ApiError::artifact_storage_unavailable())?;
+
+    let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
+    let artifact =
+        artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
+    if artifact.status != "verified" {
+        if !artifact.protection_pending
+            || artifact.verified_storage_generation != Some(request.storage_generation)
+        {
+            return Err(ApiError::conflict(
+                "upload_completion_mismatch",
+                "The upload protection state changed.",
+            ));
+        }
+        sqlx::query(
+            "UPDATE job_artifacts SET status = 'verified', protection_pending = false, \
+                    state_reason = NULL WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| ApiError::internal())?;
+        consume_completed_upload_session(&mut transaction, artifact_id)
+            .await
+            .map_err(|_| ApiError::internal())?;
+    }
+    let verified_artifact =
         artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
     transaction
         .commit()
         .await
         .map_err(|_| ApiError::internal())?;
-    Ok(Json(completed.try_into()?))
+    Ok(Json(verified_artifact.try_into()?))
+}
+
+pub(crate) async fn reconcile_pending_protections(
+    pool: &sqlx::PgPool,
+    storage: &crate::artifact_storage::ArtifactStorageClient,
+) -> usize {
+    let pending = match sqlx::query_as::<_, (Uuid, String, String, i64)>(
+        "SELECT id, storage_bucket, object_key, verified_storage_generation \
+         FROM job_artifacts WHERE protection_pending = true AND status = 'uploading' \
+         ORDER BY verified_at LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not load pending artifact protections");
+            return 0;
+        }
+    };
+    let mut completed = 0;
+    for (artifact_id, bucket, object_key, generation) in pending {
+        if storage
+            .protect_verified_object(&bucket, &object_key, generation)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::warn!(%error, %artifact_id, "could not begin artifact publication");
+                continue;
+            }
+        };
+        let published = match sqlx::query(
+            "UPDATE job_artifacts SET status = 'verified', protection_pending = false, \
+                    state_reason = NULL WHERE id = $1 AND status = 'uploading' \
+                    AND protection_pending = true AND verified_storage_generation = $2",
+        )
+        .bind(artifact_id)
+        .bind(generation)
+        .execute(&mut *transaction)
+        .await
+        {
+            Ok(result) => result.rows_affected(),
+            Err(error) => {
+                tracing::warn!(%error, %artifact_id, "could not publish protected artifact");
+                continue;
+            }
+        };
+        if published == 1
+            && let Err(error) =
+                consume_completed_upload_session(&mut transaction, artifact_id).await
+        {
+            tracing::warn!(%error, %artifact_id, "could not consume completed upload session");
+            continue;
+        }
+        match transaction.commit().await {
+            Ok(()) => completed += usize::try_from(published).unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(%error, %artifact_id, "could not commit artifact publication");
+            }
+        }
+    }
+    completed
+}
+
+async fn mark_sessions_for_cancellation(
+    transaction: &mut Transaction<'_, Postgres>,
+    predicate: &str,
+    subject_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    let query = format!(
+        "UPDATE artifact_upload_grants g SET \
+             state = CASE WHEN g.state = 'active' THEN 'cancel_pending' ELSE 'cancelled' END, \
+             cancel_requested_at = now(), cancelled_at = CASE WHEN g.state = 'initiating' THEN now() ELSE NULL END, \
+             cancellation_reason = $2 \
+         FROM job_artifacts a WHERE g.artifact_id = a.id AND {predicate} \
+           AND g.state IN ('initiating', 'active')"
+    );
+    sqlx::query(&query)
+        .bind(subject_id)
+        .bind(reason)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn cancel_artifact_upload_session(
+    transaction: &mut Transaction<'_, Postgres>,
+    artifact_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    mark_sessions_for_cancellation(transaction, "g.artifact_id = $1", artifact_id, reason).await
+}
+
+async fn consume_completed_upload_session(
+    transaction: &mut Transaction<'_, Postgres>,
+    artifact_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE artifact_upload_grants SET state = 'cancelled', session_uri = NULL, \
+                cancel_requested_at = COALESCE(cancel_requested_at, now()), \
+                cancelled_at = now(), cancellation_reason = 'upload_completed' \
+         WHERE artifact_id = $1 AND state = 'active'",
+    )
+    .bind(artifact_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn cancel_worker_upload_sessions(
+    transaction: &mut Transaction<'_, Postgres>,
+    worker_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    mark_sessions_for_cancellation(transaction, "g.worker_id = $1", worker_id, reason).await
+}
+
+pub(crate) async fn cancel_job_upload_sessions(
+    transaction: &mut Transaction<'_, Postgres>,
+    job_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    mark_sessions_for_cancellation(transaction, "a.job_id = $1", job_id, reason).await
+}
+
+pub(crate) async fn cancel_attempt_upload_sessions(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt_id: Uuid,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    mark_sessions_for_cancellation(transaction, "a.attempt_id = $1", attempt_id, reason).await
+}
+
+pub(crate) async fn reconcile_pending_session_cancellations(
+    pool: &sqlx::PgPool,
+    storage: &crate::artifact_storage::ArtifactStorageClient,
+) -> usize {
+    let pending = match sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, session_uri FROM artifact_upload_grants \
+         WHERE state = 'cancel_pending' ORDER BY cancel_requested_at LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "could not load upload sessions pending cancellation");
+            return 0;
+        }
+    };
+    let mut completed = 0;
+    for (grant_id, session_uri) in pending {
+        if storage.cancel_resumable_upload(&session_uri).await.is_err() {
+            continue;
+        }
+        match sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'cancelled', session_uri = NULL, \
+                    cancelled_at = now() WHERE id = $1 AND state = 'cancel_pending' \
+                    AND session_uri = $2",
+        )
+        .bind(grant_id)
+        .bind(&session_uri)
+        .execute(pool)
+        .await
+        {
+            Ok(result) => completed += usize::try_from(result.rows_affected()).unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(%error, %grant_id, "could not consume cancelled session URI");
+            }
+        }
+    }
+    completed
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header::AUTHORIZATION},
@@ -638,22 +1187,139 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tokio::sync::Notify;
     use tower::ServiceExt;
     use uuid::Uuid;
 
     use crate::{
-        app,
+        app, app_with_dependencies,
+        artifact_storage::{
+            ArtifactStorage, ArtifactStorageClient, ArtifactStorageError, ResumableUploadSession,
+            StoredObjectMetadata,
+        },
         credentials::{self, CredentialKind},
     };
 
     use super::{
-        JobOutputRequirement, valid_crc32c, valid_logical_path, validate_output_requirements,
+        JobOutputRequirement, cancel_attempt_upload_sessions, cancel_job_upload_sessions,
+        cancel_worker_upload_sessions, reconcile_pending_protections,
+        reconcile_pending_session_cancellations, valid_crc32c, valid_logical_path,
+        validate_output_requirements,
     };
 
     struct Fixture {
         worker_id: Uuid,
+        job_id: Uuid,
         attempt_id: Uuid,
         credential: String,
+    }
+
+    #[derive(Default)]
+    struct StorageCalls {
+        initiated: AtomicUsize,
+        protected: AtomicUsize,
+        deleted: AtomicUsize,
+        cancelled: AtomicUsize,
+        block_next_initiation: AtomicBool,
+        initiation_started: Notify,
+        release_initiation: Notify,
+    }
+
+    struct FakeArtifactStorage {
+        crc32c: &'static str,
+        bucket: String,
+        calls: Arc<StorageCalls>,
+    }
+
+    #[async_trait]
+    impl ArtifactStorage for FakeArtifactStorage {
+        async fn initiate_resumable_upload(
+            &self,
+            object_key: &str,
+            media_type: &str,
+            byte_length: u64,
+            sha256: &str,
+            issued_at: chrono::DateTime<Utc>,
+        ) -> Result<ResumableUploadSession, ArtifactStorageError> {
+            self.calls.initiated.fetch_add(1, Ordering::SeqCst);
+            let _ = (media_type, byte_length, sha256);
+            if self
+                .calls
+                .block_next_initiation
+                .swap(false, Ordering::SeqCst)
+            {
+                self.calls.initiation_started.notify_one();
+                self.calls.release_initiation.notified().await;
+            }
+            Ok(ResumableUploadSession {
+                uri: format!("https://storage.googleapis.com/upload/session/{object_key}"),
+                method: "PUT".to_owned(),
+                expires_at: issued_at + TimeDelta::days(7),
+            })
+        }
+
+        async fn object_metadata(
+            &self,
+            bucket: &str,
+            object_key: &str,
+            generation: i64,
+        ) -> Result<StoredObjectMetadata, ArtifactStorageError> {
+            Ok(StoredObjectMetadata {
+                bucket: bucket.to_owned(),
+                object_key: object_key.to_owned(),
+                generation,
+                byte_length: 512,
+                crc32c: self.crc32c.to_owned(),
+                sha256: "b".repeat(64),
+            })
+        }
+
+        fn bucket(&self) -> &str {
+            &self.bucket
+        }
+
+        async fn protect_verified_object(
+            &self,
+            _bucket: &str,
+            _object_key: &str,
+            _generation: i64,
+        ) -> Result<(), ArtifactStorageError> {
+            self.calls.protected.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn delete_object(
+            &self,
+            _bucket: &str,
+            _object_key: &str,
+            _generation: i64,
+        ) -> Result<(), ArtifactStorageError> {
+            self.calls.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn cancel_resumable_upload(
+            &self,
+            _session_uri: &str,
+        ) -> Result<(), ArtifactStorageError> {
+            self.calls.cancelled.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn app_with_storage(pool: PgPool, crc32c: &'static str) -> (axum::Router, Arc<StorageCalls>) {
+        let calls = Arc::new(StorageCalls::default());
+        let router = app_with_dependencies(
+            None,
+            Some(pool),
+            None,
+            Some(ArtifactStorageClient::new(FakeArtifactStorage {
+                crc32c,
+                bucket: "test-artifacts".to_owned(),
+                calls: Arc::clone(&calls),
+            })),
+        );
+        (router, calls)
     }
 
     async fn fixture(pool: &PgPool) -> Fixture {
@@ -727,6 +1393,7 @@ mod tests {
         .unwrap();
         Fixture {
             worker_id,
+            job_id,
             attempt_id,
             credential: credential.plaintext.into_string(),
         }
@@ -949,9 +1616,9 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn upload_completion_replays_and_does_not_claim_verification(pool: PgPool) {
+    async fn upload_authority_and_verified_completion_are_replay_safe(pool: PgPool) {
         let fixture = fixture(&pool).await;
-        let router = app(None, Some(pool.clone()));
+        let (router, storage_calls) = app_with_storage(pool.clone(), "ImIEBA==");
         let manifest_uri = format!(
             "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
             fixture.worker_id, fixture.attempt_id
@@ -975,18 +1642,65 @@ mod tests {
             "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
             fixture.worker_id, fixture.attempt_id
         );
-        let started = router
-            .clone()
-            .oneshot(
+        storage_calls
+            .block_next_initiation
+            .store(true, Ordering::SeqCst);
+        let first = tokio::spawn(
+            router.clone().oneshot(
                 Request::put(&upload_uri)
                     .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
                     .header("content-type", "application/json")
                     .body(Body::from(json!({ "protocol_version": "1.1" }).to_string()))
                     .unwrap(),
+            ),
+        );
+        storage_calls.initiation_started.notified().await;
+        let pending = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(pending.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(storage_calls.initiated.load(Ordering::SeqCst), 1);
+        storage_calls.release_initiation.notify_one();
+        let started = first.await.unwrap().unwrap();
         assert_eq!(started.status(), StatusCode::OK);
+        assert_eq!(started.headers()["cache-control"], "no-store");
+        let started = response_json(started).await;
+        assert_eq!(started["artifact"]["status"], "uploading");
+        assert_eq!(started["session"]["method"], "PUT");
+        assert!(
+            started["session"]["uri"]
+                .as_str()
+                .unwrap()
+                .contains("/upload/session/")
+        );
+        let replayed = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::OK);
+        let replayed = response_json(replayed).await;
+        assert_eq!(replayed["session"], started["session"]);
+        let grant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_upload_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(grant_count, 1);
+        assert_eq!(storage_calls.initiated.load(Ordering::SeqCst), 1);
 
         let completion_uri = format!(
             "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/complete-upload",
@@ -1014,14 +1728,59 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let body = response_json(response).await;
-            assert_eq!(body["status"], "uploading");
-            assert_eq!(body["verification_pending"], true);
+            assert_eq!(body["status"], "verified");
+            assert_eq!(body["verification_pending"], false);
             if let Some(first) = &first_body {
                 assert_eq!(&body, first);
             } else {
                 first_body = Some(body);
             }
         }
+
+        // A crash after durable verification but before publishing the row leaves recoverable work,
+        // including the still-reachable upload session.
+        let mut recovery = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE job_artifacts SET status = 'uploading', protection_pending = true, \
+                    state_reason = 'gcs_protection_pending' WHERE id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&mut *recovery)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'active', session_uri = $2, \
+                    activated_at = now(), cancel_requested_at = NULL, cancelled_at = NULL, \
+                    cancellation_reason = NULL WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind("https://storage.googleapis.com/upload/session/protection-recovery")
+        .execute(&mut *recovery)
+        .await
+        .unwrap();
+        recovery.commit().await.unwrap();
+        let recovery_storage = ArtifactStorageClient::new(FakeArtifactStorage {
+            crc32c: "ImIEBA==",
+            bucket: "test-artifacts".to_owned(),
+            calls: storage_calls.clone(),
+        });
+        assert_eq!(
+            reconcile_pending_protections(&pool, &recovery_storage).await,
+            1
+        );
+        let recovered: (String, bool, String, Option<String>) = sqlx::query_as(
+            "SELECT a.status, a.protection_pending, g.state, g.session_uri \
+             FROM job_artifacts a JOIN artifact_upload_grants g ON g.artifact_id = a.id \
+             WHERE a.id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered,
+            ("verified".to_owned(), false, "cancelled".to_owned(), None)
+        );
 
         let mut conflicting = completion.clone();
         conflicting["storage_generation"] = json!(43);
@@ -1049,39 +1808,6 @@ mod tests {
             "stderr": "",
             "failure_message": null
         });
-        let blocked = router
-            .clone()
-            .oneshot(
-                Request::put(&result_uri)
-                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
-                    .header("content-type", "application/json")
-                    .body(Body::from(result.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(blocked.status(), StatusCode::CONFLICT);
-        let blocked = response_json(blocked).await;
-        assert_eq!(blocked["code"], "artifacts_incomplete");
-
-        let unverifiable = sqlx::query(
-            "UPDATE job_artifacts SET status = 'verified', verified_at = now() WHERE id = $1",
-        )
-        .bind(artifact_id)
-        .execute(&pool)
-        .await;
-        assert!(unverifiable.is_err());
-        sqlx::query(
-            "UPDATE job_artifacts SET status = 'verified', verified_at = now(), \
-                    verified_storage_generation = storage_generation, \
-                    verified_byte_length = uploaded_byte_length, \
-                    verified_crc32c = uploaded_crc32c, verification_source = 'gcs_metadata' \
-             WHERE id = $1",
-        )
-        .bind(artifact_id)
-        .execute(&pool)
-        .await
-        .unwrap();
         let accepted = router
             .clone()
             .oneshot(
@@ -1097,6 +1823,18 @@ mod tests {
         let accepted = response_json(accepted).await;
         assert_eq!(accepted["status"], "succeeded");
 
+        // A replay also repairs a legacy/partial verified row with a reachable session.
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'active', session_uri = $2, \
+                    activated_at = now(), cancel_requested_at = NULL, cancelled_at = NULL, \
+                    cancellation_reason = NULL WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind("https://storage.googleapis.com/upload/session/replay-recovery")
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let replayed_after_terminal = router
             .oneshot(
                 Request::put(&completion_uri)
@@ -1110,5 +1848,344 @@ mod tests {
         assert_eq!(replayed_after_terminal.status(), StatusCode::OK);
         let replayed_after_terminal = response_json(replayed_after_terminal).await;
         assert_eq!(replayed_after_terminal["status"], "verified");
+        let replay_grant: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, session_uri FROM artifact_upload_grants WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_grant, ("cancelled".to_owned(), None));
+        assert_eq!(storage_calls.protected.load(Ordering::SeqCst), 2);
+        assert_eq!(storage_calls.deleted.load(Ordering::SeqCst), 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upload_session_denies_revoked_workers_and_closed_jobs(pool: PgPool) {
+        for cancel_job in [false, true] {
+            let fixture = fixture(&pool).await;
+            let (router, storage_calls) = app_with_storage(pool.clone(), "ImIEBA==");
+            let declared = router
+                .clone()
+                .oneshot(
+                    Request::put(format!(
+                        "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+                        fixture.worker_id, fixture.attempt_id
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(declared.status(), StatusCode::OK);
+            let declared = response_json(declared).await;
+            let artifact_id =
+                Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+
+            if cancel_job {
+                sqlx::query(
+                    "UPDATE jobs SET status = 'cancelled', cancel_requested_at = now(), \
+                            finished_at = now() WHERE id = $1",
+                )
+                .bind(fixture.job_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE worker_credentials SET revoked_at = now() WHERE worker_id = $1",
+                )
+                .bind(fixture.worker_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+
+            let denied = router
+                .oneshot(
+                    Request::put(format!(
+                        "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
+                        fixture.worker_id, fixture.attempt_id
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                denied.status(),
+                if cancel_job {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+            assert_eq!(storage_calls.initiated.load(Ordering::SeqCst), 0);
+        }
+        let grant_count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_upload_grants")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(grant_count, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn crash_before_session_commit_does_not_fan_out_initiation(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let calls = Arc::new(StorageCalls::default());
+        let storage = ArtifactStorageClient::new(FakeArtifactStorage {
+            crc32c: "ImIEBA==",
+            bucket: "test-artifacts".to_owned(),
+            calls: calls.clone(),
+        });
+        let router = app_with_dependencies(None, Some(pool.clone()), None, Some(storage.clone()));
+        let declared = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+                    fixture.worker_id, fixture.attempt_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                .header("content-type", "application/json")
+                .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let declared = response_json(declared).await;
+        let artifact_id =
+            Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+        let object_key = declared["artifacts"][0]["object_key"].as_str().unwrap();
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO artifact_upload_grants \
+             (id, artifact_id, worker_id, bucket_name, object_key, state, initiation_id, issued_at, expires_at) \
+             VALUES ($1, $2, $3, 'test-artifacts', $4, 'initiating', $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(artifact_id)
+        .bind(fixture.worker_id)
+        .bind(object_key)
+        .bind(Uuid::new_v4())
+        .bind(now)
+        .bind(now + TimeDelta::minutes(15))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // GCS returned a session, then the process died before recording it. The durable initiating
+        // row makes the URI unreachable to a worker and suppresses retries until the grace expires.
+        let _orphaned = storage
+            .initiate_resumable_upload(
+                object_key,
+                "application/octet-stream",
+                512,
+                &"b".repeat(64),
+                now,
+            )
+            .await
+            .unwrap();
+        let upload_uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
+            fixture.worker_id, fixture.attempt_id
+        );
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::put(&upload_uri)
+                        .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(calls.initiated.load(Ordering::SeqCst), 1);
+        let state: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, session_uri FROM artifact_upload_grants WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("initiating".to_owned(), None));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn authority_endings_cancel_and_consume_reachable_sessions(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let (router, calls) = app_with_storage(pool.clone(), "ImIEBA==");
+        let declared = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+                    fixture.worker_id, fixture.attempt_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                .header("content-type", "application/json")
+                .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let declared = response_json(declared).await;
+        let artifact_id =
+            Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+        let upload_uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let started = router
+            .oneshot(
+                Request::put(upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let storage = ArtifactStorageClient::new(FakeArtifactStorage {
+            crc32c: "ImIEBA==",
+            bucket: "test-artifacts".to_owned(),
+            calls: calls.clone(),
+        });
+        for scope in 0..3 {
+            if scope > 0 {
+                sqlx::query(
+                    "UPDATE artifact_upload_grants SET state = 'active', \
+                            session_uri = $2, activated_at = now(), cancel_requested_at = NULL, \
+                            cancelled_at = NULL, cancellation_reason = NULL WHERE artifact_id = $1",
+                )
+                .bind(artifact_id)
+                .bind(format!(
+                    "https://storage.googleapis.com/upload/session/retry-{scope}"
+                ))
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let mut transaction = pool.begin().await.unwrap();
+            match scope {
+                0 => cancel_worker_upload_sessions(&mut transaction, fixture.worker_id, "revoked")
+                    .await
+                    .unwrap(),
+                1 => cancel_job_upload_sessions(&mut transaction, fixture.job_id, "cancelled")
+                    .await
+                    .unwrap(),
+                _ => cancel_attempt_upload_sessions(
+                    &mut transaction,
+                    fixture.attempt_id,
+                    "lease_expired",
+                )
+                .await
+                .unwrap(),
+            }
+            transaction.commit().await.unwrap();
+            assert_eq!(
+                reconcile_pending_session_cancellations(&pool, &storage).await,
+                1
+            );
+            let grant: (String, Option<String>) = sqlx::query_as(
+                "SELECT state, session_uri FROM artifact_upload_grants WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(grant, ("cancelled".to_owned(), None));
+        }
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn authoritative_metadata_mismatch_rejects_artifact(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let (router, storage_calls) = app_with_storage(pool.clone(), "AAAAAA==");
+        let manifest_uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let declared = router
+            .clone()
+            .oneshot(
+                Request::put(manifest_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(manifest_body(Uuid::new_v4()).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let declared = response_json(declared).await;
+        let artifact_id =
+            Uuid::parse_str(declared["artifacts"][0]["artifact_id"].as_str().unwrap()).unwrap();
+        let base = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let started = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base}/upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+
+        let rejected = router
+            .oneshot(
+                Request::put(format!("{base}/complete-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.1",
+                            "storage_generation": 42,
+                            "byte_length": 512,
+                            "sha256": "b".repeat(64),
+                            "crc32c": "ImIEBA=="
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected = response_json(rejected).await;
+        assert_eq!(rejected["code"], "artifact_verification_failed");
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT status, state_reason FROM job_artifacts WHERE id = $1")
+                .bind(artifact_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, "rejected");
+        assert_eq!(stored.1.as_deref(), Some("gcs_metadata_mismatch"));
+        assert_eq!(storage_calls.protected.load(Ordering::SeqCst), 0);
+        assert_eq!(storage_calls.deleted.load(Ordering::SeqCst), 1);
+        assert_eq!(storage_calls.cancelled.load(Ordering::SeqCst), 1);
+        let grant: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, session_uri FROM artifact_upload_grants WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grant, ("cancelled".to_owned(), None));
     }
 }

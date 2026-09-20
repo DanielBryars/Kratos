@@ -15,6 +15,7 @@ use utoipa::{
 };
 use utoipa_swagger_ui::SwaggerUi;
 
+pub mod artifact_storage;
 mod artifacts;
 pub mod credentials;
 pub mod database;
@@ -23,9 +24,11 @@ pub mod migration;
 mod operator;
 mod registry;
 
+use artifact_storage::{ArtifactStorageClient, ResumableUploadSession};
 use artifacts::{
     ArtifactManifestFile, ArtifactManifestResponse, ArtifactResponse, BeginArtifactUploadRequest,
-    CompleteArtifactUploadRequest, DeclareArtifactManifestRequest, JobOutputRequirement,
+    BeginArtifactUploadResponse, CompleteArtifactUploadRequest, DeclareArtifactManifestRequest,
+    JobOutputRequirement,
 };
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
@@ -62,6 +65,7 @@ pub struct ReadinessResponse {
 pub(crate) struct AppState {
     pub(crate) database: Option<PgPool>,
     pub(crate) human_auth: Option<HumanAuth>,
+    pub(crate) artifact_storage: Option<ArtifactStorageClient>,
     pub(crate) verification_gate: VerificationGate,
 }
 
@@ -104,7 +108,8 @@ pub(crate) struct AppState {
         WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
-        ArtifactResponse, ArtifactManifestResponse
+        ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
+        ResumableUploadSession
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -241,6 +246,15 @@ pub fn app_with_human_auth(
     database: Option<PgPool>,
     human_auth: Option<HumanAuth>,
 ) -> Router {
+    app_with_dependencies(web_root, database, human_auth, None)
+}
+
+pub fn app_with_dependencies(
+    web_root: Option<PathBuf>,
+    database: Option<PgPool>,
+    human_auth: Option<HumanAuth>,
+    artifact_storage: Option<ArtifactStorageClient>,
+) -> Router {
     let router = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
@@ -320,6 +334,7 @@ pub fn app_with_human_auth(
         .with_state(AppState {
             database,
             human_auth,
+            artifact_storage,
             verification_gate: VerificationGate::default(),
         });
 
@@ -329,6 +344,16 @@ pub fn app_with_human_auth(
     } else {
         router
     }
+}
+
+/// Reconciles durable storage-protection work left by interrupted upload finalization.
+pub async fn reconcile_artifact_protections(
+    pool: &PgPool,
+    storage: &ArtifactStorageClient,
+) -> usize {
+    let protected = artifacts::reconcile_pending_protections(pool, storage).await;
+    let cancelled = artifacts::reconcile_pending_session_cancellations(pool, storage).await;
+    protected + cancelled
 }
 
 #[cfg(test)]

@@ -5,12 +5,14 @@ resource "google_project_service" "platform" {
     "compute.googleapis.com",
     "iam.googleapis.com",
     "identitytoolkit.googleapis.com",
+    "iamcredentials.googleapis.com",
     "logging.googleapis.com",
     "monitoring.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "serviceusage.googleapis.com",
     "sqladmin.googleapis.com",
+    "storage.googleapis.com",
   ])
 
   project            = var.project_id
@@ -51,6 +53,65 @@ resource "google_service_account" "database_migration" {
   display_name = "Kratos database migration"
 
   depends_on = [google_project_service.platform]
+}
+
+resource "google_service_account" "artifact_upload_signer" {
+  project      = var.project_id
+  account_id   = "kratos-artifact-upload"
+  display_name = "Kratos artifact upload URL signer"
+
+  depends_on = [google_project_service.platform]
+}
+
+resource "google_storage_bucket" "artifacts" {
+  project                     = var.project_id
+  name                        = "${var.project_id}-kratos-artifacts"
+  location                    = var.region
+  uniform_bucket_level_access = true
+  public_access_prevention    = "enforced"
+  force_destroy               = false
+
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["v1/owners/"]
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
+  depends_on = [google_project_service.platform]
+}
+
+resource "google_storage_bucket_iam_member" "artifact_upload_create" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.artifact_upload_signer.email}"
+}
+
+resource "google_project_iam_custom_role" "artifact_metadata_manager" {
+  project     = var.project_id
+  role_id     = "kratosArtifactVerifier"
+  title       = "Kratos artifact verifier"
+  description = "Read, protect, and clean exact artifact objects after upload."
+  permissions = [
+    "storage.objects.delete",
+    "storage.objects.get",
+    "storage.objects.update",
+  ]
+}
+
+resource "google_storage_bucket_iam_member" "artifact_metadata_manage" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = google_project_iam_custom_role.artifact_metadata_manager.name
+  member = "serviceAccount:${google_service_account.control_plane.email}"
+}
+
+resource "google_service_account_iam_member" "control_plane_sign_artifact_upload" {
+  service_account_id = google_service_account.artifact_upload_signer.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
 resource "google_sql_database_instance" "kratos" {
