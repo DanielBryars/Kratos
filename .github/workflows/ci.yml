@@ -125,6 +125,23 @@ jobs:
       - run: uv run --python 3.12 mypy train.py tests
       - run: uv run --python 3.12 pytest
 
+  soak-workload:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/soak-workload
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.19"
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - run: uv run --python 3.12 ruff format --check .
+      - run: uv run --python 3.12 ruff check .
+      - run: uv run --python 3.12 mypy soak.py tests
+      - run: uv run --python 3.12 pytest
+
   observability:
     runs-on: ubuntu-latest
     env:
@@ -205,3 +222,11 @@ jobs:
           tags: kratos-training-example:ci
           cache-from: type=gha,scope=training-example
           cache-to: type=gha,mode=max,scope=training-example
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: workers/soak-workload/Dockerfile
+          push: false
+          tags: kratos-soak-workload:ci
+          cache-from: type=gha,scope=soak-workload
+          cache-to: type=gha,mode=max,scope=soak-workload
