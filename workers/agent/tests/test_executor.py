@@ -182,3 +182,11 @@ def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
     assert options["cap_drop"] == ["ALL"]
     assert options["device_requests"][0].device_ids == ["0"]
     assert options["labels"]["com.kratos.role"] == "job"
+    assert options["environment"] == {
+        "KRATOS_JOB_ID": "22222222-2222-4222-8222-222222222222",
+        "KRATOS_ATTEMPT_ID": "11111111-1111-4111-8111-111111111111",
+        "OTEL_RESOURCE_ATTRIBUTES": (
+            "kratos.job.id=22222222-2222-4222-8222-222222222222,"
+            "kratos.attempt.id=11111111-1111-4111-8111-111111111111"
+        ),
+    }

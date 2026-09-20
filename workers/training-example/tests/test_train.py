@@ -30,6 +30,57 @@ def test_cuda_is_required_without_cpu_fallback(monkeypatch: pytest.MonkeyPatch) 
         train.require_cuda()
 
 
+def test_run_identity_is_validated_and_exposes_correlation_attributes() -> None:
+    identity = train.load_run_identity(
+        {
+            "KRATOS_JOB_ID": "22222222-2222-4222-8222-222222222222",
+            "KRATOS_ATTEMPT_ID": "11111111-1111-4111-8111-111111111111",
+        }
+    )
+
+    assert identity.result_fields() == {
+        "job_id": "22222222-2222-4222-8222-222222222222",
+        "attempt_id": "11111111-1111-4111-8111-111111111111",
+    }
+    assert identity.otel_resource_attributes() == {
+        "kratos.job.id": "22222222-2222-4222-8222-222222222222",
+        "kratos.attempt.id": "11111111-1111-4111-8111-111111111111",
+    }
+
+
+@pytest.mark.parametrize(
+    "environment, message",
+    [
+        ({}, "required run identity is missing"),
+        (
+            {"KRATOS_JOB_ID": "not-a-uuid", "KRATOS_ATTEMPT_ID": "also-not-a-uuid"},
+            "must be valid UUIDs",
+        ),
+    ],
+)
+def test_invalid_run_identity_fails_clearly(environment: dict[str, str], message: str) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        train.load_run_identity(environment)
+
+
+def test_failure_result_preserves_valid_run_identity() -> None:
+    failure = train.failure_result(
+        RuntimeError("training failed"),
+        {
+            "KRATOS_JOB_ID": "22222222-2222-4222-8222-222222222222",
+            "KRATOS_ATTEMPT_ID": "11111111-1111-4111-8111-111111111111",
+        },
+    )
+
+    assert failure["run"] == {
+        "job_id": "22222222-2222-4222-8222-222222222222",
+        "attempt_id": "11111111-1111-4111-8111-111111111111",
+    }
+    assert failure["telemetry"]["resource_attributes"]["kratos.attempt.id"] == (
+        "11111111-1111-4111-8111-111111111111"
+    )
+
+
 def test_structured_result_is_compact_and_stable() -> None:
     encoded = train.encode_result({"status": "succeeded", "schema_version": "1.0"})
     assert len(encoded.encode()) <= train.OUTPUT_LIMIT_BYTES
