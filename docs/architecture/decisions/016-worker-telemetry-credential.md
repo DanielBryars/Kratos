@@ -79,10 +79,29 @@ waiting when attempt B begins, at which point the only token available names B, 
 either misattributed to B or refused. Once A has ended, no token naming A is ever issued again, so
 that queue can never drain. It would have worked on an idle worker and failed on a busy one.
 
-The control plane SHALL therefore include every stream the worker currently holds **and** every
-stream whose attempt ended within a bounded recent window, which SHALL be at least as long as the
-collector's queue can plausibly hold data. The set SHALL be bounded, and a worker with no current
-attempt and nothing recent SHALL receive no telemetry token at all.
+The control plane SHALL therefore include every stream the worker currently holds **and** the
+most recently ended ones, bounded by **both** a count and an age:
+
+| Bound | Value | Why this one binds |
+|---|---|---|
+| Streams named in a token | at most **16** | Binds when attempts are short and numerous |
+| Age of an ended attempt | at most **24 hours** | Binds when attempts are long and few |
+
+Whichever is smaller applies. A worker with no current attempt and nothing inside those bounds
+SHALL receive no telemetry token at all.
+
+**The count exists because the collector's queue is capacity-bounded, not age-bounded.** A
+persistent queue holds a number of batches; it has no notion of how old they are, so "as long as
+the queue might hold data" is not a duration anyone can compute. A worker running many short
+attempts can therefore have data from far more streams in its queue than a worker running one long
+one, and an age bound alone would have silently stopped covering it. The count is what makes the
+rule hold at both ends.
+
+**The queue SHALL be sized to fit the bound, not the other way round.** ADR-015 caps a worker at
+64 MiB of forwarded bytes per attempt, so a queue capacity above sixteen attempts' worth can hold
+records this token can never authorise. The deployment SHALL configure the collector's queue
+capacity below that, and SHALL treat the two numbers as one decision: raising the queue without
+raising the count reintroduces exactly the undrainable queue this section exists to prevent.
 
 This has a property worth stating plainly: **no old token ever needs to be retained.** Whatever
 token is current authorises the whole of what the queue may still hold, so a retry after a restart
@@ -123,8 +142,28 @@ that will one day not reach it.
 
 **A batch SHALL carry records for exactly one stream.** One authorisation decision covers one
 request, so a request mixing streams could be neither accepted nor refused as a whole. The
-collector's batching SHALL be keyed so that this holds, and the gateway SHALL refuse a request
-whose records do not agree on their stream.
+collector's batching SHALL be keyed so that this holds.
+
+**The check itself needs a component that does not exist yet, and this decision names it rather
+than implying one.** The `oidc` authenticator validates a token and `attributes/from_context`
+copies claims onto data; neither compares a claim against the stream inside an OTLP request, and
+assuming they did was an error in an earlier draft of this decision.
+
+A **telemetry admission service** SHALL sit in front of the gateway's OTLP receiver and perform,
+per request: verification of the token against the published keys; extraction of the stream the
+request's records carry; refusal unless all records agree on one stream; and refusal unless that
+stream is in `kratos.streams`. Only then does it forward to the collector, whose receiver SHALL be
+bound so that nothing can reach it except through this service.
+
+It SHALL refuse with an HTTP status the sender's exporter treats as retryable or permanent as
+appropriate, and SHALL NOT acknowledge a request it refused. That is the property the whole
+arrangement rests on: an unacknowledged push stays in the worker's queue, so a refusal caused by a
+stream that has aged out of the token is visible as a retry that keeps failing rather than as data
+that quietly vanished.
+
+It is a small service and it holds no state. It is, however, ours to write and operate, and that
+cost belongs in this decision rather than in the surprise of discovering the Collector will not do
+it.
 
 **Identity SHALL be derived from the validated claims, never from what the worker sent.** The
 gateway SHALL overwrite the worker and project resource attributes on every accepted request
@@ -238,6 +277,8 @@ storing it.
 | A token scoped only to the worker | Simpler to mint, but it authorises writing to any stream, including another attempt's. Identity is not scope. |
 | A token scoped to one stream | What the first version decided. Unimplementable against a durable queue that outlives its attempt: telemetry for a finished attempt is either misattributed to the current one or refused, and once that attempt ends no token naming it is issued again, so the queue can never drain. Found in review. |
 | Retaining each stream's token until its queue drains | Removes the set, but the agent cannot know when the collector's queue has drained — that is the collector's business by ADR-015 — so it would hold credentials indefinitely for work that finished. |
+| Stock `oidc` plus `attributes/from_context` for the stream check | What an earlier draft assumed. Those authenticate a token and copy claims onto data; neither compares a claim against the stream inside a request, so the scope would have been documented and unenforced. |
+| An age bound alone on the stream set | Simpler, and wrong for a worker running many short attempts: a persistent queue is bounded by capacity rather than age, so the number of streams it can hold is not a function of time. |
 | A revocation list the gateway polls | Gains faster revocation than expiry alone, but it is still a cache with a staleness window, and it adds an endpoint, a poller and a failure mode for a token that grants only ingestion. |
 
 ## Consequences
@@ -253,9 +294,12 @@ storing it.
   loopback proxy process to run and supervise. That proxy is new code on the worker, and it is the
   real cost of this decision: it must be small, must add no state, and must pass the gateway's
   answer back unchanged.
-- The gateway's configuration gains an authenticator and a resource processor that overwrites
-  identity from claims. Both are Collector features rather than bespoke code, but the second is
-  what makes the scope enforceable, so it is not optional.
+- The gateway gains a **telemetry admission service** in front of its OTLP receiver. This is
+  bespoke code we write and operate, not Collector configuration, because no stock component
+  compares a claim against the stream inside a request. It is the single largest cost of this
+  decision and the one most likely to be underestimated.
+- The collector's queue capacity and the stream count stop being independent knobs. Raising one
+  without the other reintroduces an undrainable queue.
 - ADR-015's OTLP sink becomes implementable, and its second cursor stops being theoretical.
 - A revoked worker retains ingestion for up to fifteen minutes, as set out above.
 - A worker may write to a recently finished attempt's stream as well as its current one. That is
@@ -265,8 +309,10 @@ storing it.
 
 ## Deliberately deferred
 
-This decision does not define the worker-local collector's own configuration, its queue sizing, the
-loopback proxy's implementation, or how the agent supervises either; nor per-tenant ingestion quotas at the gateway, which the
+This decision does not define the worker-local collector's own configuration, the loopback proxy's
+or the admission service's implementation, or how either is supervised. It fixes the queue capacity
+*relative to* the stream count without choosing the absolute numbers, which belong with the
+collector's configuration; nor per-tenant ingestion quotas at the gateway, which the
 `kratos.project` claim makes possible but which need their own limits; nor how the gateway's
 authenticator is configured in Terraform, which follows once the shape here is accepted.
 
