@@ -61,6 +61,22 @@ A record SHALL NOT carry labels or dimensions in version 1. A workload MAY repea
 attempt identifiers it was given, as the training example does, but the agent SHALL ignore them as
 identity.
 
+### The observation stream is the correlation key
+
+`observation_stream_id` is the normative cross-system correlation key for a run's telemetry. It is
+allocated by the control plane with the attempt, before anything is exported, so every observation
+carries it from the first record. The MLflow run identifier is **not** a correlation key: it does
+not exist when the earliest telemetry is exported, and making it one would either reintroduce a
+synchronous dependency on MLflow or leave early records unattributable.
+
+This amends [ADR-009](009-observability-and-mlflow.md) and MON-018, which name the MLflow run
+identifier among the identifiers telemetry carries. Where they do, read `observation_stream_id`.
+The MLflow run identifier remains recorded **against** the stream, so a view resolves a run in one
+lookup in either direction, and MLflow's own records continue to carry the Kratos job, attempt and
+stream identifiers as tags. Telemetry exported before the run exists therefore resolves to it as
+soon as the outbox worker records the mapping, with no gap and nothing to backfill. A deployment
+SHALL NOT treat the absence of an MLflow run identifier on a record as an error.
+
 ### The trusted agent reads, bounds, stamps and forwards
 
 While it supervises a container, the agent SHALL follow the container's stdout and stderr through
@@ -70,9 +86,28 @@ workload cannot stall on a full pipe or fill the host disk, and SHALL hand lines
 bounded reader and export queue. Deadline enforcement, the lease and the result report SHALL NOT
 wait on any telemetry work, and a telemetry failure SHALL NOT raise into supervision.
 
-The agent SHALL apply documented limits before forwarding: the line length above, a maximum record
-and log-line rate, a maximum number of distinct metric and parameter names per attempt, and a total
-byte budget per attempt. On exhaustion it SHALL drop diagnostic data rather than block. It SHALL
+The agent SHALL apply these limits before forwarding. They are the initial v1 profile and are
+configurable downwards by deployment policy:
+
+| Limit | Value |
+|---|---|
+| Line length, including its newline | 8 KiB |
+| Kratos records accepted | 20 per second, burst 100, per attempt |
+| Log lines forwarded | 200 per second, burst 1000, per attempt |
+| Distinct metric names | 100 per attempt |
+| Distinct parameter names | 200 per attempt |
+| Total forwarded bytes | 64 MiB per attempt |
+| `schema_version` accepted | exactly the string `"1.0"` |
+| `progress.total_steps` | integer in `[0, 2^53)`, and at least `step` |
+
+The initial metric-name allowlist is the supported workloads' own names: `train.loss`,
+`train.accuracy`, `validation.loss`, `validation.accuracy`, `throughput.steps_per_second` and
+`gpu.memory.peak_bytes`. A name outside the allowlist SHALL be forwarded to MLflow, which is a
+per-run store and therefore unbounded by cardinality, and SHALL NOT become an OpenTelemetry metric;
+it SHALL be counted as `dropped.metric_name_not_allowed`. Extending the allowlist is a deployment
+configuration change, so a new workload cannot expand metric cardinality on its own.
+
+On exhaustion the agent SHALL drop diagnostic data rather than block. It SHALL
 count what it dropped by reason — rate, budget, name limit, malformed, oversize — and SHALL report
 those counters with the attempt so a gap is visible as a number rather than as silence. Those
 counters are execution evidence: they SHALL survive queue exhaustion and accompany the job result
@@ -87,12 +122,25 @@ Delivery is ordered by an agent-assigned sequence, not by timestamp, because con
 can repeat and are not a cursor. The agent SHALL number every forwarded record within an attempt
 with a monotonic sequence starting at one, SHALL group records into batches with a durable batch
 identifier, and SHALL persist the batch and its sequence range in its protected state before
-sending. A sink SHALL acknowledge a batch identifier, and the agent SHALL advance a durable
-acknowledged high-water mark only on acknowledgement, updating that cursor atomically with the
-spool. After a restart it SHALL resume from the high-water mark. Replaying a batch SHALL be
-harmless: a sink SHALL be idempotent on attempt and sequence. Where retention or a bounded spool
-has discarded records below the mark, the agent SHALL report the missing sequence range explicitly
-as a gap rather than leave the absence to be inferred.
+sending.
+
+The two sinks are independent and SHALL have **their own durable cursor**. One acknowledged
+high-water mark cannot represent both: the collector and the control plane acknowledge at different
+times and fail independently, so a single mark either advances past records one sink never received
+or replays records the other already holds. Each sink therefore has its own cursor, advanced only
+on that sink's acknowledgement and updated atomically with the spool. A record SHALL be retained
+until **every** sink's cursor has passed it. After a restart each path resumes from its own cursor.
+
+Replaying a batch SHALL be harmless, and each sink SHALL define how: the control plane SHALL be
+idempotent on stream and sequence; OpenTelemetry has no such guarantee, so the agent SHALL make
+each exported record's identity deterministic from the stream and sequence, and a deployment SHALL
+treat duplicate delivery of a log or metric point with the same stream and sequence as the same
+record rather than a second observation.
+
+Loss is possible **above** a cursor, not below it: records below every cursor have been
+acknowledged and are safe to discard, while a bounded spool that overflows discards records that no
+sink has taken yet. When that happens the agent SHALL report the missing sequence range explicitly
+as a gap, per sink, rather than leave the absence to be inferred.
 
 The agent SHALL report the **last** `result` record as the job's structured result, within the
 existing 64 KiB bound, instead of the first 64 KiB of stdout.
@@ -133,8 +181,8 @@ identifiers, by the agent's fan-out rather than by the workload.
 
 Telemetry SHALL NOT start, stop, fail or extend a job. Loss of the collector, gateway, control plane
 or MLflow SHALL NOT interrupt supervision or lease enforcement. The agent SHALL keep undelivered
-records in a bounded spool in its protected state directory and replay them from the acknowledged
-high-water mark when the link returns. On exhaustion it SHALL drop the oldest diagnostic records
+records in a bounded spool in its protected state directory and replay them from each sink's own
+cursor when the link returns. On exhaustion it SHALL drop the oldest diagnostic records
 first, never the job result and never the drop counters or the resulting gap report, and the loss
 SHALL be visible in the run view. Durable replay across long outages remains R0.4 scope.
 
@@ -160,10 +208,14 @@ SHALL be visible in the run view. Durable replay across long outages remains R0.
 - The agent gains a parser for untrusted input. It must be bounded, must never raise into
   supervision, and needs the same adversarial testing as the output manifest builder.
 - The agent gains durable per-attempt telemetry state: a spool, batch identifiers and an
-  acknowledged high-water mark, all of which must survive restart alongside the execution
+  a durable cursor per sink, all of which must survive restart alongside the execution
   authority it already persists.
 - The worker-local collector becomes a prerequisite for this decision rather than a later
   refinement, which brings ADR-009's scoped worker telemetry credential onto the critical path.
+- ADR-009 and MON-018 are amended: the normative correlation key is `observation_stream_id`, not
+  the MLflow run identifier. Those documents SHOULD be updated in place when this is accepted.
+- The agent holds one durable cursor per sink rather than one overall, and retains a record until
+  every cursor has passed it, so the spool is sized by the slowest sink rather than the fastest.
 - Stdout becomes a contract. Human-readable output belongs on stderr, and the result-extraction
   change must ship with the first record-aware agent.
 - Spans from inside a workload are not supported. Traces cover the control plane and agent only.
@@ -178,9 +230,9 @@ SHALL be visible in the run view. Durable replay across long outages remains R0.
 How the gateway authenticates a worker, which ADR-009 requires to be scoped and revocable, needs its
 own decision; a short-lived token issued by the control plane and verified by the collector is the
 expected direction. Because the worker-local collector is now a prerequisite, that decision blocks
-implementation of this one. This ADR does not define MLflow artefact or model registration, which SHALL
-reference verified ADR-014 artefacts; labelled metrics; workload spans; or the worker-local
-collector's configuration.
+implementation of this one. This ADR does not define MLflow artefact or model registration,
+which SHALL reference verified ADR-014 artefacts; labelled metrics; workload spans; or the
+worker-local collector's configuration.
 
 ## Conditions for reconsideration
 
