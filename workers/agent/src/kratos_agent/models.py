@@ -7,7 +7,12 @@ from uuid import UUID
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
-PROTOCOL_VERSION = "1.0"
+# 1.1 adds the durable output extension. The agent advertises it only when it can collect and
+# upload outputs, because the control plane withholds jobs with output requirements from 1.0.
+PROTOCOL_VERSION = "1.1"
+# What an agent advertises when it cannot deliver durable outputs. The control plane never
+# assigns a job with output requirements to a 1.0 worker, which is the point.
+PROTOCOL_VERSION_WITHOUT_OUTPUTS = "1.0"
 MAX_OUTPUT_FILES = 100
 MAX_OUTPUT_FILE_BYTES = 5 * 1024**3
 MAX_OUTPUT_TOTAL_BYTES = 10 * 1024**3
@@ -234,3 +239,60 @@ class ArtifactManifestFile(StrictModel):
     byte_length: int = Field(ge=0, le=MAX_OUTPUT_FILE_BYTES)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{5}[AQgw]==$")
+
+
+class DeclareArtifactManifestRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[1-9][0-9]*$")
+    manifest_id: UUID
+    files: tuple[ArtifactManifestFile, ...] = Field(max_length=MAX_OUTPUT_FILES)
+
+
+class ArtifactResponse(StrictModel):
+    artifact_id: UUID
+    logical_path: LogicalPath
+    role: str
+    media_type: str
+    mandatory: bool
+    byte_length: int = Field(ge=0, le=MAX_OUTPUT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{5}[AQgw]==$")
+    object_key: str
+    status: str
+    storage_generation: int | None = None
+    upload_started_at: datetime | None = None
+    upload_completed_at: datetime | None = None
+    verification_pending: bool
+
+
+class ArtifactManifestResponse(StrictModel):
+    manifest_id: UUID
+    attempt_id: UUID
+    artifacts: tuple[ArtifactResponse, ...]
+
+
+class ResumableUploadSession(StrictModel):
+    uri: str = Field(repr=False)
+    method: str
+    expires_at: datetime
+
+
+class BeginArtifactUploadRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[1-9][0-9]*$")
+
+
+class BeginArtifactUploadResponse(StrictModel):
+    artifact: ArtifactResponse
+    session: ResumableUploadSession
+
+
+class CompleteArtifactUploadRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[1-9][0-9]*$")
+    storage_generation: int
+    byte_length: int = Field(ge=0, le=MAX_OUTPUT_FILE_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{5}[AQgw]==$")
+
+
+class AbandonArtifactUploadRequest(StrictModel):
+    protocol_version: str = Field(pattern=r"^1\.[1-9][0-9]*$")
+    session_uri_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

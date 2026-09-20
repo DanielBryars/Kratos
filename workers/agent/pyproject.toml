@@ -28,6 +28,7 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: needs a real Docker daemon"]
 
 [tool.ruff]
 line-length = 100

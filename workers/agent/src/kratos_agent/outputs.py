@@ -1,14 +1,16 @@
 """Verified manifests for the output tree of a finished job attempt."""
 
 import base64
+import contextlib
 import hashlib
 import os
+import shutil
 import stat
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import BinaryIO, Protocol, cast
 
 import google_crc32c
 
@@ -33,6 +35,13 @@ MAX_INSPECTED_ENTRIES = 10_000
 READ_CHUNK_BYTES = 1024 * 1024
 SEALED_FILE_MODE = 0o400
 SEALED_DIRECTORY_MODE = 0o500
+UNSEALED_FILE_MODE = 0o600
+UNSEALED_DIRECTORY_MODE = 0o700
+# A job image runs as whatever user it declares, so the leaf it writes into must be
+# writable by that unknown user. Only the leaf is opened up; the attempt directory
+# above it stays private to the agent, so nothing can reach a sibling attempt.
+OUTPUT_LEAF_MODE = 0o777
+ATTEMPT_DIRECTORY_MODE = 0o700
 DESCRIPTOR_WALK_SUPPORTED = (
     os.open in os.supports_dir_fd
     and os.scandir in os.supports_fd
@@ -207,6 +216,58 @@ def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> V
         ),
         identity=identity,
     )
+
+
+@contextmanager
+def open_verified(source: Path, identity: OutputIdentity) -> Iterator[BinaryIO]:
+    """Open an output for transfer, refusing it unless it is still the file that was hashed.
+
+    This closes the window between hashing and uploading: a file replaced, relinked or rewritten
+    in between would otherwise be sent under the manifest's checksums.
+    """
+    try:
+        descriptor = os.open(str(source), os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
+    except OSError as error:
+        raise OutputError(f"output {_shown(source.name)} could not be reopened") from error
+    stream = os.fdopen(descriptor, "rb")
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OutputError(f"output {_shown(source.name)} is not a regular file")
+        if OutputIdentity.of(os.fstat(descriptor)) != identity:
+            raise OutputError(f"output {_shown(source.name)} changed after it was recorded")
+        yield stream
+    finally:
+        stream.close()
+
+
+def create_attempt_tree(attempt_root: Path) -> Path:
+    """Create the outputs directory a job will write into, and return it.
+
+    Docker requires a volume subpath to exist before the container is created. The leaf is made
+    world-writable because the workload's user is not known to the agent; its parent is not, so an
+    attempt cannot see or reach another attempt's outputs.
+    """
+    outputs = attempt_root / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    attempt_root.chmod(ATTEMPT_DIRECTORY_MODE)
+    outputs.chmod(OUTPUT_LEAF_MODE)
+    return outputs
+
+
+def discard_tree(root: Path) -> None:
+    """Remove an attempt's retained outputs, undoing the read-only sealing first.
+
+    Collection seals the tree, so a non-root agent cannot delete what it just sealed until the
+    write bit is restored. Anything it does not own is left behind rather than forced.
+    """
+    if not root.exists():
+        return
+    for directory, _, files in os.walk(root, topdown=False):
+        for name in (*files, ""):
+            target = Path(directory) / name if name else Path(directory)
+            with contextlib.suppress(OSError):
+                target.chmod(UNSEALED_DIRECTORY_MODE if not name else UNSEALED_FILE_MODE)
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _seal(descriptor: int, mode: int) -> None:

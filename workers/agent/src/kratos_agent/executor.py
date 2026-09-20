@@ -22,6 +22,10 @@ from kratos_agent.models import (
 IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 64 * 1024
 MAX_FAILURE_MESSAGE_CHARS = 1_000
+OUTPUT_MOUNT_TARGET = "/kratos/outputs"
+ATTEMPT_DIRECTORY = "attempts"
+# Volume subpath mounts require Docker Engine 26 or later.
+MINIMUM_SUBPATH_ENGINE_MAJOR = 26
 SUPERVISION_POLL_SECONDS = 1.0
 # How late a bound may be enforced: one poll plus one in-flight heartbeat and its collection.
 ENFORCEMENT_TOLERANCE = timedelta(seconds=30)
@@ -50,14 +54,19 @@ class DockerExecutor:
         *,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], None] = time.sleep,
+        state_volume: str | None = None,
     ) -> None:
         self._client = client
         self._clock = clock
         self._sleep = sleep
+        # The agent drives sibling containers, so a job's output directory cannot be a path inside
+        # this container. Only the per-attempt subpath of the state volume is exposed, never its
+        # root, which holds the worker credential (ADR-014).
+        self._state_volume = state_volume
 
     @classmethod
-    def from_environment(cls) -> "DockerExecutor":
-        return cls(docker.from_env())
+    def from_environment(cls, *, state_volume: str | None = None) -> "DockerExecutor":
+        return cls(docker.from_env(), state_volume=state_volume)
 
     def run_gpu_health_check(
         self, image_reference: str, gpu_index: int = 0, timeout_seconds: int = 120
@@ -183,6 +192,7 @@ class DockerExecutor:
                     nano_cpus=4_000_000_000,
                     pids_limit=512,
                     tmpfs={"/tmp": "rw,noexec,nosuid,size=1g"},
+                    mounts=self._output_mounts(assignment),
                     environment={
                         "KRATOS_JOB_ID": job_id,
                         "KRATOS_ATTEMPT_ID": attempt_id,
@@ -263,6 +273,49 @@ class DockerExecutor:
             stderr=stderr,
             failure_message=failure_message,
         )
+
+    def durable_output_support(self) -> str | None:
+        """Why this agent cannot deliver durable outputs, or None when it can.
+
+        Checked once at startup so the agent advertises 1.1 only when an output job would
+        actually succeed, rather than being assigned work it must then reject.
+        """
+        if self._state_volume is None:
+            return "the agent was started without --state-volume"
+        try:
+            version = self._client.version()
+            engine = str(version.get("Version", "0"))
+            major = int(engine.split(".")[0])
+        except Exception as error:
+            return f"the Docker Engine version could not be read: {type(error).__name__}"
+        if major < MINIMUM_SUBPATH_ENGINE_MAJOR:
+            return f"Docker Engine {engine} cannot mount a volume subpath"
+        try:
+            self._client.volumes.get(self._state_volume)
+        except Exception:
+            return f"the state volume {self._state_volume!r} does not exist"
+        return None
+
+    def _output_mounts(self, assignment: JobAssignment) -> list[Any]:
+        """Expose only this attempt's outputs subdirectory, writable, at /kratos/outputs."""
+        if not assignment.output_requirements:
+            return []
+        if self._state_volume is None:
+            raise ExecutorError(
+                "a job with output requirements needs the agent state volume name; "
+                "reinstall the agent so it can pass --state-volume"
+            )
+        return [
+            docker.types.Mount(
+                target=OUTPUT_MOUNT_TARGET,
+                source=self._state_volume,
+                type="volume",
+                read_only=False,
+                # Docker Engine 26 or later. Without subpath support the whole volume, including
+                # the worker credential, would be visible to the job.
+                subpath=f"{ATTEMPT_DIRECTORY}/{assignment.attempt_id}/outputs",
+            )
+        ]
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""

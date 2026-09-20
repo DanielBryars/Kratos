@@ -8,7 +8,7 @@ import docker
 import pytest
 
 from kratos_agent.executor import DockerExecutor, EnforcementError, ExecutorError
-from kratos_agent.models import GpuHealthStatus, JobAssignment
+from kratos_agent.models import GpuHealthStatus, JobAssignment, JobOutputRequirement
 
 IMAGE_ID = "sha256:" + ("a" * 64)
 
@@ -553,3 +553,61 @@ def test_stopping_an_absent_unbounded_attempt_is_harmless() -> None:
     clock = FakeClock()
 
     job_executor(clock, JobClient(clock)).stop_unbounded_attempt(job_assignment().attempt_id)
+
+
+def output_assignment() -> JobAssignment:
+    return job_assignment().model_copy(
+        update={
+            "output_requirements": (
+                JobOutputRequirement(
+                    logical_path="model.pt",
+                    role="model",
+                    media_type="application/octet-stream",
+                    mandatory=True,
+                    max_bytes=1024,
+                ),
+            )
+        }
+    )
+
+
+def test_only_this_attempts_outputs_subpath_is_exposed_to_the_job() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+    assignment = output_assignment()
+
+    DockerExecutor(
+        client, clock=clock, sleep=clock.sleep, state_volume="kratos-agent-state"
+    ).run_job(assignment)
+
+    options = client.containers.options
+    assert options is not None
+    (mount,) = options["mounts"]
+    assert mount["Target"] == "/kratos/outputs"
+    assert mount["Source"] == "kratos-agent-state"
+    assert mount["ReadOnly"] is False
+    # The volume root holds the worker credential and must never be what the job sees.
+    assert mount["VolumeOptions"]["Subpath"] == f"attempts/{assignment.attempt_id}/outputs"
+
+
+def test_a_job_without_declared_outputs_gets_no_output_mount() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+
+    DockerExecutor(
+        client, clock=clock, sleep=clock.sleep, state_volume="kratos-agent-state"
+    ).run_job(job_assignment())
+
+    options = client.containers.options
+    assert options is not None
+    assert options["mounts"] == []
+
+
+def test_a_job_with_outputs_refuses_to_start_without_a_known_state_volume() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+
+    with pytest.raises(ExecutorError, match="needs the agent state volume name"):
+        DockerExecutor(client, clock=clock, sleep=clock.sleep).run_job(output_assignment())
+
+    assert client.containers.options is None

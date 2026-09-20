@@ -84,13 +84,15 @@ def _detect_gpus(
 
 
 def collect_capabilities(
-    storage_path: Path = Path("/"), gpu_health_override: GpuHealth | None = None
+    storage_path: Path = Path("/"),
+    gpu_health_override: GpuHealth | None = None,
+    protocol_version: str = PROTOCOL_VERSION,
 ) -> WorkerCapabilities:
     """Collect a point-in-time report without claiming untested GPU health."""
 
     gpus, gpu_health = _detect_gpus()
     return WorkerCapabilities(
-        protocol_version=PROTOCOL_VERSION,
+        protocol_version=protocol_version,
         collected_at=datetime.now(UTC),
         hostname=platform.node(),
         operating_system=platform.system(),

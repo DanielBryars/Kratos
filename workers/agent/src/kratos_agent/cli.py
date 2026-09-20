@@ -12,7 +12,13 @@ from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import GpuHealth, GpuHealthEvidence, GpuHealthStatus
+from kratos_agent.models import (
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_WITHOUT_OUTPUTS,
+    GpuHealth,
+    GpuHealthEvidence,
+    GpuHealthStatus,
+)
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.runner import AgentRunner
 
@@ -29,6 +35,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--display-name", default=socket.gethostname())
     run.add_argument("--state-file", type=Path, default=Path("/var/lib/kratos-agent/state.json"))
     run.add_argument("--enrolment-credential-file", type=Path)
+    run.add_argument(
+        "--state-volume",
+        help="Docker volume holding the agent state directory. Required for jobs with "
+        "declared outputs, whose per-attempt subdirectory is mounted into the job.",
+    )
     run.add_argument(
         "--health-check-image",
         help="immutable GPU health-check image run once before heartbeats",
@@ -64,12 +75,32 @@ def main() -> int:
         return 0 if evidence.status is GpuHealthStatus.HEALTHY else 1
     elif args.command == "run":
         try:
-            capability_collector = collect_capabilities
-            executor = DockerExecutor.from_environment()
+            executor = DockerExecutor.from_environment(state_volume=args.state_volume)
+            unsupported = executor.durable_output_support()
+            protocol_version = PROTOCOL_VERSION_WITHOUT_OUTPUTS if unsupported else PROTOCOL_VERSION
+            if unsupported:
+                print(
+                    json.dumps(
+                        {
+                            "status": "durable_outputs_unavailable",
+                            "detail": unsupported,
+                            "advertising": protocol_version,
+                        }
+                    ),
+                    flush=True,
+                )
             if args.health_check_image:
                 evidence = executor.run_gpu_health_check(image_reference=args.health_check_image)
                 health = _reported_health(evidence)
-                capability_collector = partial(collect_capabilities, gpu_health_override=health)
+                capability_collector = partial(
+                    collect_capabilities,
+                    gpu_health_override=health,
+                    protocol_version=protocol_version,
+                )
+            else:
+                capability_collector = partial(
+                    collect_capabilities, protocol_version=protocol_version
+                )
             with WorkerProtocolClient(args.control_plane) as client:
                 AgentRunner(
                     client=client,

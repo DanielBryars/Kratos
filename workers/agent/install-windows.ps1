@@ -90,7 +90,10 @@ $runArguments += @(
     $resolvedImage,
     "run",
     "--control-plane", $ControlPlane,
-    "--display-name", $DisplayName
+    "--display-name", $DisplayName,
+    # The agent mounts a per-attempt subdirectory of this volume into each job that declares
+    # outputs. It never exposes the volume root, which holds the worker credential.
+    "--state-volume", $StateVolume
 )
 if ($HealthCheckImage) {
     $runArguments += @("--health-check-image", $HealthCheckImage)
