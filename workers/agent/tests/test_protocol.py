@@ -262,7 +262,9 @@ class FakeJobExecutor(DockerExecutor):
         self.stopped_unbounded.append(attempt_id)
 
 
-def heartbeat_response(request: httpx.Request, *, assigned: bool) -> httpx.Response:
+def heartbeat_response(
+    request: httpx.Request, *, assigned: bool, observation_stream: UUID | None = None
+) -> httpx.Response:
     body: dict[str, object] = {
         "worker_id": str(WORKER_ID),
         "state": "busy" if assigned else "idle",
@@ -270,7 +272,7 @@ def heartbeat_response(request: httpx.Request, *, assigned: bool) -> httpx.Respo
         "next_heartbeat_seconds": 30,
     }
     if assigned:
-        body["assignment"] = {
+        assignment_body: dict[str, object] = {
             "attempt_id": str(ATTEMPT_ID),
             "job_id": str(JOB_ID),
             "name": "Matrix check",
@@ -279,6 +281,9 @@ def heartbeat_response(request: httpx.Request, *, assigned: bool) -> httpx.Respo
             "timeout_seconds": 120,
             "lease_expires_at": "2099-09-19T13:00:00Z",
         }
+        if observation_stream is not None:
+            assignment_body["observation_stream_id"] = str(observation_stream)
+        body["assignment"] = assignment_body
     return httpx.Response(200, json=body)
 
 
@@ -339,6 +344,45 @@ def test_assignment_is_executed_reported_and_removed_after_acknowledgement(tmp_p
     assert executor.removed == [ATTEMPT_ID]
     assert reported["exit_code"] == 0
     assert reported["stdout"] == "done\n"
+
+
+def test_fresh_assignment_builds_observation_spool_after_image_pull(tmp_path: Path) -> None:
+    """A slow first pull must not let the courier retire an empty spool before execution."""
+    stream_id = UUID("55555555-5555-4555-8555-555555555555")
+    events: list[str] = []
+
+    class OrderedExecutor(FakeJobExecutor):
+        def prepare_job(
+            self,
+            assignment: JobAssignment,
+            still_authorised: Callable[[], bool] | None = None,
+            tick_seconds: float = 30,
+        ) -> JobExecutionResult | None:
+            events.append("pull")
+            return super().prepare_job(assignment, still_authorised, tick_seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            return heartbeat_response(request, assigned=True, observation_stream=stream_id)
+        return result_acknowledgement()
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = OrderedExecutor()
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        runner = job_runner(client, state_path, executor)
+        original = runner._build_pump
+
+        def build_pump(current: AgentState, assigned: JobAssignment):  # type: ignore[no-untyped-def]
+            events.append("pump")
+            return original(current, assigned)
+
+        runner._build_pump = build_pump  # type: ignore[assignment]
+        runner.heartbeat_once(state)
+
+    assert events == ["pull", "pump"]
 
 
 def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
