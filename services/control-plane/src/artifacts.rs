@@ -1176,7 +1176,7 @@ pub(crate) async fn reconcile_pending_session_cancellations(
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     use async_trait::async_trait;
@@ -1187,6 +1187,7 @@ mod tests {
     use chrono::{TimeDelta, Utc};
     use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tokio::sync::Notify;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -1219,6 +1220,9 @@ mod tests {
         protected: AtomicUsize,
         deleted: AtomicUsize,
         cancelled: AtomicUsize,
+        block_next_initiation: AtomicBool,
+        initiation_started: Notify,
+        release_initiation: Notify,
     }
 
     struct FakeArtifactStorage {
@@ -1239,9 +1243,14 @@ mod tests {
         ) -> Result<ResumableUploadSession, ArtifactStorageError> {
             self.calls.initiated.fetch_add(1, Ordering::SeqCst);
             let _ = (media_type, byte_length, sha256);
-            // Keep the first transaction open long enough for concurrency tests to contend on the
-            // artifact row rather than accidentally becoming a purely sequential replay.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if self
+                .calls
+                .block_next_initiation
+                .swap(false, Ordering::SeqCst)
+            {
+                self.calls.initiation_started.notify_one();
+                self.calls.release_initiation.notified().await;
+            }
             Ok(ResumableUploadSession {
                 uri: format!("https://storage.googleapis.com/upload/session/{object_key}"),
                 method: "PUT".to_owned(),
@@ -1633,30 +1642,35 @@ mod tests {
             "/api/v1/workers/{}/job-attempts/{}/artifacts/{artifact_id}/upload",
             fixture.worker_id, fixture.attempt_id
         );
-        let first = router.clone().oneshot(
-            Request::put(&upload_uri)
-                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
-                .header("content-type", "application/json")
-                .body(Body::from(json!({ "protocol_version": "1.1" }).to_string()))
-                .unwrap(),
+        storage_calls
+            .block_next_initiation
+            .store(true, Ordering::SeqCst);
+        let first = tokio::spawn(
+            router.clone().oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "protocol_version": "1.1" }).to_string()))
+                    .unwrap(),
+            ),
         );
-        let second = router.clone().oneshot(
-            Request::put(&upload_uri)
-                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"protocol_version":"1.1"}"#))
-                .unwrap(),
-        );
-        let (first, second) = tokio::join!(first, second);
-        let first = first.unwrap();
-        let second = second.unwrap();
-        let (started, pending) = if first.status() == StatusCode::OK {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        assert_eq!(started.status(), StatusCode::OK);
+        storage_calls.initiation_started.notified().await;
+        let pending = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(pending.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(storage_calls.initiated.load(Ordering::SeqCst), 1);
+        storage_calls.release_initiation.notify_one();
+        let started = first.await.unwrap().unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
         assert_eq!(started.headers()["cache-control"], "no-store");
         let started = response_json(started).await;
         assert_eq!(started["artifact"]["status"], "uploading");
