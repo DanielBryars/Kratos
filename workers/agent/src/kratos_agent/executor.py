@@ -308,7 +308,7 @@ class DockerExecutor:
             observed_start = _state_time(container, "StartedAt")
             resumed = False
 
-        reader, reader_stop = self._start_log_reader(container, observe, resumed=resumed)
+        self._start_log_reader(container, observe, resumed=resumed)
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
@@ -366,8 +366,10 @@ class DockerExecutor:
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
-        # Signalled, never waited on: the result goes now, whatever the reader is doing.
-        self._stop_log_reader(reader, reader_stop)
+        # The reader is deliberately left to drain Docker's finite log stream on its daemon
+        # thread. The result goes now without waiting for it. Asking it to stop here used to race
+        # a short-lived container: Docker could yield the first buffered chunk after supervision
+        # observed the exit, at which point the stop flag discarded every line the job wrote.
         # Both or neither: an interval with one end missing is not evidence.
         whole = observed_start is not None and observed_finish is not None
         return JobExecutionResult(
@@ -486,7 +488,7 @@ class DockerExecutor:
         observe: "LogObserver | None",
         *,
         resumed: bool,
-    ) -> tuple[threading.Thread | None, threading.Event]:
+    ) -> None:
         """Follow the container's output on its own thread, or decline to.
 
         A resumed container is deliberately **not** followed. Docker replays a container's log
@@ -495,23 +497,21 @@ class DockerExecutor:
         idempotency does not help: it is keyed on sequence, and these would be new ones. Losing
         telemetry for a resumed attempt is the lesser fault, and it is counted rather than silent.
         """
-        stop = threading.Event()
         if observe is None:
-            return None, stop
+            return
         if resumed:
             observe(Stream.STDERR, self._clock(), _RESUMED_NOTICE)
-            return None, stop
+            return
         thread = threading.Thread(
             target=self._follow_logs,
-            args=(container, observe, stop),
+            args=(container, observe),
             name="kratos-log-reader",
             daemon=True,
         )
         thread.start()
-        return thread, stop
 
-    def _follow_logs(self, container: Any, observe: "LogObserver", stop: threading.Event) -> None:
-        """Read until the container ends or supervision says stop. Never raises."""
+    def _follow_logs(self, container: Any, observe: "LogObserver") -> None:
+        """Read until Docker closes the exited container's finite log stream. Never raises."""
         assemblers = {
             Stream.STDOUT: LineAssembler(LOG_LINE_BOUND_BYTES),
             Stream.STDERR: LineAssembler(LOG_LINE_BOUND_BYTES),
@@ -525,8 +525,6 @@ class DockerExecutor:
             for out, err in container.logs(
                 stdout=True, stderr=True, stream=True, follow=True, timestamps=True, demux=True
             ):
-                if stop.is_set():
-                    break
                 for data, which in ((out, Stream.STDOUT), (err, Stream.STDERR)):
                     if not data:
                         continue
@@ -541,20 +539,6 @@ class DockerExecutor:
                 for which, assembler in assemblers.items():
                     for line in assembler.flush():
                         emit(which, line)
-
-    @staticmethod
-    def _stop_log_reader(reader: threading.Thread | None, stop: threading.Event) -> None:
-        """Ask the reader to stop, and do not wait for it.
-
-        Not even briefly. A result may never wait on telemetry, and a bounded wait is still a
-        wait: it would make a slow or stuck log stream delay the result, the lease and the
-        worker's availability by exactly the bound. The reader is a daemon thread, so it cannot
-        hold the agent open, and whatever it is still holding is diagnostic data.
-
-        The consequence is that the reader may deliver a few more lines after this returns, which
-        is why the pump it feeds is safe to call from two threads.
-        """
-        stop.set()
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""
