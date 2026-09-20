@@ -1,0 +1,25 @@
+# Prometheus receives metrics only through its OTLP endpoint, from the gateway.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+otlp:
+  # Each promoted attribute becomes a label on every series from that resource. Job and attempt
+  # identifiers create new series per run, so their lifetime is bounded by the retention flags and
+  # the list is kept to the identifiers MON-018 requires.
+  promote_resource_attributes:
+    - service.name
+    - kratos.worker.id
+    - kratos.job.id
+    - kratos.attempt.id
+  translation_strategy: UnderscoreEscapingWithSuffixes
+
+storage:
+  tsdb:
+    # Accept samples that arrive late because a worker was offline and its collector replayed them.
+    out_of_order_time_window: 30m
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

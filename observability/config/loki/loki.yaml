@@ -1,0 +1,60 @@
+# Single-binary Loki with filesystem storage. The cloud deployment replaces the object store with
+# Cloud Storage (ADR-009); the limits below are intended to carry over unchanged.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: "2026-01-01"
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+limits_config:
+  retention_period: 168h
+  allow_structured_metadata: true
+  # Bounds on what one tenant, here the whole fleet, may send (MON-019).
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  max_global_streams_per_user: 5000
+  max_label_names_per_series: 15
+  max_line_size: 16KB
+  max_line_size_truncate: true
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  otlp_config:
+    # Only these resource attributes become index labels. Job and attempt identifiers stay in
+    # structured metadata, which is searchable without creating a stream per run.
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes:
+            - service.name
+            - kratos.worker.id
+
+analytics:
+  reporting_enabled: false

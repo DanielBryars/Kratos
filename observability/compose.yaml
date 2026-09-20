@@ -1,0 +1,145 @@
+# Local ADR-009 observability stack. Every image is pinned by digest; the tag is documentation.
+# Only Grafana, MLflow and the OTLP gateway are published, and only on the loopback interface.
+# Prometheus, Loki and Tempo stay on an internal network, as ADR-009 requires of the cloud stack.
+name: kratos-observability
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  otel-gateway:
+    <<: *hardening
+    image: otel/opentelemetry-collector-contrib:0.161.0@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./config/otel-gateway/config.yaml:/etc/otelcol/config.yaml:ro
+    networks: [edge, backend]
+    ports:
+      - "127.0.0.1:${KRATOS_OTLP_GRPC_PORT:-14317}:4317"
+      - "127.0.0.1:${KRATOS_OTLP_HTTP_PORT:-14318}:4318"
+    mem_limit: 512m
+    depends_on: [prometheus, loki, tempo]
+
+  prometheus:
+    <<: *hardening
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=4GB
+      - --web.enable-otlp-receiver
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks: [backend]
+    mem_limit: 1g
+
+  loki:
+    <<: *hardening
+    image: grafana/loki:3.7.8@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./config/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    networks: [backend]
+    mem_limit: 1g
+
+  tempo:
+    <<: *hardening
+    image: grafana/tempo:3.0.3@sha256:0296560ac66f8a3600d7fb3014a52c189d4d9c3549ad6ff441bf2409855d68d5
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+      - -backend-scheduler.provider.work.compaction.block-retention=72h
+    volumes:
+      - ./config/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    networks: [backend]
+    mem_limit: 1g
+
+  grafana:
+    <<: *hardening
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${KRATOS_GRAFANA_ADMIN_USER:-kratos-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${KRATOS_GRAFANA_ADMIN_PASSWORD:?copy .env.example to .env and set a password}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      # Grafana otherwise downloads unpinned plugins at startup, outside this file's digests.
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    tmpfs: ["/tmp"]
+    networks: [edge, backend]
+    ports:
+      - "127.0.0.1:${KRATOS_GRAFANA_PORT:-13000}:3000"
+    mem_limit: 512m
+    depends_on: [prometheus, loki, tempo]
+
+  mlflow:
+    <<: *hardening
+    image: ghcr.io/mlflow/mlflow:v3.16.1@sha256:6b6ec62130dd9a273b24e53e905bdc728b915fbd2dfb71f2fb7eff9a22f7fa67
+    # SQLite and a local artefact directory are for this local bundle only. ADR-009 places durable
+    # metadata in PostgreSQL and artefacts in Cloud Storage for the cloud deployment.
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --workers=2
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --artifacts-destination=/mlflow/artifacts
+      - --serve-artifacts
+      - --allowed-hosts=mlflow:5000,localhost:${KRATOS_MLFLOW_PORT:-15000},127.0.0.1:${KRATOS_MLFLOW_PORT:-15000}
+    environment:
+      HOME: /tmp
+      # The job runner serves MLflow's generative-AI scoring features, which Kratos does not use.
+      # Left enabled, an idle server holds about 2 GiB and several hundred processes.
+      MLFLOW_SERVER_ENABLE_JOB_EXECUTION: "false"
+    volumes:
+      - mlflow-data:/mlflow
+    tmpfs: ["/tmp"]
+    networks: [edge, backend]
+    ports:
+      - "127.0.0.1:${KRATOS_MLFLOW_PORT:-15000}:5000"
+    mem_limit: 1g
+
+  # Sends one metric, log and trace through the gateway, logs one MLflow run, then proves that
+  # each arrived carrying the same Kratos identifiers. Run with: docker compose run --rm smoke
+  smoke:
+    image: python:3.12-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+    profiles: [smoke]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    user: "65534:65534"
+    command: ["python", "/smoke/smoke.py"]
+    environment:
+      KRATOS_GRAFANA_ADMIN_USER: ${KRATOS_GRAFANA_ADMIN_USER:-kratos-admin}
+      KRATOS_GRAFANA_ADMIN_PASSWORD: ${KRATOS_GRAFANA_ADMIN_PASSWORD:?copy .env.example to .env and set a password}
+    volumes:
+      - ./smoke/smoke.py:/smoke/smoke.py:ro
+    networks: [backend]
+    depends_on: [otel-gateway, grafana, mlflow]
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+volumes:
+  prometheus-data: {}
+  loki-data: {}
+  tempo-data: {}
+  grafana-data: {}
+  mlflow-data: {}
