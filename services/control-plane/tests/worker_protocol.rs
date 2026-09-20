@@ -142,6 +142,8 @@ async fn enrolment_and_heartbeat_are_transactional_and_replay_safe(pool: PgPool)
         .unwrap();
     assert_eq!(repeated.status(), StatusCode::CONFLICT);
 
+    let mut upgraded_capabilities = capabilities();
+    upgraded_capabilities["protocol_version"] = json!("1.1");
     for (sequence, expected) in [
         (1, StatusCode::OK),
         (1, StatusCode::OK),
@@ -154,10 +156,10 @@ async fn enrolment_and_heartbeat_are_transactional_and_replay_safe(pool: PgPool)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         json!({
-                            "protocol_version": "1.0",
+                            "protocol_version": "1.1",
                             "sequence": sequence,
                             "observed_at": Utc::now(),
-                            "capabilities": capabilities()
+                            "capabilities": upgraded_capabilities.clone()
                         })
                         .to_string(),
                     ))
@@ -168,15 +170,38 @@ async fn enrolment_and_heartbeat_are_transactional_and_replay_safe(pool: PgPool)
         assert_eq!(response.status(), expected);
     }
 
-    let persisted: (i64, bool, bool) = sqlx::query_as(
-        "SELECT heartbeat_sequence, last_seen_at IS NOT NULL, last_observed_at IS NOT NULL \
+    let mismatched_replay = app(None, Some(pool.clone()))
+        .oneshot(
+            Request::put(format!("/api/v1/workers/{worker_id}/heartbeat"))
+                .header("authorization", format!("Bearer {worker_credential}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "protocol_version": "1.0",
+                        "sequence": 1,
+                        "observed_at": Utc::now(),
+                        "capabilities": capabilities()
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatched_replay.status(), StatusCode::CONFLICT);
+    let mismatched_replay = response_json(mismatched_replay).await;
+    assert_eq!(mismatched_replay["code"], "heartbeat_replay_mismatch");
+
+    let persisted: (i64, bool, bool, String) = sqlx::query_as(
+        "SELECT heartbeat_sequence, last_seen_at IS NOT NULL, last_observed_at IS NOT NULL, \
+                protocol_version \
          FROM workers WHERE id = $1",
     )
     .bind(worker_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(persisted, (1, true, true));
+    assert_eq!(persisted, (1, true, true, "1.1".to_owned()));
 
     let wrong_worker = app(None, Some(pool.clone()))
         .oneshot(

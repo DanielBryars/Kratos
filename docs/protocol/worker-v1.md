@@ -9,6 +9,12 @@ does not require an inbound port on the worker network.
 Every message SHALL carry a `protocol_version` in `major.minor` form. The initial version is `1.0`.
 The control plane SHALL reject an unsupported major version with an actionable response. It MAY
 accept an older minor version when all required fields retain their meaning.
+An accepted newer heartbeat sequence SHALL atomically replace the worker's stored protocol version
+and capability report. Scheduling SHALL use that stored current version rather than the version
+seen during enrolment. A duplicate sequence SHALL be accepted only when its protocol version and
+capability report exactly match the stored observation. Scheduling SHALL recheck that same
+observation while holding the worker row lock; if a newer heartbeat wins first, the older request
+SHALL conflict without claiming work.
 
 Unknown fields are rejected in v1. A capability report therefore fails visibly when the control
 plane and agent disagree about its shape.
@@ -181,7 +187,21 @@ container to the end of its authority before any operation that needs the networ
 found to have finished more than thirty seconds after that time was unsupervised and SHALL NOT be
 reported as successful. A container that
 exited within its authority SHALL be reported with its actual exit status even when the result can
-only be delivered after the lease deadline; the control plane decides whether to accept it.
+only be delivered after the lease deadline; the control plane SHALL reject it as a late result once
+the lease has expired.
+
+The control plane SHALL durably close an expired attempt before retrying its job. It SHALL create no
+more than two attempts for one job: the initial attempt and one automatic retry from scratch. A
+worker SHALL treat each attempt identifier as independent execution authority and SHALL NOT infer
+checkpoint continuity between them. The database SHALL permit no more than one assigned or running
+attempt for a job, and a late result from a closed attempt SHALL return that attempt's terminal state
+without changing the current job or replacement attempt.
+
+An operator cancellation of queued work is immediately terminal. Cancellation of assigned or
+running work remains pending until the worker next reports a result or the lease expires. Because
+protocol 1.x has no cancellation command, a repeated heartbeat MAY continue returning that attempt;
+the agent's existing runtime and lease bounds still apply. The control plane SHALL record the job
+and attempt as `cancelled`, and release the worker, when either completion signal arrives.
 
 A transport failure, `429` or `5xx` response, or local container-runtime error SHALL NOT end the
 agent. It SHALL retain the container and its recorded attempt, continue heartbeats at the normal
@@ -225,3 +245,41 @@ failure results whenever valid identifiers were supplied. This establishes the c
 for later OpenTelemetry and MLflow integrations. It does not enable telemetry export, provision a
 collector or create an MLflow run. A later integration SHALL add the authoritative worker, project
 and MLflow run attributes described by ADR-009.
+
+## R0.2 durable output extension (protocol 1.1)
+
+A job MAY contain an immutable `output_requirements` array. Each requirement defines an exact
+relative path below `/kratos/outputs`, a role, media type, mandatory flag and maximum byte length.
+The control plane SHALL NOT assign a job with output requirements to a worker advertising protocol
+1.0. Assignments without output requirements remain compatible with protocol 1.0.
+
+After execution, a protocol 1.1 agent SHALL calculate the byte length, lowercase SHA-256 digest and
+canonical base64 CRC32C of each produced regular file. It SHALL submit one immutable manifest with a
+client-generated UUID to
+`PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifact-manifest`. The manifest SHALL
+contain every mandatory exact path, MAY contain declared optional paths, and SHALL NOT contain an
+undeclared path. Replaying the same UUID and content returns the same artefact identifiers and object
+keys. A changed replay or second manifest conflicts.
+
+The first control-plane slice exposes two replay-safe transfer-state calls:
+
+- `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading`. Its response
+  identifies the opaque object key. A later storage integration will add the short-lived signed
+  resumable-upload authority described by ADR-014.
+- `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
+  returned byte length and CRC32C. A matching retry returns the stored response; different evidence
+  conflicts. An authenticated matching retry remains valid after the attempt becomes terminal, but
+  a terminal attempt cannot start or alter an upload.
+
+Upload completion SHALL remain visibly `verification_pending` and the artefact SHALL remain in the
+`uploading` state until a control-plane storage adapter reads authoritative Cloud Storage metadata.
+The worker's completion report alone SHALL NOT mark an artefact `verified`. Verification SHALL
+record its server-side source and the observed generation, byte length and CRC32C, all of which
+SHALL match the immutable declaration and completion report. A successful job result SHALL be
+rejected while any mandatory output lacks this evidence. Failed job results do not require
+mandatory outputs, so a workload failure cannot leave the worker permanently occupied.
+
+The initial limits are 100 files, 5 GiB per file, 10 GiB across the manifest and 240 UTF-8 bytes per
+logical path. Absolute paths, empty segments, `.` and `..` segments, backslashes and control
+characters are rejected. Logical paths remain metadata; object keys use opaque server-generated
+artefact identifiers below the owning identity, job and attempt scopes.

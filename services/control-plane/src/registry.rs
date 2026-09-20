@@ -16,13 +16,14 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tokio::sync::{Mutex, Semaphore};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
     AppState,
+    artifacts::JobOutputRequirement,
     credentials::{self, CredentialKind, IssuedCredential},
 };
 
@@ -32,6 +33,7 @@ const REGISTRATION_POLL_SECONDS: u32 = 3;
 const MAX_OPEN_REGISTRATIONS: i64 = 1_000;
 const MAX_VERIFICATIONS_PER_MINUTE: usize = 10;
 const MAX_CONCURRENT_VERIFICATIONS: usize = 4;
+const MAX_LEASE_RECOVERIES_PER_PASS: usize = 100;
 
 #[derive(Clone)]
 pub(crate) struct VerificationGate {
@@ -251,6 +253,8 @@ pub struct JobAssignment {
     pub gpu_index: u32,
     pub timeout_seconds: u32,
     pub lease_expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -322,7 +326,7 @@ impl ApiError {
         )
     }
 
-    const fn invalid_request() -> Self {
+    pub(crate) const fn invalid_request() -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_request",
@@ -338,7 +342,7 @@ impl ApiError {
         )
     }
 
-    const fn unavailable() -> Self {
+    pub(crate) const fn unavailable() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "persistence_unavailable",
@@ -346,7 +350,7 @@ impl ApiError {
         )
     }
 
-    const fn conflict(code: &'static str, message: &'static str) -> Self {
+    pub(crate) const fn conflict(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::CONFLICT, code, message)
     }
 
@@ -366,7 +370,7 @@ impl ApiError {
         )
     }
 
-    const fn internal() -> Self {
+    pub(crate) const fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -396,7 +400,17 @@ struct WorkerAuthenticationRecord {
     expires_at: Option<DateTime<Utc>>,
     credential_revoked_at: Option<DateTime<Utc>>,
     status: String,
+}
+
+#[derive(FromRow)]
+struct HeartbeatAuthenticationRecord {
+    token_verifier: String,
+    expires_at: Option<DateTime<Utc>>,
+    credential_revoked_at: Option<DateTime<Utc>>,
+    status: String,
     heartbeat_sequence: i64,
+    protocol_version: String,
+    capabilities: serde_json::Value,
 }
 
 #[derive(FromRow)]
@@ -407,6 +421,28 @@ struct AssignmentRecord {
     image_reference: String,
     timeout_seconds: i32,
     lease_expires_at: DateTime<Utc>,
+}
+
+struct ExpectedHeartbeat<'a> {
+    sequence: i64,
+    protocol_version: &'a str,
+    capabilities: &'a serde_json::Value,
+}
+
+#[derive(FromRow)]
+struct ExpiredAttemptRecord {
+    attempt_id: Uuid,
+    job_id: Uuid,
+    worker_id: Uuid,
+    attempt_number: i32,
+    attempt_status: String,
+    job_status: String,
+    max_attempts: i32,
+    lease_expires_at: DateTime<Utc>,
+}
+
+struct LeaseExpiryOutcome {
+    attempt_status: &'static str,
 }
 
 impl TryFrom<AssignmentRecord> for JobAssignment {
@@ -422,8 +458,34 @@ impl TryFrom<AssignmentRecord> for JobAssignment {
             timeout_seconds: u32::try_from(record.timeout_seconds)
                 .map_err(|_| ApiError::internal())?,
             lease_expires_at: record.lease_expires_at,
+            output_requirements: Vec::new(),
         })
     }
+}
+
+async fn load_output_requirements(
+    pool: &PgPool,
+    job_id: Uuid,
+) -> Result<Vec<JobOutputRequirement>, ApiError> {
+    let rows = sqlx::query_as::<_, (String, String, String, bool, i64)>(
+        "SELECT logical_path, role, media_type, mandatory, max_bytes \
+         FROM job_output_requirements WHERE job_id = $1 ORDER BY logical_path",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| database_error(&error, "load job output contract"))?;
+    rows.into_iter()
+        .map(|(logical_path, role, media_type, mandatory, max_bytes)| {
+            Ok(JobOutputRequirement {
+                logical_path,
+                role,
+                media_type,
+                mandatory,
+                max_bytes: u64::try_from(max_bytes).map_err(|_| ApiError::internal())?,
+            })
+        })
+        .collect()
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -435,7 +497,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
         .ok_or_else(ApiError::unauthorized)
 }
 
-fn validate_protocol(version: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_protocol(version: &str) -> Result<(), ApiError> {
     if version.split_once('.').is_some_and(|(major, minor)| {
         major == "1" && !minor.is_empty() && minor.bytes().all(|byte| byte.is_ascii_digit())
     }) {
@@ -443,6 +505,42 @@ fn validate_protocol(version: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::unsupported_protocol())
     }
+}
+
+pub(crate) async fn authenticate_worker(
+    state: &AppState,
+    headers: &HeaderMap,
+    worker_id: Uuid,
+    operation: &'static str,
+) -> Result<(), ApiError> {
+    let pool = database(state)?;
+    let supplied = bearer(headers)?.to_owned();
+    let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
+        .map_err(|_| ApiError::unauthorized())?;
+    let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
+        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, w.status \
+         FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
+         WHERE c.id = $1 AND c.worker_id = $2",
+    )
+    .bind(credential_id)
+    .bind(worker_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| database_error(&error, operation))?
+    .ok_or_else(ApiError::unauthorized)?;
+    if authentication.credential_revoked_at.is_some()
+        || authentication
+            .expires_at
+            .is_some_and(|expires| expires <= Utc::now())
+        || authentication.status == "revoked"
+        || !state
+            .verification_gate
+            .verify(credential_id, supplied, authentication.token_verifier)
+            .await?
+    {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(())
 }
 
 fn validate_capabilities(capabilities: &WorkerCapabilities) -> Result<(), ApiError> {
@@ -649,7 +747,7 @@ pub(crate) async fn enrol_worker(
     .bind(request.agent_instance_id)
     .bind(request.display_name.trim())
     .bind(&request.protocol_version)
-    .bind(capabilities)
+    .bind(&capabilities)
     .execute(&mut *transaction)
     .await
     .map_err(|error| {
@@ -1052,28 +1150,226 @@ pub(crate) async fn claim_registration(
     ))
 }
 
+async fn close_expired_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: &ExpiredAttemptRecord,
+) -> Result<LeaseExpiryOutcome, ApiError> {
+    let cancellation = attempt.job_status == "cancelling";
+    let retry_queued = !cancellation && attempt.attempt_number < attempt.max_attempts;
+    let attempt_status = if cancellation { "cancelled" } else { "failed" };
+    let job_status = if cancellation {
+        "cancelled"
+    } else if retry_queued {
+        "queued"
+    } else {
+        "failed"
+    };
+    let reason = if cancellation {
+        "Cancellation completed when the execution lease expired."
+    } else if retry_queued {
+        "Execution lease expired; one bounded retry was queued."
+    } else {
+        "Execution lease expired and the bounded attempt limit was reached."
+    };
+
+    sqlx::query(
+        "UPDATE job_attempts SET status = $2, finished_at = now(), terminal_reason = $3 \
+         WHERE id = $1 AND status IN ('assigned', 'running')",
+    )
+    .bind(attempt.attempt_id)
+    .bind(attempt_status)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "expire job attempt"))?;
+    sqlx::query(
+        "UPDATE workers SET status = 'idle', updated_at = now() \
+         WHERE id = $1 AND status = 'busy' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM job_attempts \
+               WHERE worker_id = $1 AND id <> $2 AND status IN ('assigned', 'running') \
+           )",
+    )
+    .bind(attempt.worker_id)
+    .bind(attempt.attempt_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "release expired attempt worker"))?;
+
+    if retry_queued {
+        sqlx::query(
+            "UPDATE jobs SET status = 'queued', assigned_worker_id = NULL, finished_at = NULL, \
+                    exit_code = NULL, stdout = NULL, stderr = NULL, failure_message = $2 \
+             WHERE id = $1 AND status IN ('assigned', 'running')",
+        )
+        .bind(attempt.job_id)
+        .bind(reason)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| database_error(&error, "requeue expired job"))?;
+    } else {
+        sqlx::query(
+            "UPDATE jobs SET status = $2, assigned_worker_id = NULL, \
+                    started_at = COALESCE(started_at, submitted_at), finished_at = now(), \
+                    failure_message = $3 WHERE id = $1 \
+             AND status IN ('assigned', 'running', 'cancelling')",
+        )
+        .bind(attempt.job_id)
+        .bind(job_status)
+        .bind(reason)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| database_error(&error, "finish expired job"))?;
+    }
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'service', NULL, 'job.attempt.lease_expired', 'job', $2, $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(attempt.job_id)
+    .bind(if cancellation { "succeeded" } else { "failed" })
+    .bind(json!({
+        "attempt_id": attempt.attempt_id,
+        "worker_id": attempt.worker_id,
+        "attempt_number": attempt.attempt_number,
+        "attempt_status_before": attempt.attempt_status,
+        "job_status": job_status,
+        "retry_queued": retry_queued
+    }))
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "audit expired job attempt"))?;
+
+    Ok(LeaseExpiryOutcome { attempt_status })
+}
+
+async fn acknowledge_cancelled_attempt(
+    transaction: &mut Transaction<'_, Postgres>,
+    attempt: &ExpiredAttemptRecord,
+) -> Result<(), ApiError> {
+    let reason = "Cancellation completed when the worker acknowledged execution had stopped.";
+    sqlx::query(
+        "UPDATE job_attempts SET status = 'cancelled', \
+                started_at = COALESCE(started_at, assigned_at), finished_at = now(), \
+                terminal_reason = $2 WHERE id = $1 AND status IN ('assigned', 'running')",
+    )
+    .bind(attempt.attempt_id)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "acknowledge cancelled attempt"))?;
+    sqlx::query(
+        "UPDATE jobs SET status = 'cancelled', assigned_worker_id = NULL, \
+                started_at = COALESCE(started_at, submitted_at), finished_at = now(), \
+                failure_message = $2 WHERE id = $1 AND status = 'cancelling'",
+    )
+    .bind(attempt.job_id)
+    .bind(reason)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "finish cancelled job"))?;
+    sqlx::query(
+        "UPDATE workers SET status = 'idle', updated_at = now() \
+         WHERE id = $1 AND status = 'busy' \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM job_attempts \
+               WHERE worker_id = $1 AND id <> $2 AND status IN ('assigned', 'running') \
+           )",
+    )
+    .bind(attempt.worker_id)
+    .bind(attempt.attempt_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "release cancelled attempt worker"))?;
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'worker', $2, 'job.cancellation.acknowledged', 'job', $3, 'succeeded', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(attempt.worker_id)
+    .bind(attempt.job_id)
+    .bind(json!({ "attempt_id": attempt.attempt_id }))
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "audit cancelled attempt"))?;
+    Ok(())
+}
+
+pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, ApiError> {
+    let mut recovered = 0;
+    for _ in 0..MAX_LEASE_RECOVERIES_PER_PASS {
+        let mut transaction = pool
+            .begin()
+            .await
+            .map_err(|error| database_error(&error, "begin lease reconciliation"))?;
+        let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
+            "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
+                    a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
+                    a.lease_expires_at \
+             FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+             WHERE a.status IN ('assigned', 'running') AND a.lease_expires_at <= now() \
+               AND j.status IN ('assigned', 'running', 'cancelling') \
+             ORDER BY a.lease_expires_at, a.id FOR UPDATE OF a, j SKIP LOCKED LIMIT 1",
+        )
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|error| database_error(&error, "select expired job attempt"))?;
+        let Some(attempt) = attempt else {
+            transaction
+                .commit()
+                .await
+                .map_err(|error| database_error(&error, "commit empty lease reconciliation"))?;
+            break;
+        };
+        close_expired_attempt(&mut transaction, &attempt).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(&error, "commit lease reconciliation"))?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn current_or_assign_job(
     pool: &PgPool,
     worker_id: Uuid,
     eligible: bool,
+    expected_heartbeat: Option<ExpectedHeartbeat<'_>>,
 ) -> Result<Option<JobAssignment>, ApiError> {
     let mut transaction = pool
         .begin()
         .await
         .map_err(|error| database_error(&error, "begin job assignment"))?;
-    let worker_status =
-        sqlx::query_scalar::<_, String>("SELECT status FROM workers WHERE id = $1 FOR UPDATE")
-            .bind(worker_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|error| database_error(&error, "lock worker for assignment"))?
-            .ok_or_else(ApiError::unauthorized)?;
+    let worker = sqlx::query_as::<_, (String, i64, String, serde_json::Value)>(
+        "SELECT status, heartbeat_sequence, protocol_version, capabilities \
+         FROM workers WHERE id = $1 FOR UPDATE",
+    )
+    .bind(worker_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| database_error(&error, "lock worker for assignment"))?
+    .ok_or_else(ApiError::unauthorized)?;
+    if expected_heartbeat.is_some_and(|expected| {
+        worker.1 != expected.sequence
+            || worker.2 != expected.protocol_version
+            || worker.3 != *expected.capabilities
+    }) {
+        return Err(ApiError::conflict(
+            "stale_sequence",
+            "A newer heartbeat was accepted before scheduling completed.",
+        ));
+    }
+    let worker_status = worker.0;
     let existing = sqlx::query_as::<_, AssignmentRecord>(
         "SELECT a.id AS attempt_id, j.id AS job_id, j.name, j.image_reference, \
                 j.timeout_seconds, a.lease_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.worker_id = $1 AND a.status IN ('assigned', 'running') \
+           AND a.lease_expires_at > now() \
          ORDER BY a.assigned_at LIMIT 1",
     )
     .bind(worker_id)
@@ -1081,11 +1377,14 @@ async fn current_or_assign_job(
     .await
     .map_err(|error| database_error(&error, "load active assignment"))?;
     if let Some(record) = existing {
+        let job_id = record.job_id;
         transaction
             .commit()
             .await
             .map_err(|error| database_error(&error, "commit active assignment"))?;
-        return Ok(Some(record.try_into()?));
+        let mut assignment: JobAssignment = record.try_into()?;
+        assignment.output_requirements = load_output_requirements(pool, job_id).await?;
+        return Ok(Some(assignment));
     }
     if !eligible || worker_status != "idle" {
         transaction
@@ -1096,9 +1395,20 @@ async fn current_or_assign_job(
     }
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
         "SELECT id, name, image_reference, timeout_seconds FROM jobs \
-         WHERE status = 'queued' AND gpu_count = 1 ORDER BY submitted_at \
+         WHERE status = 'queued' AND gpu_count = 1 \
+           AND (SELECT count(*) FROM job_attempts a WHERE a.job_id = jobs.id) < max_attempts \
+           AND ( \
+               NOT EXISTS (SELECT 1 FROM job_output_requirements r WHERE r.job_id = jobs.id) \
+               OR EXISTS ( \
+                   SELECT 1 FROM workers w WHERE w.id = $1 \
+                     AND split_part(w.protocol_version, '.', 1) = '1' \
+                     AND split_part(w.protocol_version, '.', 2)::integer >= 1 \
+               ) \
+           ) \
+         ORDER BY submitted_at \
          FOR UPDATE SKIP LOCKED LIMIT 1",
     )
+    .bind(worker_id)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "select queued job"))?;
@@ -1110,15 +1420,24 @@ async fn current_or_assign_job(
         return Ok(None);
     };
     let attempt_id = Uuid::new_v4();
+    let attempt_number = sqlx::query_scalar::<_, i32>(
+        "SELECT COALESCE(max(attempt_number), 0)::integer + 1 \
+         FROM job_attempts WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| database_error(&error, "allocate job attempt number"))?;
     let lease_expires_at = Utc::now()
         .checked_add_signed(TimeDelta::seconds(i64::from(timeout_seconds) + 120))
         .ok_or_else(ApiError::internal)?;
     sqlx::query(
         "INSERT INTO job_attempts \
-         (id, job_id, attempt_number, worker_id, lease_expires_at) VALUES ($1, $2, 1, $3, $4)",
+         (id, job_id, attempt_number, worker_id, lease_expires_at) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(attempt_id)
     .bind(job_id)
+    .bind(attempt_number)
     .bind(worker_id)
     .bind(lease_expires_at)
     .execute(&mut *transaction)
@@ -1144,7 +1463,12 @@ async fn current_or_assign_job(
     )
     .bind(Uuid::new_v4())
     .bind(job_id)
-    .bind(json!({ "attempt_id": attempt_id, "worker_id": worker_id, "lease_expires_at": lease_expires_at }))
+    .bind(json!({
+        "attempt_id": attempt_id,
+        "attempt_number": attempt_number,
+        "worker_id": worker_id,
+        "lease_expires_at": lease_expires_at
+    }))
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "audit job assignment"))?;
@@ -1160,6 +1484,7 @@ async fn current_or_assign_job(
         gpu_index: 0,
         timeout_seconds: u32::try_from(timeout_seconds).map_err(|_| ApiError::internal())?,
         lease_expires_at,
+        output_requirements: load_output_requirements(pool, job_id).await?,
     }))
 }
 
@@ -1195,9 +1520,9 @@ pub(crate) async fn heartbeat(
         return Err(ApiError::invalid_request());
     }
 
-    let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
+    let authentication = sqlx::query_as::<_, HeartbeatAuthenticationRecord>(
         "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, \
-                w.status, w.heartbeat_sequence \
+                w.status, w.heartbeat_sequence, w.protocol_version, w.capabilities \
          FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
          WHERE c.id = $1 AND c.worker_id = $2",
     )
@@ -1222,6 +1547,10 @@ pub(crate) async fn heartbeat(
     {
         return Err(ApiError::unauthorized());
     }
+    reconcile_expired_attempts(pool).await?;
+
+    let capabilities =
+        serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
 
     if request.sequence < authentication.heartbeat_sequence {
         return Err(ApiError::conflict(
@@ -1229,14 +1558,32 @@ pub(crate) async fn heartbeat(
             "A newer heartbeat has already been accepted.",
         ));
     }
-    let state_value = WorkerState::parse(&authentication.status)?;
+    let current_status: String = sqlx::query_scalar("SELECT status FROM workers WHERE id = $1")
+        .bind(worker_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| database_error(&error, "reload reconciled worker state"))?;
+    let state_value = WorkerState::parse(&current_status)?;
     if request.sequence == authentication.heartbeat_sequence {
+        if request.protocol_version != authentication.protocol_version
+            || capabilities != authentication.capabilities
+        {
+            return Err(ApiError::conflict(
+                "heartbeat_replay_mismatch",
+                "The heartbeat sequence was replayed with different protocol or capability data.",
+            ));
+        }
         let assignment = current_or_assign_job(
             pool,
             worker_id,
             state_value == WorkerState::Idle
                 && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
                 && !request.capabilities.gpus.is_empty(),
+            Some(ExpectedHeartbeat {
+                sequence: request.sequence,
+                protocol_version: &request.protocol_version,
+                capabilities: &capabilities,
+            }),
         )
         .await?;
         return Ok(Json(HeartbeatResponse {
@@ -1252,19 +1599,18 @@ pub(crate) async fn heartbeat(
         }));
     }
 
-    let capabilities =
-        serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
     let updated = sqlx::query_as::<_, (String, i64)>(
-        "UPDATE workers SET capabilities = $2, heartbeat_sequence = $3, \
-                last_seen_at = now(), last_observed_at = $4, updated_at = now() \
-         WHERE id = $1 AND status <> 'revoked' AND heartbeat_sequence < $3 \
-           AND EXISTS (SELECT 1 FROM worker_credentials c WHERE c.id = $5 \
+        "UPDATE workers SET protocol_version = $2, capabilities = $3, heartbeat_sequence = $4, \
+                last_seen_at = now(), last_observed_at = $5, updated_at = now() \
+         WHERE id = $1 AND status <> 'revoked' AND heartbeat_sequence < $4 \
+           AND EXISTS (SELECT 1 FROM worker_credentials c WHERE c.id = $6 \
                        AND c.worker_id = workers.id AND c.revoked_at IS NULL \
                        AND (c.expires_at IS NULL OR c.expires_at > now())) \
          RETURNING status, heartbeat_sequence",
     )
     .bind(worker_id)
-    .bind(capabilities)
+    .bind(&request.protocol_version)
+    .bind(&capabilities)
     .bind(request.sequence)
     .bind(request.observed_at)
     .bind(credential_id)
@@ -1273,8 +1619,9 @@ pub(crate) async fn heartbeat(
     .map_err(|error| database_error(&error, "update heartbeat"))?;
 
     let Some((status, accepted_sequence)) = updated else {
-        let current = sqlx::query_as::<_, (String, i64)>(
-            "SELECT status, heartbeat_sequence FROM workers WHERE id = $1",
+        let current = sqlx::query_as::<_, (String, i64, String, serde_json::Value)>(
+            "SELECT status, heartbeat_sequence, protocol_version, capabilities \
+             FROM workers WHERE id = $1",
         )
         .bind(worker_id)
         .fetch_optional(pool)
@@ -1285,6 +1632,12 @@ pub(crate) async fn heartbeat(
             return Err(ApiError::unauthorized());
         }
         if current.1 == request.sequence {
+            if current.2 != request.protocol_version || current.3 != capabilities {
+                return Err(ApiError::conflict(
+                    "heartbeat_replay_mismatch",
+                    "The heartbeat sequence was replayed with different protocol or capability data.",
+                ));
+            }
             let current_state = WorkerState::parse(&current.0)?;
             let assignment = current_or_assign_job(
                 pool,
@@ -1292,6 +1645,11 @@ pub(crate) async fn heartbeat(
                 current_state == WorkerState::Idle
                     && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
                     && !request.capabilities.gpus.is_empty(),
+                Some(ExpectedHeartbeat {
+                    sequence: request.sequence,
+                    protocol_version: &request.protocol_version,
+                    capabilities: &capabilities,
+                }),
             )
             .await?;
             return Ok(Json(HeartbeatResponse {
@@ -1319,6 +1677,11 @@ pub(crate) async fn heartbeat(
         response_state == WorkerState::Idle
             && request.capabilities.gpu_health.status == GpuHealthStatus::Healthy
             && !request.capabilities.gpus.is_empty(),
+        Some(ExpectedHeartbeat {
+            sequence: request.sequence,
+            protocol_version: &request.protocol_version,
+            capabilities: &capabilities,
+        }),
     )
     .await?;
     Ok(Json(HeartbeatResponse {
@@ -1362,8 +1725,7 @@ pub(crate) async fn report_job_result(
     let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
         .map_err(|_| ApiError::unauthorized())?;
     let authentication = sqlx::query_as::<_, WorkerAuthenticationRecord>(
-        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, \
-                w.status, w.heartbeat_sequence \
+        "SELECT c.token_verifier, c.expires_at, c.revoked_at AS credential_revoked_at, w.status \
          FROM worker_credentials c JOIN workers w ON w.id = c.worker_id \
          WHERE c.id = $1 AND c.worker_id = $2",
     )
@@ -1399,8 +1761,12 @@ pub(crate) async fn report_job_result(
         .begin()
         .await
         .map_err(|error| database_error(&error, "begin job result"))?;
-    let attempt = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT job_id, status FROM job_attempts WHERE id = $1 AND worker_id = $2 FOR UPDATE",
+    let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
+        "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
+                a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
+                a.lease_expires_at \
+         FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+         WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
     .bind(attempt_id)
     .bind(worker_id)
@@ -1408,18 +1774,82 @@ pub(crate) async fn report_job_result(
     .await
     .map_err(|error| database_error(&error, "load job attempt"))?
     .ok_or_else(ApiError::unauthorized)?;
-    if matches!(attempt.1.as_str(), "succeeded" | "failed") {
+    if matches!(
+        attempt.attempt_status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    ) {
         transaction
             .commit()
             .await
             .map_err(|error| database_error(&error, "commit repeated job result"))?;
         return Ok(Json(JobResultResponse {
             attempt_id,
-            job_id: attempt.0,
-            status: attempt.1,
+            job_id: attempt.job_id,
+            status: attempt.attempt_status,
+        }));
+    }
+    // `now()` is fixed at transaction start in PostgreSQL. This query deliberately runs after the
+    // attempt and job locks have been acquired and uses the wall clock so lock wait time counts
+    // against execution authority.
+    let lease_expired: bool = sqlx::query_scalar("SELECT clock_timestamp() >= $1")
+        .bind(attempt.lease_expires_at)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database_error(&error, "check job attempt lease after locking"))?;
+    if lease_expired {
+        let outcome = close_expired_attempt(&mut transaction, &attempt).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(&error, "commit expired job result"))?;
+        return Ok(Json(JobResultResponse {
+            attempt_id,
+            job_id: attempt.job_id,
+            status: outcome.attempt_status.to_owned(),
+        }));
+    }
+    if attempt.job_status == "cancelling" {
+        acknowledge_cancelled_attempt(&mut transaction, &attempt).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(&error, "commit cancelled job result"))?;
+        return Ok(Json(JobResultResponse {
+            attempt_id,
+            job_id: attempt.job_id,
+            status: "cancelled".to_owned(),
         }));
     }
     let succeeded = result.exit_code == 0 && !result.timed_out && result.failure_message.is_none();
+    if succeeded {
+        let missing_artifacts = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM job_output_requirements r \
+             WHERE r.job_id = $1 AND r.mandatory \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM job_artifacts ar \
+                   WHERE ar.output_requirement_id = r.id AND ar.attempt_id = $2 \
+                     AND ar.status = 'verified' AND ar.upload_completed_at IS NOT NULL \
+                     AND ar.verified_at IS NOT NULL \
+                     AND ar.verification_source = 'gcs_metadata' \
+                     AND ar.verified_storage_generation = ar.storage_generation \
+                     AND ar.verified_byte_length = ar.byte_length \
+                     AND ar.verified_byte_length = ar.uploaded_byte_length \
+                     AND ar.verified_crc32c = ar.crc32c \
+                     AND ar.verified_crc32c = ar.uploaded_crc32c \
+               )",
+        )
+        .bind(attempt.job_id)
+        .bind(attempt_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database_error(&error, "check mandatory job artefacts"))?;
+        if missing_artifacts > 0 {
+            return Err(ApiError::conflict(
+                "artifacts_incomplete",
+                "Mandatory output artefacts have not been durably verified.",
+            ));
+        }
+    }
     let final_status = if succeeded { "succeeded" } else { "failed" };
     sqlx::query(
         "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, assigned_at), \
@@ -1435,7 +1865,7 @@ pub(crate) async fn report_job_result(
                 finished_at = now(), exit_code = $3, stdout = $4, stderr = $5, \
                 failure_message = $6 WHERE id = $1",
     )
-    .bind(attempt.0)
+    .bind(attempt.job_id)
     .bind(final_status)
     .bind(result.exit_code)
     .bind(&result.stdout)
@@ -1458,7 +1888,7 @@ pub(crate) async fn report_job_result(
     )
     .bind(Uuid::new_v4())
     .bind(worker_id)
-    .bind(attempt.0)
+    .bind(attempt.job_id)
     .bind(if succeeded { "succeeded" } else { "failed" })
     .bind(json!({ "attempt_id": attempt_id, "exit_code": result.exit_code, "timed_out": result.timed_out }))
     .execute(&mut *transaction)
@@ -1470,7 +1900,7 @@ pub(crate) async fn report_job_result(
         .map_err(|error| database_error(&error, "commit job result"))?;
     Ok(Json(JobResultResponse {
         attempt_id,
-        job_id: attempt.0,
+        job_id: attempt.job_id,
         status: final_status.to_owned(),
     }))
 }
@@ -1493,7 +1923,7 @@ mod tests {
     };
 
     use super::{
-        GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
+        ExpectedHeartbeat, GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
         immutable_sha256_reference, valid_gpu_health,
     };
 
@@ -1562,6 +1992,45 @@ mod tests {
         job_id
     }
 
+    fn healthy_capabilities_json() -> Value {
+        json!({
+            "protocol_version": "1.0",
+            "collected_at": Utc::now(),
+            "hostname": "replacement-worker",
+            "operating_system": "linux",
+            "operating_system_version": "6.8",
+            "architecture": "x86_64",
+            "logical_cpu_count": 16,
+            "memory_total_bytes": 34_359_738_368_u64,
+            "storage_available_bytes": 107_374_182_400_u64,
+            "python_version": "3.12.7",
+            "gpus": [{
+                "index": 0,
+                "name": "Test GPU",
+                "memory_total_bytes": 8_589_934_592_u64,
+                "driver_version": "560.35"
+            }],
+            "gpu_health": {
+                "status": "healthy",
+                "detail": "GPU computation passed",
+                "evidence": {
+                    "schema_version": "1.0",
+                    "status": "healthy",
+                    "checked_at": Utc::now(),
+                    "image_reference": format!("example.test/health@sha256:{}", "a".repeat(64)),
+                    "device_index": 0,
+                    "device_name": "Test GPU",
+                    "operation": "matrix multiplication",
+                    "matrix_size": 512,
+                    "max_absolute_error": 0.0,
+                    "duration_ms": 10.0,
+                    "cuda_driver_api_version": "13.3",
+                    "cuda_runtime_version": "12.9"
+                }
+            }
+        })
+    }
+
     #[test]
     fn health_evidence_requires_an_immutable_lowercase_digest() {
         assert!(immutable_sha256_reference(&format!(
@@ -1598,11 +2067,11 @@ mod tests {
         let worker_id = insert_worker(&pool, owner_id, "idle").await;
         let job_id = insert_job(&pool, owner_id).await;
 
-        let first = current_or_assign_job(&pool, worker_id, true)
+        let first = current_or_assign_job(&pool, worker_id, true, None)
             .await
             .unwrap()
             .unwrap();
-        let replay = current_or_assign_job(&pool, worker_id, true)
+        let replay = current_or_assign_job(&pool, worker_id, true, None)
             .await
             .unwrap()
             .unwrap();
@@ -1630,8 +2099,8 @@ mod tests {
         let job_id = insert_job(&pool, owner_id).await;
 
         let (first, second) = tokio::join!(
-            current_or_assign_job(&pool, first_worker, true),
-            current_or_assign_job(&pool, second_worker, true),
+            current_or_assign_job(&pool, first_worker, true, None),
+            current_or_assign_job(&pool, second_worker, true, None),
         );
         let assignments: Vec<_> = [first.unwrap(), second.unwrap()]
             .into_iter()
@@ -1646,7 +2115,7 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let replay = current_or_assign_job(&pool, assigned_worker, true)
+        let replay = current_or_assign_job(&pool, assigned_worker, true, None)
             .await
             .unwrap()
             .unwrap();
@@ -1686,6 +2155,73 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((attempts, active_attempts, busy_workers), (1, 1, 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scheduler_rejects_heartbeat_superseded_while_waiting_for_worker_lock(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, 'model.pt', 'checkpoint', 'application/octet-stream', true, 1024)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut newer_heartbeat = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE workers SET heartbeat_sequence = 1, protocol_version = '1.1', \
+                    capabilities = '{\"protocol_version\":\"1.1\"}'::jsonb WHERE id = $1",
+        )
+        .bind(worker_id)
+        .execute(&mut *newer_heartbeat)
+        .await
+        .unwrap();
+
+        let scheduler_pool = pool.clone();
+        let mut scheduler = tokio::spawn(async move {
+            let old_capabilities = json!({});
+            current_or_assign_job(
+                &scheduler_pool,
+                worker_id,
+                true,
+                Some(ExpectedHeartbeat {
+                    sequence: 0,
+                    protocol_version: "1.0",
+                    capabilities: &old_capabilities,
+                }),
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut scheduler)
+                .await
+                .is_err(),
+            "scheduler should wait for the heartbeat's worker-row lock"
+        );
+        newer_heartbeat.commit().await.unwrap();
+
+        let error = scheduler.await.unwrap().unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.body.code, "stale_sequence");
+        let job_state: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let attempt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM job_attempts WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_state, "queued");
+        assert_eq!(attempt_count, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1778,5 +2314,392 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(replacement_status, "assigned");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn result_waiting_for_attempt_lock_is_rejected_when_lease_expires(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "busy").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        let attempt_id = Uuid::new_v4();
+        let lease_expires_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() + interval '3 seconds'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'running', assigned_worker_id = $2 WHERE id = $1")
+            .bind(job_id)
+            .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, started_at, lease_expires_at) \
+             VALUES ($1, $2, 1, $3, 'running', now(), $4)",
+        )
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(lease_expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(credential.id)
+        .bind(worker_id)
+        .bind(&credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM job_attempts WHERE id = $1 FOR UPDATE")
+            .bind(attempt_id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let request = app(None, Some(pool.clone())).oneshot(
+            Request::put(format!(
+                "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result"
+            ))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", credential.plaintext.expose()),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "stdout": "completed before the lock was released",
+                    "stderr": "",
+                    "failure_message": null
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        );
+        let result = tokio::spawn(request);
+
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result_query_waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM pg_stat_activity \
+                    WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                      AND wait_event_type = 'Lock' \
+                      AND query LIKE '%FROM job_attempts a JOIN jobs j%' \
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if result_query_waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "result endpoint did not reach the attempt lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let transaction_started_before_expiry: bool =
+            sqlx::query_scalar("SELECT clock_timestamp() < $1")
+                .bind(lease_expires_at)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(transaction_started_before_expiry);
+
+        loop {
+            let expired: bool = sqlx::query_scalar("SELECT clock_timestamp() >= $1")
+                .bind(lease_expires_at)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if expired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        blocker.commit().await.unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["status"], "failed");
+
+        let persisted: (String, String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT a.status, j.status, j.exit_code, j.stdout \
+             FROM job_attempts a JOIN jobs j ON j.id = a.job_id WHERE a.id = $1",
+        )
+        .bind(attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            ("failed".to_owned(), "queued".to_owned(), None, None)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn expired_attempt_is_retried_once_and_late_results_remain_terminal(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let lost_worker = insert_worker(&pool, owner_id, "busy").await;
+        let replacement_worker = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        let lost_attempt = Uuid::new_v4();
+        sqlx::query("UPDATE jobs SET status = 'assigned', assigned_worker_id = $2 WHERE id = $1")
+            .bind(job_id)
+            .bind(lost_worker)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, assigned_at, lease_expires_at) \
+             VALUES ($1, $2, 1, $3, 'running', now() - interval '10 minutes', \
+                     now() - interval '1 minute')",
+        )
+        .bind(lost_attempt)
+        .bind(job_id)
+        .bind(lost_worker)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let replacement_credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(replacement_credential.id)
+        .bind(replacement_worker)
+        .bind(&replacement_credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let router = app(None, Some(pool.clone()));
+        let heartbeat = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/v1/workers/{replacement_worker}/heartbeat"))
+                    .header(
+                        AUTHORIZATION,
+                        format!("Bearer {}", replacement_credential.plaintext.expose()),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.0",
+                            "sequence": 1,
+                            "observed_at": Utc::now(),
+                            "capabilities": healthy_capabilities_json()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+        let heartbeat = to_bytes(heartbeat.into_body(), 1024 * 1024).await.unwrap();
+        let heartbeat: Value = serde_json::from_slice(&heartbeat).unwrap();
+        assert_eq!(heartbeat["assignment"]["job_id"], job_id.to_string());
+        let replacement_attempt =
+            Uuid::parse_str(heartbeat["assignment"]["attempt_id"].as_str().unwrap()).unwrap();
+
+        let recovered: (String, bool, Option<String>, String, String, i64) = sqlx::query_as(
+            "SELECT a.status, a.finished_at IS NOT NULL, a.terminal_reason, j.status, w.status, \
+                    (SELECT count(*) FROM job_attempts active \
+                     WHERE active.job_id = j.id AND active.status IN ('assigned', 'running')) \
+             FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+             JOIN workers w ON w.id = a.worker_id WHERE a.id = $1",
+        )
+        .bind(lost_attempt)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered.0, "failed");
+        assert!(recovered.1);
+        assert!(recovered.2.unwrap().contains("bounded retry"));
+        assert_eq!(recovered.3, "assigned");
+        assert_eq!(recovered.4, "idle");
+        assert_eq!(recovered.5, 1);
+
+        let lost_credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(lost_credential.id)
+        .bind(lost_worker)
+        .bind(&lost_credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stale = router
+            .clone()
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{lost_worker}/job-attempts/{lost_attempt}/result"
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", lost_credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "stdout": "stale success",
+                        "stderr": "",
+                        "failure_message": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        let stale = to_bytes(stale.into_body(), 1024 * 1024).await.unwrap();
+        let stale: Value = serde_json::from_slice(&stale).unwrap();
+        assert_eq!(stale["status"], "failed");
+
+        sqlx::query(
+            "UPDATE job_attempts SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(replacement_attempt)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let final_result = router
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{replacement_worker}/job-attempts/{replacement_attempt}/result"
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", replacement_credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "stdout": "too late",
+                        "stderr": "",
+                        "failure_message": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(final_result.status(), StatusCode::OK);
+        let final_result = to_bytes(final_result.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let final_result: Value = serde_json::from_slice(&final_result).unwrap();
+        assert_eq!(final_result["status"], "failed");
+
+        let exhausted: (String, Option<Uuid>, Option<i32>, Option<String>, i64, i64) =
+            sqlx::query_as(
+                "SELECT j.status, j.assigned_worker_id, j.exit_code, j.stdout, \
+                        count(a.id), \
+                        count(a.id) FILTER (WHERE a.status IN ('assigned', 'running')) \
+                 FROM jobs j JOIN job_attempts a ON a.job_id = j.id WHERE j.id = $1 \
+                 GROUP BY j.status, j.assigned_worker_id, j.exit_code, j.stdout",
+            )
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(exhausted, ("failed".to_owned(), None, None, None, 2, 0));
+        let replacement_state: String =
+            sqlx::query_scalar("SELECT status FROM workers WHERE id = $1")
+                .bind(replacement_worker)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(replacement_state, "idle");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn output_jobs_require_worker_protocol_one_point_one(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let worker_id = Uuid::new_v4();
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO human_identities (id, provider, provider_subject, display_name) \
+             VALUES ($1, 'test', $2, 'Owner')",
+        )
+        .bind(owner_id)
+        .bind(Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb)",
+        )
+        .bind(worker_id)
+        .bind(owner_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
+             VALUES ($1, $2, 'Training', $3, 120)",
+        )
+        .bind(job_id)
+        .bind(owner_id)
+        .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, 'model.pt', 'checkpoint', 'application/octet-stream', true, 1024)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            current_or_assign_job(&pool, worker_id, true, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE workers SET protocol_version = '1.1' WHERE id = $1")
+            .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let assignment = current_or_assign_job(&pool, worker_id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.job_id, job_id);
+        assert_eq!(assignment.output_requirements.len(), 1);
+        assert_eq!(assignment.output_requirements[0].logical_path, "model.pt");
     }
 }

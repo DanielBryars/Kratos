@@ -16,9 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
+    artifacts::{JobOutputRequirement, validate_output_requirements},
     credentials::{self, CredentialKind},
     human_auth::{HumanIdentity, VerifyError},
-    registry::{ErrorResponse, WorkerCapabilities},
+    registry::{ErrorResponse, WorkerCapabilities, reconcile_expired_attempts},
 };
 
 const DEFAULT_EXPIRY_SECONDS: i64 = 900;
@@ -102,6 +103,9 @@ pub struct CreateJobRequest {
     /// Immutable OCI image reference selected and approved by the operator.
     pub image_reference: String,
     pub timeout_seconds: i32,
+    /// Exact output paths and limits approved as part of the immutable job specification.
+    #[serde(default)]
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -120,6 +124,7 @@ pub struct OperatorJobResponse {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub failure_message: Option<String>,
+    pub output_requirements: Vec<JobOutputRequirement>,
 }
 
 #[derive(FromRow)]
@@ -169,9 +174,10 @@ struct JobRecord {
     failure_message: Option<String>,
 }
 
-impl From<JobRecord> for OperatorJobResponse {
-    fn from(record: JobRecord) -> Self {
-        Self {
+impl JobRecord {
+    fn into_response(self, output_requirements: Vec<JobOutputRequirement>) -> OperatorJobResponse {
+        let record = self;
+        OperatorJobResponse {
             job_id: record.id,
             name: record.name,
             image_reference: record.image_reference,
@@ -186,6 +192,7 @@ impl From<JobRecord> for OperatorJobResponse {
             stdout: record.stdout,
             stderr: record.stderr,
             failure_message: record.failure_message,
+            output_requirements,
         }
     }
 }
@@ -266,7 +273,7 @@ impl OperatorError {
         Self::new(
             StatusCode::CONFLICT,
             "job_state_conflict",
-            "Only a queued job can be cancelled.",
+            "A succeeded or failed job cannot be cancelled.",
         )
     }
 
@@ -865,6 +872,34 @@ pub(crate) async fn revoke_worker(
 const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, status, assigned_worker_id, \
      submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message";
 
+async fn job_output_requirements(
+    database: &sqlx::PgPool,
+    job_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<JobOutputRequirement>>, OperatorError> {
+    let rows = sqlx::query_as::<_, (Uuid, String, String, String, bool, i64)>(
+        "SELECT job_id, logical_path, role, media_type, mandatory, max_bytes \
+         FROM job_output_requirements WHERE job_id = ANY($1) ORDER BY logical_path",
+    )
+    .bind(job_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    let mut by_job = HashMap::new();
+    for (job_id, logical_path, role, media_type, mandatory, max_bytes) in rows {
+        by_job
+            .entry(job_id)
+            .or_insert_with(Vec::new)
+            .push(JobOutputRequirement {
+                logical_path,
+                role,
+                media_type,
+                mandatory,
+                max_bytes: u64::try_from(max_bytes).map_err(|_| OperatorError::internal())?,
+            });
+    }
+    Ok(by_job)
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/jobs",
@@ -896,6 +931,8 @@ pub(crate) async fn create_job(
     {
         return Err(OperatorError::invalid_request());
     }
+    validate_output_requirements(&request.output_requirements)
+        .map_err(|_| OperatorError::invalid_request())?;
     let id = Uuid::new_v4();
     let mut transaction = database
         .begin()
@@ -914,6 +951,23 @@ pub(crate) async fn create_job(
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+    for output in &request.output_requirements {
+        sqlx::query(
+            "INSERT INTO job_output_requirements \
+             (id, job_id, logical_path, role, media_type, mandatory, max_bytes) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(id)
+        .bind(&output.logical_path)
+        .bind(&output.role)
+        .bind(&output.media_type)
+        .bind(output.mandatory)
+        .bind(i64::try_from(output.max_bytes).map_err(|_| OperatorError::invalid_request())?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    }
     sqlx::query(
         "INSERT INTO audit_events \
          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
@@ -922,7 +976,11 @@ pub(crate) async fn create_job(
     .bind(Uuid::new_v4())
     .bind(operator_id)
     .bind(id)
-    .bind(json!({ "image_reference": request.image_reference, "timeout_seconds": request.timeout_seconds }))
+    .bind(json!({
+        "image_reference": request.image_reference,
+        "timeout_seconds": request.timeout_seconds,
+        "output_count": request.output_requirements.len()
+    }))
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
@@ -930,7 +988,10 @@ pub(crate) async fn create_job(
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok((StatusCode::CREATED, Json(record.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(record.into_response(request.output_requirements)),
+    ))
 }
 
 #[utoipa::path(
@@ -949,6 +1010,9 @@ pub(crate) async fn list_jobs(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    reconcile_expired_attempts(database)
+        .await
+        .map_err(|_| OperatorError::internal())?;
     let query = format!(
         "SELECT {JOB_COLUMNS} FROM jobs WHERE owner_identity_id = $1 ORDER BY submitted_at DESC LIMIT 100"
     );
@@ -957,7 +1021,17 @@ pub(crate) async fn list_jobs(
         .fetch_all(database)
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok(Json(records.into_iter().map(Into::into).collect()))
+    let job_ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
+    let mut requirements = job_output_requirements(database, &job_ids).await?;
+    Ok(Json(
+        records
+            .into_iter()
+            .map(|record| {
+                let outputs = requirements.remove(&record.id).unwrap_or_default();
+                record.into_response(outputs)
+            })
+            .collect(),
+    ))
 }
 
 #[utoipa::path(
@@ -967,8 +1041,8 @@ pub(crate) async fn list_jobs(
     security(("human_bearer" = [])),
     params(("job_id" = Uuid, Path, description = "Job identifier")),
     responses(
-        (status = 200, description = "Queued job cancelled idempotently", body = OperatorJobResponse),
-        (status = 409, description = "Job has already been assigned", body = ErrorResponse)
+        (status = 200, description = "Cancellation requested or completed idempotently", body = OperatorJobResponse),
+        (status = 409, description = "Job is already terminal", body = ErrorResponse)
     )
 )]
 pub(crate) async fn cancel_job(
@@ -981,9 +1055,18 @@ pub(crate) async fn cancel_job(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    reconcile_expired_attempts(database)
+        .await
+        .map_err(|_| OperatorError::internal())?;
     let query = format!(
-        "UPDATE jobs SET status = 'cancelled', finished_at = COALESCE(finished_at, now()) \
-         WHERE id = $1 AND owner_identity_id = $2 AND status IN ('queued', 'cancelled') \
+        "UPDATE jobs SET \
+             status = CASE WHEN status IN ('assigned', 'running', 'cancelling') \
+                           THEN 'cancelling' ELSE 'cancelled' END, \
+             cancel_requested_at = COALESCE(cancel_requested_at, now()), \
+             finished_at = CASE WHEN status IN ('queued', 'cancelled') \
+                                THEN COALESCE(finished_at, now()) ELSE NULL END \
+         WHERE id = $1 AND owner_identity_id = $2 \
+           AND status IN ('queued', 'assigned', 'running', 'cancelling', 'cancelled') \
          RETURNING {JOB_COLUMNS}"
     );
     let record = sqlx::query_as::<_, JobRecord>(&query)
@@ -993,7 +1076,11 @@ pub(crate) async fn cancel_job(
         .await
         .map_err(|_| OperatorError::internal())?
         .ok_or_else(OperatorError::job_conflict)?;
-    Ok(Json(record.into()))
+    let outputs = job_output_requirements(database, &[record.id])
+        .await?
+        .remove(&record.id)
+        .unwrap_or_default();
+    Ok(Json(record.into_response(outputs)))
 }
 
 async fn authorize_operator(
@@ -1579,5 +1666,191 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(persisted, ("cancelled".to_owned(), true, 0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn active_cancellation_is_idempotent_and_finishes_when_the_lease_expires(pool: PgPool) {
+        let operator_id = Uuid::new_v4();
+        let auth = HumanAuth::new(
+            Arc::new(FakeVerifier {
+                identity: HumanIdentity {
+                    subject: "cancellation-operator".to_owned(),
+                    email: "operator@example.com".to_owned(),
+                    display_name: "Cancellation Operator".to_owned(),
+                },
+            }),
+            "operator@example.com",
+            ClientAuthConfig {
+                api_key: "test-api-key".to_owned(),
+                auth_domain: "example.test".to_owned(),
+                project_id: "test-project".to_owned(),
+            },
+        );
+        sqlx::query(
+            "INSERT INTO human_identities \
+             (id, provider, provider_subject, display_name, email, role) \
+             VALUES ($1, 'identity-platform', 'cancellation-operator', \
+                     'Cancellation Operator', 'operator@example.com', 'operator')",
+        )
+        .bind(operator_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
+              status, capabilities) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4)",
+        )
+        .bind(worker_id)
+        .bind(operator_id)
+        .bind(Uuid::new_v4())
+        .bind(healthy_worker_capabilities())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let worker_credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(worker_credential.id)
+        .bind(worker_id)
+        .bind(&worker_credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs \
+             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id) \
+             VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4)",
+        )
+        .bind(job_id)
+        .bind(operator_id)
+        .bind(format!("example.test/work@sha256:{}", "b".repeat(64)))
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, started_at, lease_expires_at) \
+             VALUES ($1, $2, 1, $3, 'running', now(), now() + interval '5 minutes')",
+        )
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let router = app_with_human_auth(None, Some(pool.clone()), Some(auth));
+        let mut first_requested_at = None;
+        for _ in 0..2 {
+            let cancelled = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/operator/jobs/{job_id}/cancel"))
+                        .header(AUTHORIZATION, "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancelled.status(), StatusCode::OK);
+            let cancelled = to_bytes(cancelled.into_body(), 1024 * 1024).await.unwrap();
+            let cancelled: Value = serde_json::from_slice(&cancelled).unwrap();
+            assert_eq!(cancelled["status"], "cancelling");
+            assert_eq!(cancelled["finished_at"], Value::Null);
+            let requested_at: chrono::DateTime<Utc> =
+                sqlx::query_scalar("SELECT cancel_requested_at FROM jobs WHERE id = $1")
+                    .bind(job_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if let Some(first) = first_requested_at {
+                assert_eq!(requested_at, first);
+            } else {
+                first_requested_at = Some(requested_at);
+            }
+        }
+
+        sqlx::query(
+            "UPDATE job_attempts SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(attempt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let listed = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/operator/jobs")
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = to_bytes(listed.into_body(), 1024 * 1024).await.unwrap();
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        assert_eq!(listed[0]["status"], "cancelled");
+
+        let stale_result = router
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result"
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", worker_credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "stdout": "late success",
+                        "stderr": "",
+                        "failure_message": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_result.status(), StatusCode::OK);
+        let stale_result = to_bytes(stale_result.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let stale_result: Value = serde_json::from_slice(&stale_result).unwrap();
+        assert_eq!(stale_result["status"], "cancelled");
+
+        let persisted: (String, bool, Option<Uuid>, String, bool, String) = sqlx::query_as(
+            "SELECT j.status, j.finished_at IS NOT NULL, j.assigned_worker_id, \
+                    a.status, a.finished_at IS NOT NULL, w.status \
+             FROM jobs j JOIN job_attempts a ON a.job_id = j.id \
+             JOIN workers w ON w.id = a.worker_id WHERE j.id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "cancelled".to_owned(),
+                true,
+                None,
+                "cancelled".to_owned(),
+                true,
+                "idle".to_owned()
+            )
+        );
     }
 }

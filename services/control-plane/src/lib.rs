@@ -15,6 +15,7 @@ use utoipa::{
 };
 use utoipa_swagger_ui::SwaggerUi;
 
+mod artifacts;
 pub mod credentials;
 pub mod database;
 pub mod human_auth;
@@ -22,6 +23,10 @@ pub mod migration;
 mod operator;
 mod registry;
 
+use artifacts::{
+    ArtifactManifestFile, ArtifactManifestResponse, ArtifactResponse, BeginArtifactUploadRequest,
+    CompleteArtifactUploadRequest, DeclareArtifactManifestRequest, JobOutputRequirement,
+};
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
     ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, CreateJobRequest,
@@ -83,7 +88,10 @@ pub(crate) struct AppState {
         registry::registration_status,
         registry::claim_registration,
         registry::heartbeat,
-        registry::report_job_result
+        registry::report_job_result,
+        artifacts::declare_manifest,
+        artifacts::begin_upload,
+        artifacts::complete_upload
     ),
     components(schemas(
         HealthResponse, ReadinessResponse, VersionResponse, ClientAuthConfig, EnrolmentRequest,
@@ -94,7 +102,9 @@ pub(crate) struct AppState {
         ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,
         ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
         WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, JobAssignment,
-        JobResultRequest, JobResultResponse
+        JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
+        DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
+        ArtifactResponse, ArtifactManifestResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -293,6 +303,18 @@ pub fn app_with_human_auth(
         .route(
             "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result",
             put(registry::report_job_result),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifact-manifest",
+            put(artifacts::declare_manifest),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/upload",
+            put(artifacts::begin_upload),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifacts/{artifact_id}/complete-upload",
+            put(artifacts::complete_upload),
         )
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(AppState {
