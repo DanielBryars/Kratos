@@ -39,9 +39,6 @@ ATTEMPT_DIRECTORY = "attempts"
 # A little above the classifier's own bound, so a line truncated here is still over that
 # bound once its timestamp prefix is removed and is refused rather than silently shortened.
 LOG_LINE_BOUND_BYTES = MAX_LINE_BYTES + 128
-# How long supervision waits for the log reader to finish after the container exits. It is
-# a tail of already-buffered output, not a network call, and nothing waits on the result.
-LOG_DRAIN_SECONDS = 5.0
 # Volume subpath mounts require Docker Engine 26 or later.
 MINIMUM_SUBPATH_ENGINE_MAJOR = 26
 # Cleanup runs a known image, not the workload's: an arbitrary image need not contain a
@@ -347,6 +344,7 @@ class DockerExecutor:
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
+        # Signalled, never waited on: the result goes now, whatever the reader is doing.
         self._stop_log_reader(reader, reader_stop)
         # Both or neither: an interval with one end missing is not evidence.
         whole = observed_start is not None and observed_finish is not None
@@ -524,11 +522,17 @@ class DockerExecutor:
 
     @staticmethod
     def _stop_log_reader(reader: threading.Thread | None, stop: threading.Event) -> None:
+        """Ask the reader to stop, and do not wait for it.
+
+        Not even briefly. A result may never wait on telemetry, and a bounded wait is still a
+        wait: it would make a slow or stuck log stream delay the result, the lease and the
+        worker's availability by exactly the bound. The reader is a daemon thread, so it cannot
+        hold the agent open, and whatever it is still holding is diagnostic data.
+
+        The consequence is that the reader may deliver a few more lines after this returns, which
+        is why the pump it feeds is safe to call from two threads.
+        """
         stop.set()
-        if reader is not None:
-            # Bounded, because nothing may wait on telemetry indefinitely. A reader still going
-            # after this is a daemon thread and does not hold the agent open.
-            reader.join(timeout=LOG_DRAIN_SECONDS)
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""

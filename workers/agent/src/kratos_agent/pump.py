@@ -11,6 +11,7 @@ malformed line or a broken spool can do is lose diagnostic data and leave a numb
 """
 
 import json
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,9 +51,12 @@ class Delivery:
 class ObservationPump:
     """Classifies lines, spools what a sink wants, and drains the spool on an interval.
 
-    One pump belongs to one attempt. Its `ingest` is called by whatever is reading the container's
-    output; its `deliver` is called from the supervision tick, where it must return quickly and
-    must never raise.
+    One pump belongs to one attempt, and **it is called from more than one thread**. The log
+    reader calls `ingest` while a delivery thread calls `deliver`, and the runner calls `counters`
+    at the moment it reports a result -- which, because a result never waits for telemetry, can
+    happen while the reader is still delivering its last few lines. The classifier and the spool
+    are single-threaded by design, so this class holds the lock that makes them safe rather than
+    pushing that requirement onto them.
     """
 
     def __init__(
@@ -72,6 +76,7 @@ class ObservationPump:
         self._otlp_configured = otlp_configured
         self._interval = batch_interval_seconds
         self._last_send = float("-inf")
+        self._lock = threading.Lock()
         self._result: dict[str, object] | None = None
         self._failures = 0
 
@@ -80,21 +85,25 @@ class ObservationPump:
     def ingest(self, stream: Stream, at: datetime, line: str) -> None:
         """Classify one line and spool it for whichever sinks want it. Never raises."""
         try:
-            observation = self._collector.observe(stream, at, line)
-            if observation is None:
-                return
-            if observation.kind is Kind.RESULT:
-                # The last result wins, and it travels with the job result rather than as an
-                # observation: it is the workload's own output, not a measurement of it.
-                self._result = observation.result
-                return
-            if observation.kind is Kind.LOG:
-                self._ingest_log()
-                return
-            if observation.kind in _DELIVERED_TO_CONTROL_PLANE:
-                self._spool.append(_wire_record(observation))
+            with self._lock:
+                self._ingest(stream, at, line)
         except Exception:  # noqa: BLE001 - telemetry must never raise into supervision
             self._failures += 1
+
+    def _ingest(self, stream: Stream, at: datetime, line: str) -> None:
+        observation = self._collector.observe(stream, at, line)
+        if observation is None:
+            return
+        if observation.kind is Kind.RESULT:
+            # The last result wins, and it travels with the job result rather than as an
+            # observation: it is the workload's own output, not a measurement of it.
+            self._result = observation.result
+            return
+        if observation.kind is Kind.LOG:
+            self._ingest_log()
+            return
+        if observation.kind in _DELIVERED_TO_CONTROL_PLANE:
+            self._spool.append(_wire_record(observation))
 
     def _ingest_log(self) -> None:
         if not self._otlp_configured:
@@ -115,25 +124,29 @@ class ObservationPump:
         the control plane is idempotent on stream and sequence.
         """
         try:
-            now = self._clock()
-            if not force and now - self._last_send < self._interval:
-                return Delivery(sent=False)
-            batch = self._spool.next_batch(
-                CONTROL_PLANE_SINK,
-                limit=MAX_OBSERVATION_BATCH_RECORDS,
-                max_bytes=MAX_OBSERVATION_BATCH_BYTES,
-            )
-            if batch is None:
-                self._last_send = now
-                return Delivery(sent=False)
-            accepted = self._send(batch)
-            self._last_send = self._clock()
-            self._spool.acknowledge(CONTROL_PLANE_SINK, accepted)
-            return Delivery(sent=True, accepted_through_sequence=accepted)
+            with self._lock:
+                return self._deliver(force=force)
         except Exception as error:  # noqa: BLE001 - an outage is not a supervision failure
             self._failures += 1
             self._last_send = self._clock()
             return Delivery(sent=False, detail=str(error))
+
+    def _deliver(self, *, force: bool) -> Delivery:
+        now = self._clock()
+        if not force and now - self._last_send < self._interval:
+            return Delivery(sent=False)
+        batch = self._spool.next_batch(
+            CONTROL_PLANE_SINK,
+            limit=MAX_OBSERVATION_BATCH_RECORDS,
+            max_bytes=MAX_OBSERVATION_BATCH_BYTES,
+        )
+        if batch is None:
+            self._last_send = now
+            return Delivery(sent=False)
+        accepted = self._send(batch)
+        self._last_send = self._clock()
+        self._spool.acknowledge(CONTROL_PLANE_SINK, accepted)
+        return Delivery(sent=True, accepted_through_sequence=accepted)
 
     def refuse_current_batch(self) -> None:
         """Forget the in-flight batch after the control plane rejects it outright.
@@ -142,7 +155,8 @@ class ObservationPump:
         The records stay in the spool and the next batch is assembled fresh.
         """
         try:
-            self._spool.abandon_inflight()
+            with self._lock:
+                self._spool.abandon_inflight()
         except Exception:  # noqa: BLE001
             self._failures += 1
 
@@ -154,7 +168,8 @@ class ObservationPump:
         already exists, so undelivered telemetry outlives the attempt rather than holding it open.
         """
         try:
-            return self._spool.pending(CONTROL_PLANE_SINK)
+            with self._lock:
+                return self._spool.pending(CONTROL_PLANE_SINK)
         except Exception:  # noqa: BLE001
             return False
 
@@ -176,12 +191,14 @@ class ObservationPump:
         Returned empty when nothing was counted, because the result omits the field rather than
         sending an empty object.
         """
-        counters = dict(self._collector.counters)
+        with self._lock:
+            counters = dict(self._collector.counters)
         try:
             # Records the spool accepted and then discarded to stay bounded. Distinct from
             # `dropped.budget`, which is a line refused on the way in: this is a record that was
             # taken, promised to a sink and then given up on, and its value is a record count.
-            abandoned = sum(gap.count for gap in self._spool.gaps(CONTROL_PLANE_SINK))
+            with self._lock:
+                abandoned = sum(gap.count for gap in self._spool.gaps(CONTROL_PLANE_SINK))
         except Exception:  # noqa: BLE001
             abandoned = 0
         if abandoned:

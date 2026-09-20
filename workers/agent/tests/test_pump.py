@@ -260,3 +260,46 @@ def test_counters_carry_the_classifier_and_the_spool(
     counters = pump.counters()
     assert counters[Drop.OVERSIZE.value] == 1
     assert counters[Drop.MALFORMED.value] == 1
+
+
+# --- Concurrency ---------------------------------------------------------------------------------
+#
+# The executor signals its log reader to stop and does not wait for it, because a result may never
+# wait on telemetry. That means the reader can still be calling ingest() while the runner takes the
+# counter snapshot and reports the result. The classifier and the spool are single-threaded by
+# design, so the pump is what makes that safe.
+
+
+def test_ingest_and_counters_are_safe_from_two_threads(
+    tmp_path: Path, clock: Clock, link: Link
+) -> None:
+    """Without the pump's lock this races on the counter dictionary and the spool's file."""
+    import threading
+
+    pump = build(tmp_path, clock, link)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            for step in range(300):
+                if stop.is_set():
+                    return
+                pump.ingest(Stream.STDOUT, AT, record(record="progress", step=step))
+                pump.ingest(Stream.STDOUT, AT, "x" * 9000)  # oversize, so a counter moves too
+        except BaseException as error:  # pragma: no cover - the failure is the point
+            errors.append(error)
+
+    reader = threading.Thread(target=write, daemon=True)
+    reader.start()
+    try:
+        for _ in range(300):
+            # Exactly what the runner does at the moment it reports a result.
+            snapshot = pump.counters()
+            assert all(value >= 0 for value in snapshot.values())
+            pump.pending()
+    finally:
+        stop.set()
+        reader.join(timeout=10)
+
+    assert errors == []
