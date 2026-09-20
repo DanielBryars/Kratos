@@ -59,6 +59,15 @@ it means issuing another, which is already how `ken_` behaves and already how th
 
 The console SHALL present the invitation as a link for the owner to send themselves.
 
+**The secret SHALL travel in the URL fragment, never in the path or the query string.** A fragment
+is not sent to the server, so it cannot reach load-balancer logs, application access logs, a
+`Referer` header or analytics. A path or query secret reaches all four, and the one in an access
+log outlives the invitation by whatever the retention period is.
+
+On landing, the browser SHALL read the fragment into memory and immediately clear it from the
+address bar and history with `history.replaceState`, SHALL NOT write it to local or session
+storage, and SHALL send it only in the body of the HTTPS claim request after sign-in.
+
 This is the deliberate scope cut. Sending mail would add an external provider, a secret, a sending
 domain with SPF and DKIM, bounce and complaint handling, and an outbound path that is an abuse
 surface — for a feature whose purpose is to hand a link to people the owner already knows. The
@@ -82,51 +91,65 @@ The subject that claims an invitation is **whoever signs in**, not whoever the s
 The link is the credential. This is the same property `ken_` already has, and it is why expiry is
 short and revocation exists.
 
-### Ownership becomes a scope, and this is the substantive change
+### Ownership becomes a project, and this is the substantive change
 
-A new table SHALL map identities to the ownership scope they may act within, and every ownership
-predicate SHALL be rewritten from `owner_identity_id = $caller` to membership of the scope that
-owns the row.
+This SHALL be the first real slice of projects rather than a bespoke scope. USR-002 already
+requires every resource to carry an owner **and a project scope**; USR-003 and USR-005 already
+require project membership and its revocation. A generic ownership-scope abstraction would be
+renamed or wrapped the moment those are built, so it is not introduced.
 
-Attribution SHALL NOT change. Rows continue to record the individual `owner_identity_id` that
-created them, audit events continue to name the individual, and no two people share an identity
-row. Only *visibility and authority* widen to the scope. That distinction is the whole point: the
-alternative — aliasing a second provider subject onto one existing identity — would be a smaller
-change that makes every audit event a lie about who did it, on a system whose audit table exists
-precisely to answer that.
+Kratos SHALL add `projects` and `project_memberships`, backfill every existing owned resource into
+one default project, and add `project_id` to owned resources. Every ownership predicate SHALL be
+rewritten from `owner_identity_id = $caller` to membership of the project that owns the row.
+
+`owner_identity_id` SHALL be retained on those rows as **individual attribution**. It stops being
+the authorisation predicate and becomes the record of who did it. Audit events continue to name the
+individual, and no two people share an identity row. Only visibility and authority widen. The
+alternative — aliasing a second provider subject onto one existing identity — needs no rewrite at
+all and was rejected because it would make every audit event name one person for the actions of
+several, on a system whose audit table exists to answer exactly that.
 
 This rewrite is the risk in this decision, not the credential. A predicate missed in one direction
-hides a person's own data; missed in the other, it shows them someone else's. It SHALL therefore
-ship with a test that asserts a co-owner sees exactly the set the founding owner sees, resource by
-resource, and a test that a non-member sees none of it.
+hides a person's own data; missed in the other, it shows them someone else's.
 
 ### An invited co-owner has the owner's authority, with one rail
 
 The user has asked for co-owners with the same access, explicitly including revoking workers,
 deleting artefacts and issuing further invitations. That is what this grants.
 
-One rail SHALL apply: **the last remaining owner of a scope cannot be removed**, and an owner
-cannot remove themselves while they are the last. This prevents a scope becoming permanently
-unadministrable, and it removes no authority anyone would want.
+A co-owner MAY remove the founding owner. "The same as me" was the requirement, and a special case
+would create two classes of owner that nothing else in the system models.
 
-Whether a co-owner may remove the founding owner is left to the reviewer. Recommended: yes,
-because "the same as me" was the requirement and a special case here creates two classes of owner
-that nothing else in the system models.
+One rail SHALL apply: **a project cannot be left with no owner.** The count and the revocation
+SHALL happen in one transaction, locking the project's membership rows, so that two concurrent
+removals cannot each observe a second owner and both proceed. A check outside the transaction would
+pass every test written against it and fail exactly once, in production, leaving a project nobody
+can administer.
 
 ### Removing a person has to exist before a second one does
 
-Kratos SHALL gain the ability to revoke a membership and to set `human_identities.disabled_at`,
-which is read on every request today and written by nothing. Without it, the first invitation is
-irreversible, and an irreversible grant of full authority is not a demo feature.
+Without removal the first invitation is irreversible, and an irreversible grant of full authority
+is not a demo feature.
 
-Revocation takes effect on the next authenticated request, because `authorize_operator` reads
-`disabled_at` and the membership per request. It does **not** invalidate the Identity Platform
+**Three separate actions, and conflating them would be a mistake.**
+
+*Revoking a membership* removes one person from one project. It SHALL set `revoked_at` on the
+membership row, and every project-authorised request SHALL check it. An identity may later belong
+to several projects, so being removed from one says nothing about the others.
+
+*Disabling an identity* is a platform-wide security action on `human_identities.disabled_at`,
+which is read on every request today and written by nothing. It remains separate, and this decision
+does not make project removal reach for it.
+
+*Revoking a pending invitation* stops a credential being claimed at all. The `ken_` precedent has
+`revoked_at` on the table and no endpoint that sets it; this decision does not repeat that
+omission.
+
+Revocation of any kind takes effect on the **next authenticated request**, because authorisation
+reads the membership and the identity per request. It does **not** invalidate the Identity Platform
 session: that person's browser continues to mint valid ID tokens, and Kratos refuses them. This is
-the same trade already made for worker credentials, and it SHALL be stated in the console rather
-than left to be discovered.
-
-A pending invitation SHALL also be revocable. The `ken_` precedent has `revoked_at` on the table
-and no endpoint that sets it; this decision does not repeat that omission.
+the same trade already made for worker credentials, and the console SHALL say so rather than leave
+it to be discovered.
 
 ### Limits
 
@@ -134,11 +157,34 @@ An invitation SHALL expire within a bounded window, defaulting to the same order
 credential rather than days. The number of unconsumed invitations for a scope SHALL be bounded, so
 a compromised console session cannot mint an unbounded supply of ways in.
 
+## Acceptance conditions
+
+These are the conditions, not a suggestion of tests. The credential is easy to get right and the
+ownership rewrite is not, so most of them are about the rewrite.
+
+- **Backfill.** Every existing owned resource belongs to the default project after migration, and
+  the founding owner is its owner. A resource left without a `project_id` is invisible to everyone.
+- **Every predicate.** Each ownership predicate is rewritten, enumerated in the pull request, and
+  each one is exercised. The list begins at `operator.rs:1293`, `:1346`, `:1399`, `:853`,
+  `artifacts.rs:283` and `:1819`, and the review is expected to find more rather than to trust it.
+- **Co-owner parity.** A co-owner sees exactly the set the founding owner sees, resource by
+  resource, not merely "some jobs".
+- **Non-member isolation.** An identity in no project sees none of it, and receives the same answer
+  for a resource that exists in another project as for one that does not exist.
+- **Claim races.** Two simultaneous claims of one invitation produce one membership and one
+  distinct conflict, and a claim racing a revocation never both succeeds and revokes.
+- **Concurrent last-owner removal.** Two owners removing each other at the same instant leave
+  exactly one owner, proven against the transaction rather than argued.
+- **Attribution survives removal.** After a member is revoked, the jobs and artefacts they created
+  still name them, and the audit trail still reads correctly.
+
 ## Alternatives
 
 | Option | Assessment |
 |---|---|
 | Alias a second provider subject onto the existing identity row | The smallest possible change: no scope, no predicate rewrite. Rejected because every audit event, every `owner_identity_id` and every "who did this" answer would name one person for the actions of several, on a system that keeps an audit table specifically to answer that. |
+| A generic ownership scope rather than projects | Fewer concepts today, but USR-002, USR-003 and USR-005 already require projects by name, so it would be renamed or wrapped as soon as they are built. Rejected in review. |
+| The secret in the link's path or query string | What the first draft implied by saying only "a link". Rejected: both reach load-balancer logs, access logs and `Referer` headers, where the secret outlives the invitation by the log retention period. |
 | Per-resource sharing, as USR-012 eventually wants | The right long-term model, and far more than this needs. An owner showing colleagues their system wants one boundary, not an access-control matrix. |
 | Give the invitee the bootstrap operator email | Works today with no code at all, and is the reason this decision is needed: it means sharing a Google account, so there is no second identity, no attribution and no revocation. |
 | Kratos sends the invitation email | Deferred, not rejected. It adds a provider, a secret, a sending domain and an abuse surface to a feature that works without any of them. The credential is indifferent to how it travels. |
@@ -147,8 +193,11 @@ a compromised console session cannot mint an unbounded supply of ways in.
 ## Consequences
 
 - A second person can exist, which nothing in the system currently allows.
-- Six or so ownership predicates change meaning. Until they all do, the feature is half-built in a
-  way that is invisible: the invitee signs in successfully and sees nothing.
+- Six or so ownership predicates change meaning, and a `project_id` appears on every owned table.
+  Until they all change, the feature is half-built in a way that is invisible: the invitee signs in
+  successfully and sees nothing.
+- Existing data is migrated into a default project. A backfill that misses a table makes those rows
+  invisible to everyone, including the founding owner.
 - The console gains an invitation view, a copy-once link, a list of pending invitations and current
   members, and a revoke control for each.
 - The web application gains its first URL handling. It has no router today, does not read
@@ -163,8 +212,8 @@ a compromised console session cannot mint an unbounded supply of ways in.
 
 ## Deliberately deferred
 
-Email delivery. Projects and per-project membership as USR-002 and USR-003 describe them; this adds
-one scope, not a project system. Roles below owner — the `'member'` value stays unreachable rather
+Email delivery. Per-project *roles* — this adds projects and membership, and every member is an
+owner; USR-003's finer permissions come later. Roles below owner — the `'member'` value stays unreachable rather
 than being given a meaning it does not yet need. Session invalidation on revocation, which needs
 Identity Platform token revocation rather than a Kratos change.
 
