@@ -182,7 +182,21 @@ actual start, and the lease deadline. The agent SHALL stop the container at that
 needing to reach the control plane, including after an agent restart. A container found to have
 finished after that time while unsupervised SHALL NOT be reported as successful. A container that
 exited within its authority SHALL be reported with its actual exit status even when the result can
-only be delivered after the lease deadline; the control plane decides whether to accept it.
+only be delivered after the lease deadline; the control plane SHALL reject it as a late result once
+the lease has expired.
+
+The control plane SHALL durably close an expired attempt before retrying its job. It SHALL create no
+more than two attempts for one job: the initial attempt and one automatic retry from scratch. A
+worker SHALL treat each attempt identifier as independent execution authority and SHALL NOT infer
+checkpoint continuity between them. The database SHALL permit no more than one assigned or running
+attempt for a job, and a late result from a closed attempt SHALL return that attempt's terminal state
+without changing the current job or replacement attempt.
+
+An operator cancellation of queued work is immediately terminal. Cancellation of assigned or
+running work remains pending until the worker next reports a result or the lease expires. Because
+protocol 1.x has no cancellation command, a repeated heartbeat MAY continue returning that attempt;
+the agent's existing runtime and lease bounds still apply. The control plane SHALL record the job
+and attempt as `cancelled`, and release the worker, when either completion signal arrives.
 
 A transport failure, `429` or `5xx` response, or local container-runtime error SHALL NOT end the
 agent. It SHALL retain the container and its recorded attempt, continue heartbeats at the normal

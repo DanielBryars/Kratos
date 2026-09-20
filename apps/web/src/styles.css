@@ -74,6 +74,8 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .job-failure, .badge--job-failed { color: #ff9e9e; }
 .badge--job-succeeded { border-color: #245d48; color: #66d19e; }
 .badge--job-assigned, .badge--job-running { border-color: #376791; color: #8cc0ff; }
+.badge--job-cancelling { border-color: #7a6227; color: #ffd978; }
+.job-cancellation { color: #ffd978; }
 .operator-action { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .form-row { flex-wrap: wrap; gap: 12px; }
 .form-row label { color: #9babbc; }

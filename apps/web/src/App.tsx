@@ -45,7 +45,7 @@ type Job = {
   image_reference: string;
   gpu_count: number;
   timeout_seconds: number;
-  status: "queued" | "assigned" | "running" | "succeeded" | "failed" | "cancelled";
+  status: "queued" | "assigned" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
   assigned_worker_id: string | null;
   submitted_at: string;
   started_at: string | null;
@@ -75,6 +75,12 @@ function jobTiming(job: Job) {
   const submittedAt = new Date(job.submitted_at).getTime();
   const startedAt = job.started_at ? new Date(job.started_at).getTime() : null;
   const finishedAt = job.finished_at ? new Date(job.finished_at).getTime() : null;
+  if (job.status === "cancelling") {
+    const elapsed = startedAt === null
+      ? formatDuration(Date.now() - submittedAt)
+      : formatDuration(Date.now() - startedAt);
+    return `Cancellation pending · waiting for the worker to stop or its lease to expire · ${elapsed}`;
+  }
   if (startedAt !== null && finishedAt !== null) {
     return `Waited ${formatDuration(startedAt - submittedAt)} · ran ${formatDuration(finishedAt - startedAt)}`;
   }
@@ -396,7 +402,7 @@ export function App() {
                 <div className="job-list">
                   {jobs.map((job) => (
                     <div className="job" key={job.job_id}>
-                      <div className="job-heading"><div><strong>{job.name}</strong><p>{new Date(job.submitted_at).toLocaleString()}</p></div><span className={`badge badge--job-${job.status}`}>{job.status}</span></div>
+                      <div className="job-heading"><div><strong>{job.name}</strong><p>{new Date(job.submitted_at).toLocaleString()}</p></div><span className={`badge badge--job-${job.status}`}>{job.status === "cancelling" ? "cancellation pending" : job.status}</span></div>
                       <p className="job-identity">Run {job.job_id}</p>
                       <p className="job-image">{job.image_reference}</p>
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
@@ -404,7 +410,12 @@ export function App() {
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
                       {job.stdout && <pre>{job.stdout}</pre>}
                       {job.stderr && <pre className="job-failure">{job.stderr}</pre>}
-                      {job.status === "queued" && <button className="button-secondary" type="button" disabled={jobAction} onClick={() => void cancelJob(job.job_id)}>Cancel queued job</button>}
+                      {job.status === "cancelling" && <p className="job-cancellation" role="status">Cancellation has been requested. The job will be cancelled when the worker stops or its lease expires.</p>}
+                      {(job.status === "queued" || job.status === "assigned" || job.status === "running") && (
+                        <button className="button-secondary" type="button" disabled={jobAction} onClick={() => void cancelJob(job.job_id)}>
+                          {job.status === "queued" ? "Cancel queued job" : "Request cancellation"}
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
