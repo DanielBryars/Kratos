@@ -210,3 +210,46 @@ def test_the_counter_object_survives_a_round_trip() -> None:
     counters = {"dropped.malformed": 2, "not_exported.metric_name_not_allowed": 7}
     encoded = result(observation_counters=counters).model_dump_json()
     assert json.loads(encoded)["observation_counters"] == counters
+
+
+# --- The cross-half contract ---------------------------------------------------------------------
+
+
+def test_the_agent_can_only_emit_counters_the_control_plane_accepts() -> None:
+    """Pinned against the merged control plane, because a mismatch rejects the job result.
+
+    `registry.rs` holds a nine-name allowlist and answers anything outside it with
+    `invalid_request`, which fails the whole result submission rather than just dropping the
+    counter. A new counter added here without a matching change there would therefore turn a minor
+    telemetry event into a job whose result the control plane refuses.
+
+    If this test fails, the fix is not to change the expected set: it is to add the name to
+    `OBSERVATION_COUNTERS` in the control plane first, and only then here.
+    """
+    from kratos_agent.observations import Drop
+    from kratos_agent.pump import ABANDONED_COUNTER, FAILURE_COUNTER
+
+    emittable = {reason.value for reason in Drop} | {FAILURE_COUNTER, ABANDONED_COUNTER}
+    accepted_by_the_control_plane = {
+        "dropped.oversize",
+        "dropped.malformed",
+        "dropped.rate",
+        "dropped.budget",
+        "dropped.name_limit",
+        "dropped.delivery_abandoned",
+        "not_exported.metric_name_not_allowed",
+        "not_exported.otlp_unconfigured",
+        "delivery.failures",
+    }
+    assert emittable == accepted_by_the_control_plane
+
+
+def test_every_accepted_counter_name_passes_the_models_own_rule() -> None:
+    """The model's rule is broader than the allowlist, so it must at least admit all of it."""
+    for name in (
+        "dropped.oversize",
+        "dropped.delivery_abandoned",
+        "not_exported.metric_name_not_allowed",
+        "delivery.failures",
+    ):
+        assert result(observation_counters={name: 1}).observation_counters == {name: 1}
