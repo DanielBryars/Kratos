@@ -141,5 +141,7 @@ The agent records each attempt in its state volume before creating the container
 container is reported as a failure rather than run again. It stops a container at the earlier of its
 runtime bound and lease deadline without needing the control plane. Losing the control plane, or a
 temporary Docker or registry error, is logged as `{"status": "retrying"}` and does not end the
-agent: heartbeats continue and the retained result is delivered once the link returns. See the
+agent: heartbeats continue and the retained result is delivered once the link returns. Heartbeats
+also continue while a job runs, and the agent stops the container if the control plane stops
+returning that attempt. See the
 [worker protocol](../../docs/protocol/worker-v1.md#execution-authority-and-network-loss).

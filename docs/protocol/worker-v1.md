@@ -172,15 +172,20 @@ the agent SHALL inspect its stable attempt-named container and SHALL NOT knowing
 ### Execution authority and network loss
 
 The agent SHALL execute an attempt at most once. It SHALL fetch the image, durably record the
-attempt identifier in its protected state and only then create the container. For a recorded
+whole assignment, including its runtime bound and lease deadline, in its protected state and only
+then create the container. For a recorded
 attempt it SHALL resume the existing container and SHALL NOT create another; if that container is
 missing it SHALL report a failure, because it cannot prove that the workload did not run. A
 container that was created but never started SHALL also be reported as a failure.
 
 A container's authority ends at the earlier of its runtime bound, measured from the container's
-actual start, and the lease deadline. The agent SHALL stop the container at that time without
-needing to reach the control plane, including after an agent restart. A container found to have
-finished after that time while unsupervised SHALL NOT be reported as successful. A container that
+actual start, and the lease deadline. The agent SHALL kill the container at that time. It SHALL
+NOT first ask it to stop, because a grace period would let a workload that ignores the request run
+beyond its authority. Enforcement SHALL NOT depend on reaching the control plane: whenever the
+agent holds a recorded assignment, including immediately after a restart, it SHALL supervise that
+container to the end of its authority before any operation that needs the network. A container
+found to have finished more than thirty seconds after that time was unsupervised and SHALL NOT be
+reported as successful. A container that
 exited within its authority SHALL be reported with its actual exit status even when the result can
 only be delivered after the lease deadline; the control plane SHALL reject it as a late result once
 the lease has expired.
@@ -205,10 +210,21 @@ rejection, including `401`, remains fatal. When a heartbeat response no longer c
 attempt, the control plane has closed it: the agent SHALL remove that container, running or not,
 and clear its record.
 
+The agent SHALL continue heartbeats at the normal interval while it supervises a container, so a
+busy worker's displayed connectivity reflects its link rather than its workload. A heartbeat that
+fails for a temporary reason SHALL NOT interrupt the workload. A valid heartbeat response that no
+longer carries the attempt, or an explicit `4xx` rejection other than `429`, withdraws the
+attempt's authority: the agent SHALL kill the container and report the failure. A malformed
+response SHALL NOT be treated as a withdrawal. No failure inside a heartbeat, including a failure
+to observe the host's capabilities, SHALL end supervision of a running container.
+
 Known limitations of this slice: the lease deadline is compared with the worker's clock, so worker
-clock error shifts the local bound; and the agent sends no heartbeat while it supervises a
-container, so a busy worker is displayed as `stale` and then `offline` for a job longer than the
-connectivity thresholds even when its link is healthy.
+clock error shifts the local bound; a heartbeat in progress can delay enforcement of a bound by up
+to about twenty-five seconds, being a ten-second capability collection followed by a fifteen-second
+request timeout, plus the polling interval; and no bound is enforced while the agent process itself
+is not running, which is why an overrun found afterwards is reported as a failure. A container that
+cannot be killed is reported as no result at all: the attempt stays recorded and enforcement is
+retried, because a result would tell the control plane the attempt had ended while it had not.
 
 The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
 `PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be

@@ -15,10 +15,19 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
-from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import JobAssignment, WorkerCapabilities
+from kratos_agent.executor import DockerExecutor, EnforcementError, ExecutorError
+from kratos_agent.models import (
+    HeartbeatResponse,
+    JobAssignment,
+    JobExecutionResult,
+    WorkerCapabilities,
+)
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
+
+
+class CapabilityCollectionError(RuntimeError):
+    """This host's capabilities could not be observed for one heartbeat."""
 
 
 class AgentRunner:
@@ -152,10 +161,13 @@ class AgentRunner:
         save_state(self._state_path, state)
         return state
 
-    def heartbeat_once(self, state: AgentState) -> AgentState:
+    def _exchange_heartbeat(self, state: AgentState) -> tuple[AgentState, HeartbeatResponse]:
         if state.worker_id is None or state.worker_credential is None:
             raise ValueError("worker is not enrolled")
-        capabilities = self._collect()
+        try:
+            capabilities = self._collect()
+        except Exception as error:
+            raise CapabilityCollectionError(f"capability collection failed: {error}") from error
         response = self._client.heartbeat(
             state.worker_id,
             state.worker_credential,
@@ -175,6 +187,10 @@ class AgentRunner:
             heartbeat_interval_seconds=response.next_heartbeat_seconds,
         )
         save_state(self._state_path, updated)
+        return updated, response
+
+    def heartbeat_once(self, state: AgentState) -> AgentState:
+        updated, response = self._exchange_heartbeat(state)
         assignment = response.assignment
         stale_attempt_id = updated.started_attempt_id
         if (
@@ -185,7 +201,7 @@ class AgentRunner:
             # The control plane no longer holds this attempt open, so nothing authorises its
             # container to keep running and its retained evidence is no longer required.
             self._executor.remove_job_container(stale_attempt_id)
-            updated = replace(updated, started_attempt_id=None)
+            updated = replace(updated, started_attempt_id=None, started_assignment=None)
             save_state(self._state_path, updated)
         if assignment is not None:
             updated = self._run_assignment(updated, assignment)
@@ -202,10 +218,12 @@ class AgentRunner:
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
             result = self._executor.prepare_job(assignment)
             if result is None:
-                state = replace(state, started_attempt_id=assignment.attempt_id)
+                state = replace(
+                    state, started_attempt_id=assignment.attempt_id, started_assignment=assignment
+                )
                 save_state(self._state_path, state)
         if result is None:
-            result = self._executor.run_job(assignment, may_start=not resuming)
+            state, result = self._supervise(state, assignment, may_start=not resuming)
         acknowledgement = self._client.report_job_result(
             worker_id, worker_credential, assignment.attempt_id, result
         )
@@ -214,9 +232,37 @@ class AgentRunner:
                 200, "invalid_response", "job result acknowledgement is inconsistent"
             )
         self._executor.remove_job_container(assignment.attempt_id)
-        state = replace(state, started_attempt_id=None)
+        state = replace(state, started_attempt_id=None, started_assignment=None)
         save_state(self._state_path, state)
         return state
+
+    def _supervise(
+        self, state: AgentState, assignment: JobAssignment, *, may_start: bool
+    ) -> tuple[AgentState, JobExecutionResult]:
+        """Run the attempt's container to the end of its authority, heartbeating meanwhile."""
+        if self._executor is None:
+            raise ExecutorError("job assignment received without a configured executor")
+
+        def still_authorised() -> bool:
+            nonlocal state
+            try:
+                state, response = self._exchange_heartbeat(state)
+            except Exception as error:
+                # Nothing that goes wrong in a heartbeat may abandon supervision of the container,
+                # and an outage never interrupts the workload.
+                print(json.dumps({"status": "retrying", "detail": str(error)}), flush=True)
+                state = load_state(self._state_path) or state
+                return not _is_rejection(error)
+            held = response.assignment
+            return held is not None and held.attempt_id == assignment.attempt_id
+
+        result = self._executor.run_job(
+            assignment,
+            may_start=may_start,
+            on_tick=still_authorised,
+            tick_seconds=state.heartbeat_interval_seconds,
+        )
+        return state, result
 
     def step(self, state: AgentState) -> AgentState:
         """Send one heartbeat, surviving a temporary loss of the control plane or Docker.
@@ -225,8 +271,24 @@ class AgentRunner:
         state is reloaded after a failure and the next heartbeat resumes the same attempt.
         """
         try:
+            recorded_attempt_id = state.started_attempt_id
+            if self._executor is not None and recorded_attempt_id is not None:
+                # A recorded attempt is supervised to the end of its authority before anything
+                # that needs the control plane, so a restart during an outage still enforces
+                # its bounds. The heartbeat below then reports the finished container.
+                if state.started_assignment is not None:
+                    state = self._supervise(state, state.started_assignment, may_start=False)[0]
+                else:
+                    # A state file written before the bounds were recorded.
+                    self._executor.stop_unbounded_attempt(recorded_attempt_id)
             return self.heartbeat_once(state)
-        except (ControlPlaneError, DockerException, httpx.TransportError) as error:
+        except (
+            CapabilityCollectionError,
+            DockerException,
+            EnforcementError,
+            httpx.TransportError,
+            ControlPlaneError,
+        ) as error:
             if isinstance(error, ControlPlaneError) and not _is_transient(error):
                 raise
             print(json.dumps({"status": "retrying", "detail": str(error)}), flush=True)
@@ -241,6 +303,15 @@ class AgentRunner:
 
 def _is_transient(error: ControlPlaneError) -> bool:
     return error.status_code == 429 or error.status_code >= 500
+
+
+def _is_rejection(error: Exception) -> bool:
+    """Whether the control plane explicitly refused this worker, rather than being unreachable."""
+    return (
+        isinstance(error, ControlPlaneError)
+        and 400 <= error.status_code < 500
+        and error.status_code != 429
+    )
 
 
 def _encode(value: bytes) -> str:

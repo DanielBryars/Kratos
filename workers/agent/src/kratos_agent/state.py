@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from uuid import UUID
 
+from kratos_agent.models import JobAssignment
+
 
 @dataclass(frozen=True)
 class AgentState:
@@ -19,6 +21,9 @@ class AgentState:
     heartbeat_interval_seconds: int = 30
     # Recorded before an attempt's container is created so a restarted agent never starts it twice.
     started_attempt_id: UUID | None = None
+    # The attempt's whole execution authority, so a restarted agent can enforce its bounds
+    # without first reaching the control plane.
+    started_assignment: JobAssignment | None = None
 
     @property
     def is_enrolled(self) -> bool:
@@ -44,6 +49,11 @@ def load_state(path: Path) -> AgentState | None:
         started_attempt_id=(
             UUID(payload["started_attempt_id"]) if payload.get("started_attempt_id") else None
         ),
+        started_assignment=(
+            JobAssignment.model_validate(payload["started_assignment"])
+            if payload.get("started_assignment")
+            else None
+        ),
     )
 
 
@@ -56,6 +66,9 @@ def save_state(path: Path, state: AgentState) -> None:
     payload["registration_id"] = str(state.registration_id) if state.registration_id else None
     payload["started_attempt_id"] = (
         str(state.started_attempt_id) if state.started_attempt_id else None
+    )
+    payload["started_assignment"] = (
+        state.started_assignment.model_dump(mode="json") if state.started_assignment else None
     )
 
     descriptor, temporary_name = tempfile.mkstemp(prefix=".state-", dir=path.parent)

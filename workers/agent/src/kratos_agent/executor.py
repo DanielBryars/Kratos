@@ -1,8 +1,10 @@
 """Constrained Docker execution for controlled worker operations."""
 
+import contextlib
 import json
-import math
 import re
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -20,15 +22,38 @@ from kratos_agent.models import (
 IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 64 * 1024
 MAX_FAILURE_MESSAGE_CHARS = 1_000
+SUPERVISION_POLL_SECONDS = 1.0
+# How late a bound may be enforced: one poll plus one in-flight heartbeat and its collection.
+ENFORCEMENT_TOLERANCE = timedelta(seconds=30)
+# How hard the agent tries to stop a container before it admits it cannot.
+KILL_ATTEMPTS = 3
+KILL_RETRY_SECONDS = 1.0
+ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 
 class ExecutorError(RuntimeError):
     """The local container executor could not produce trustworthy evidence."""
 
 
+class EnforcementError(ExecutorError):
+    """A container outlived its authority and could not be stopped.
+
+    This is never a job result. The attempt stays recorded so the agent retries
+    enforcement rather than reporting an outcome while the workload still runs.
+    """
+
+
 class DockerExecutor:
-    def __init__(self, client: Any) -> None:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._client = client
+        self._clock = clock
+        self._sleep = sleep
 
     @classmethod
     def from_environment(cls) -> "DockerExecutor":
@@ -104,25 +129,39 @@ class DockerExecutor:
             return _failure(125, "job image was not found in its registry")
         return None
 
-    def run_job(self, assignment: JobAssignment, *, may_start: bool = True) -> JobExecutionResult:
+    def run_job(
+        self,
+        assignment: JobAssignment,
+        *,
+        may_start: bool = True,
+        on_tick: Callable[[], bool] | None = None,
+        tick_seconds: float = 30,
+    ) -> JobExecutionResult:
         """Supervise the attempt's container until it exits or its authority ends.
 
         An existing attempt-named container is always resumed rather than replaced. With
         ``may_start`` false a missing container is reported as a failure, because this worker
         has already recorded starting the attempt and cannot prove that it did not run.
+
+        ``on_tick`` is called about every ``tick_seconds`` while the container runs. Returning
+        false means the control plane no longer holds the attempt, which ends its authority.
+
+        Authority ends without a grace period: the container is killed, not asked to stop,
+        so a workload that ignores SIGTERM cannot run past its bound.
         """
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
         container_name = _container_name(assignment.attempt_id)
+        logical_name = f"attempt {assignment.attempt_id}"
         job_id = str(assignment.job_id)
         attempt_id = str(assignment.attempt_id)
         try:
             container = self._client.containers.get(container_name)
             if container.status == "created":
                 return _failure(125, "job container was created but never started")
-            started_at = _state_time(container, "StartedAt") or datetime.now(UTC)
+            started_at = _state_time(container, "StartedAt") or self._clock()
         except docker.errors.NotFound:
-            if datetime.now(UTC) >= assignment.lease_expires_at:
+            if self._clock() >= assignment.lease_expires_at:
                 return _failure(124, "assignment lease expired before execution", timed_out=True)
             if not may_start:
                 return _failure(
@@ -165,37 +204,54 @@ class DockerExecutor:
                 )
             except docker.errors.APIError as error:
                 return _failure(125, f"job container could not be started: {error}")
-            started_at = datetime.now(UTC)
+            started_at = self._clock()
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
-        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        bound_message = (
+            f"execution exceeded {assignment.timeout_seconds} seconds"
+            if deadline == runtime_deadline
+            else "assignment lease expired during execution"
+        )
+        tick = timedelta(seconds=tick_seconds)
+        next_tick = self._clock() + tick
         timed_out = False
         failure_message: str | None = None
-        try:
-            # An exited container returns immediately, so a result held back by a network
-            # outage is still reported with its real exit status.
-            wait_result = container.wait(timeout=max(1, math.ceil(remaining)))
-            exit_code = int(wait_result["StatusCode"])
-        except Exception:
-            timed_out = True
-            exit_code = 124
-            failure_message = (
-                f"execution exceeded {assignment.timeout_seconds} seconds"
-                if deadline == runtime_deadline
-                else "assignment lease expired during execution"
-            )
-            try:
-                container.stop(timeout=10)
-            except Exception:
-                failure_message = f"{failure_message}; container stop failed"
-        else:
+        while True:
             container.reload()
+            if container.status not in ACTIVE_CONTAINER_STATUSES:
+                break
+            now = self._clock()
+            if now >= deadline:
+                timed_out = True
+                failure_message = bound_message
+                break
+            if on_tick is not None and now >= next_tick:
+                authorised = on_tick()
+                next_tick = self._clock() + tick
+                if not authorised:
+                    failure_message = "control plane no longer holds this attempt"
+                    break
+                continue
+            self._sleep(min(SUPERVISION_POLL_SECONDS, (deadline - now).total_seconds()))
+        if failure_message is not None:
+            exit_code = 124 if timed_out else 125
+            self._kill(container, logical_name)
+        else:
+            # A container that has already exited is reported with its real exit status, even
+            # when a network outage held the result back beyond the lease.
+            exit_code = int(container.wait(timeout=10)["StatusCode"])
             finished_at = _state_time(container, "FinishedAt")
             if finished_at is not None and finished_at > deadline:
+                # A container this agent killed at its bound finishes just after it; a later
+                # finish means nothing was enforcing the bound at the time.
                 timed_out = True
                 exit_code = 124
-                failure_message = "execution continued beyond its authority while unsupervised"
+                failure_message = (
+                    bound_message
+                    if finished_at <= deadline + ENFORCEMENT_TOLERANCE
+                    else "execution continued beyond its authority while unsupervised"
+                )
         stdout = self._bounded_log(container, stdout=True, stderr=False)
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
@@ -208,11 +264,45 @@ class DockerExecutor:
             failure_message=failure_message,
         )
 
+    def _kill(self, container: Any, logical_name: str) -> None:
+        """Stop a container whose authority has ended, or refuse to report a result."""
+        for remaining in range(KILL_ATTEMPTS - 1, -1, -1):
+            # The container may simply have exited between the check and the kill.
+            with contextlib.suppress(Exception):
+                container.kill()
+            try:
+                container.reload()
+                if container.status not in ACTIVE_CONTAINER_STATUSES:
+                    return
+            except docker.errors.NotFound:
+                return
+            except Exception:
+                # Without a confirmed status the agent cannot claim the workload stopped.
+                pass
+            if remaining:
+                self._sleep(KILL_RETRY_SECONDS)
+        raise EnforcementError(f"{logical_name} outlived its authority and could not be stopped")
+
     def remove_job_container(self, attempt_id: UUID) -> None:
         try:
             self._client.containers.get(_container_name(attempt_id)).remove(force=True)
         except docker.errors.NotFound:
             return
+
+    def stop_unbounded_attempt(self, attempt_id: UUID) -> None:
+        """Stop a container whose recorded authority is unknown, keeping it for reporting.
+
+        An agent upgraded in place during an outage can hold an attempt identifier from an
+        older state file without the bounds needed to supervise it. It cannot show the
+        container is still authorised, so it stops it and leaves it for the control plane.
+        """
+        try:
+            container = self._client.containers.get(_container_name(attempt_id))
+        except docker.errors.NotFound:
+            return
+        container.reload()
+        if container.status in ACTIVE_CONTAINER_STATUSES:
+            self._kill(container, f"attempt {attempt_id}")
 
     @staticmethod
     def _bounded_log(container: Any, *, stdout: bool, stderr: bool) -> str:
