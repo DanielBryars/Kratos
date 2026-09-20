@@ -271,10 +271,19 @@ class JobExecutionResult(StrictModel):
     structured_result: dict[str, Any] | None = None
 
     @model_validator(mode="after")
-    def the_structured_result_fits(self) -> "JobExecutionResult":
+    def the_structured_result_is_sendable(self) -> "JobExecutionResult":
         if self.structured_result is None:
             return self
-        encoded = json.dumps(self.structured_result, separators=(",", ":")).encode("utf-8")
+        try:
+            # allow_nan=False is the point. Python's json emits NaN and Infinity by default,
+            # which are not JSON, and the HTTP client refuses to encode them -- so a workload
+            # result containing one would abort the whole result request rather than being
+            # dropped. json.loads accepts those literals, so they arrive here quite easily.
+            encoded = json.dumps(
+                self.structured_result, separators=(",", ":"), allow_nan=False
+            ).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as error:
+            raise ValueError("structured result cannot be encoded as JSON") from error
         if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
             raise ValueError("structured result exceeds its size limit")
         return self

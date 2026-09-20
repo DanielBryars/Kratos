@@ -316,3 +316,47 @@ def test_a_result_that_fits_is_still_carried(runner: AgentRunner) -> None:
 
     result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
     assert _with_observations(result, pump).structured_result == summary
+
+
+@pytest.mark.parametrize("hostile", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_workload_result_is_omitted_not_sent(
+    runner: AgentRunner, hostile: float
+) -> None:
+    """Python's json accepts NaN and Infinity on the way in and emits them on the way out.
+
+    Neither is JSON, and the HTTP client refuses to encode them, so a workload result carrying
+    one would have aborted the whole result request. The classifier rejects non-finite *metric*
+    values, but a result payload is opaque and passes straight through `json.loads`, which
+    accepts those literals quite happily.
+    """
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    pump._result = {"loss": hostile}
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    reported = _with_observations(result, pump)
+
+    assert reported.structured_result is None
+    assert reported.exit_code == 0
+    # And what is reported can actually be encoded, which is the property that was missing.
+    import json as _json
+
+    _json.dumps(reported.model_dump(mode="json"), allow_nan=False)
+
+
+def test_a_result_record_carrying_nan_reaches_the_pump_and_is_still_refused(
+    runner: AgentRunner,
+) -> None:
+    """The full path: a workload prints NaN inside its result record and the job still reports."""
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    pump.ingest(
+        Stream.STDOUT,
+        T0,
+        '{"schema_version":"1.0","record":"result","result":{"final_loss":NaN}}',
+    )
+    assert pump.result is not None, "json.loads accepted the NaN literal quite happily"
+    assert "final_loss" in pump.result
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    assert _with_observations(result, pump).structured_result is None

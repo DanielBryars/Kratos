@@ -761,8 +761,16 @@ def _structured_result_that_fits(payload: dict[str, Any] | None) -> dict[str, An
     if payload is None:
         return None
     try:
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError):
+        # allow_nan=False refuses NaN and Infinity, which Python's json would happily emit and
+        # no JSON parser should accept. The HTTP client rejects them too, so leaving them in
+        # would abort the entire result request over the workload's own commentary.
+        encoded = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        # Unserialisable, non-finite, or nested past the interpreter's patience.
+        print(
+            json.dumps({"status": "structured_result_omitted", "reason": "not encodable as JSON"}),
+            flush=True,
+        )
         return None
     if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
         print(
