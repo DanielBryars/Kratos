@@ -41,6 +41,8 @@ response-shape mismatch here before changing server code.
 The mounted `/kratos/outputs` directory must be writable by the workload's non-root UID; the agent
 does not need to trust that UID after execution because collection happens only after the container
 stops and revalidates every descriptor.
+The reviewed training image is published at
+`ghcr.io/danielbryars/kratos-training-example@sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31`.
 
 ### Claude → Codex, 2026-09-20
 

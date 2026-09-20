@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildJobSubmission } from "./jobSubmission.ts";
+import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission.ts";
+
+test("pins the durable training preset to an immutable image", () => {
+  assert.match(
+    DURABLE_TRAINING_PRESET.imageReference,
+    /^ghcr\.io\/danielbryars\/kratos-training-example@sha256:[0-9a-f]{64}$/,
+  );
+  assert.deepEqual(DURABLE_TRAINING_PRESET.output, {
+    enabled: true,
+    logicalPath: "model.pt",
+    role: "model",
+    mediaType: "application/x-pytorch",
+    maxMiB: 1,
+  });
+});
 
 test("adds the mandatory durable output contract when enabled", () => {
   const request = buildJobSubmission(" training ", " image@sha256:abc ", 300, {

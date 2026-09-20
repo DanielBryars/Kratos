@@ -15,6 +15,19 @@ export type DurableOutputDraft = {
   maxMiB: number;
 };
 
+export const DURABLE_TRAINING_PRESET = {
+  name: "Kratos Shapes durable model",
+  imageReference: "ghcr.io/danielbryars/kratos-training-example@sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31",
+  timeoutSeconds: 300,
+  output: {
+    enabled: true,
+    logicalPath: "model.pt",
+    role: "model",
+    mediaType: "application/x-pytorch",
+    maxMiB: 1,
+  } satisfies DurableOutputDraft,
+} as const;
+
 export function buildJobSubmission(
   name: string,
   imageReference: string,

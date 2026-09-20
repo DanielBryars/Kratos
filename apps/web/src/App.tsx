@@ -17,7 +17,7 @@ import {
   type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
-import { buildJobSubmission } from "./jobSubmission";
+import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
 
 type Version = { name: string; version: string };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
@@ -370,6 +370,23 @@ export function App() {
     }
   }
 
+  function selectDurableTrainingPreset(enabled: boolean) {
+    setDurableOutputEnabled(enabled);
+    if (enabled) {
+      setJobName(DURABLE_TRAINING_PRESET.name);
+      setJobImage(DURABLE_TRAINING_PRESET.imageReference);
+      setJobTimeout(DURABLE_TRAINING_PRESET.timeoutSeconds);
+      setDurableOutputPath(DURABLE_TRAINING_PRESET.output.logicalPath);
+      setDurableOutputRole(DURABLE_TRAINING_PRESET.output.role);
+      setDurableOutputMediaType(DURABLE_TRAINING_PRESET.output.mediaType);
+      setDurableOutputMaxMiB(DURABLE_TRAINING_PRESET.output.maxMiB);
+    } else {
+      setJobName("RTX 5090 matrix check");
+      setJobImage(DEMO_WORKLOAD_IMAGE);
+      setJobTimeout(120);
+    }
+  }
+
   async function cancelJob(jobId: string) {
     if (!user) return;
     setJobAction(true);
@@ -467,21 +484,22 @@ export function App() {
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
                 <div className="job-form">
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /></label>
-                  <label>Immutable image<input value={jobImage} onChange={(event) => setJobImage(event.target.value)} /></label>
+                  <label>Immutable image<input value={jobImage} readOnly={durableOutputEnabled} onChange={(event) => setJobImage(event.target.value)} /></label>
                   <label>Maximum runtime (seconds)<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /></label>
                   <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
                 </div>
                 <div className="output-contract">
                   <label className="output-toggle">
-                    <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => setDurableOutputEnabled(event.target.checked)} />
-                    Require one durable output
+                    <input type="checkbox" checked={durableOutputEnabled} onChange={(event) => selectDurableTrainingPreset(event.target.checked)} />
+                    Use durable training preset
                   </label>
+                  <p className="output-help">Pins the reviewed CUDA training image and requires its `model.pt` checkpoint.</p>
                   {durableOutputEnabled && (
                     <div className="output-fields">
-                      <label>Path<input value={durableOutputPath} maxLength={240} onChange={(event) => setDurableOutputPath(event.target.value)} /></label>
-                      <label>Role<input value={durableOutputRole} maxLength={32} onChange={(event) => setDurableOutputRole(event.target.value)} /></label>
-                      <label>Media type<input value={durableOutputMediaType} maxLength={127} onChange={(event) => setDurableOutputMediaType(event.target.value)} /></label>
-                      <label>Maximum MiB<input type="number" min={1} max={5120} value={durableOutputMaxMiB} onChange={(event) => setDurableOutputMaxMiB(Number(event.target.value))} /></label>
+                      <label>Path<input value={durableOutputPath} readOnly /></label>
+                      <label>Role<input value={durableOutputRole} readOnly /></label>
+                      <label>Media type<input value={durableOutputMediaType} readOnly /></label>
+                      <label>Maximum MiB<input type="number" value={durableOutputMaxMiB} readOnly /></label>
                     </div>
                   )}
                 </div>

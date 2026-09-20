@@ -67,9 +67,11 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .output-contract { display: grid; gap: 12px; padding: 14px; border: 1px solid #2b394a; border-radius: 8px; background: #0d1520; }
 .output-toggle { display: flex; align-items: center; gap: 9px; color: #c9d9e9; font-size: 0.9rem; }
 .output-toggle input { width: 18px; height: 18px; accent-color: #69adff; }
+.output-help { color: #8091a4; font-size: 0.82rem; }
 .output-fields { display: grid; grid-template-columns: 1fr 0.7fr 1.2fr 0.7fr; gap: 12px; }
 .output-fields label { display: grid; gap: 7px; color: #9babbc; font-size: 0.82rem; }
 .output-fields input { width: 100%; min-height: 42px; border: 1px solid #334154; border-radius: 8px; padding: 0 12px; color: #eef4fa; background: #151f2c; }
+.output-fields input[readonly], .job-form input[readonly] { color: #aab9c9; background: #101722; }
 .job-list { display: grid; gap: 12px; }
 .job { display: grid; gap: 10px; padding: 18px; border: 1px solid #334154; border-radius: 10px; background: #111a26; color: #9babbc; font-size: 0.9rem; }
 .job-heading { display: flex; justify-content: space-between; gap: 16px; }

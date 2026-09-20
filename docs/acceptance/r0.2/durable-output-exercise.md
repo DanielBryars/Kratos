@@ -52,7 +52,7 @@ expected to leave an output job queued in that state.
 |---|---|
 | Control-plane revision | Pending live run |
 | Worker image digest | Pending protocol 1.1 release |
-| Training image digest | Pending branch publication |
+| Training image digest | `sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31` |
 | Job ID | Pending live run |
 | Attempt ID | Pending live run |
 | Artefact ID | Pending live run |
