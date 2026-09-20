@@ -12,8 +12,9 @@ Status distinguishes a selected direction from a recommendation still under disc
 | Public HTTPS edge and custom domain | Accepted | [ADR-006](decisions/006-public-edge-and-domain.md) |
 | Python worker agent and outbound HTTPS | Accepted | [ADR-007](decisions/007-python-worker-agent.md) |
 | Worker-controlled sibling job containers | Accepted | [ADR-008](decisions/008-worker-job-execution.md) |
-| PostgreSQL-backed first job queue | Accepted | [ADR-013](decisions/013-postgresql-first-job-queue.md) |
 | Worker radio-in, approval and federation | Accepted | [ADR-012](decisions/012-worker-federation-and-registration.md) |
+| PostgreSQL-backed first job queue | Accepted | [ADR-013](decisions/013-postgresql-first-job-queue.md) |
+| Cloud Storage job artefacts and scoped resumable upload | Accepted for R0.2 | [ADR-014](decisions/014-gcs-job-artefact-transfer.md) |
 | Self-hosted Grafana stack, OpenTelemetry and MLflow | Accepted | [ADR-009](decisions/009-observability-and-mlflow.md) |
 | SkyPilot as a later cloud-capacity provider | Accepted | [ADR-010](decisions/010-skypilot-boundary.md) |
 | Cloud SQL metadata and Identity Platform human login | Accepted | [ADR-011](decisions/011-metadata-and-human-identity.md) |
