@@ -42,8 +42,12 @@ workload traces MAY also be exported to MLflow's OTLP/HTTP trace endpoint.
 
 The platform SHALL NOT describe MLflow as an OTLP metrics backend. When a training observation such
 as loss or throughput is useful in both systems, the workload integration SHALL record it through
-MLflow Tracking and emit a corresponding OTel metric. Both records SHALL carry the same Kratos job,
-attempt and MLflow run identifiers.
+MLflow Tracking and emit a corresponding OTel metric. As defined by
+[ADR-015](015-job-telemetry-without-job-network.md), `observation_stream_id` SHALL be allocated with
+the attempt and SHALL be the stable cross-system correlation key from the first observation. Both
+records SHALL carry the same Kratos project, job, attempt, worker and observation-stream identifiers
+where applicable. The asynchronously created MLflow run identifier SHALL be recorded against the
+observation stream; telemetry SHALL NOT depend on that later identifier being available.
 
 Large MLflow artefacts and supported Loki and Tempo object data SHALL use Cloud Storage. Durable
 metadata SHALL use the selected PostgreSQL service. Prometheus data SHALL use a persistent disk with
@@ -78,6 +82,6 @@ events ahead of diagnostic telemetry, report the loss and follow the active leas
 - Terraform, CI/CD, persistent-disk snapshots, object retention and restoration evidence must cover
   the observability services.
 - Telemetry volume and cardinality require explicit limits, especially for per-batch training data.
-- Common identifiers allow Grafana and MLflow views to be correlated without pretending they store
-  the same data model.
-
+- The observation-stream identifier allows Grafana and MLflow views to be correlated from the first
+  observation without pretending they store the same data model or making MLflow a scheduling
+  dependency.

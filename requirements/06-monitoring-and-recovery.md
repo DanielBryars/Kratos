@@ -20,7 +20,7 @@
 | MON-015 | The cloud deployment SHALL provide an authenticated Grafana instance backed by Prometheus for metrics, Loki for logs and Tempo for traces. |
 | MON-016 | Training parameters, scalar metrics, artefacts and models SHALL be recorded in MLflow with Kratos job and attempt identifiers. Metrics required for operational dashboards SHALL also be emitted through OpenTelemetry. |
 | MON-017 | Supported traces MAY be exported to both Tempo and MLflow. The platform SHALL NOT depend on MLflow as a general OTLP metrics backend. |
-| MON-018 | Telemetry records SHALL carry stable project, job, attempt, worker and MLflow run identifiers where applicable, without including secret values. |
+| MON-018 | Telemetry records SHALL carry stable project, job, attempt, worker and `observation_stream_id` identifiers where applicable, without including secret values. The MLflow run identifier SHALL be mapped to the observation stream when the run is created and SHALL NOT be required on earlier telemetry. |
 | MON-019 | Collector queues, telemetry retention and metric-label cardinality SHALL have documented limits and exhaustion behaviour. |
 
 ## Checkpointing and recovery
