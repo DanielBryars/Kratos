@@ -145,3 +145,15 @@ agent: heartbeats continue and the retained result is delivered once the link re
 also continue while a job runs, and the agent stops the container if the control plane stops
 returning that attempt. See the
 [worker protocol](../../docs/protocol/worker-v1.md#execution-authority-and-network-loss).
+
+## Output manifests
+
+`kratos_agent.outputs.build_manifest` prepares the manifest that ADR-014 and the protocol 1.1
+durable-output extension require. Given a finished attempt's output directory and the job's
+declared output requirements, it records each file's byte length, SHA-256 and base64 CRC32C. It
+never follows a symbolic link, and it refuses the whole tree if it finds a symbolic link, a
+hard-link alias, a device, socket or named pipe, a path the control plane would reject, an
+undeclared file, a file above its declared size, or a missing mandatory output.
+
+This is not yet connected to job execution. The agent still advertises protocol `1.0`, so the
+control plane assigns it no job with output requirements until the mount and upload steps exist.

@@ -144,6 +144,14 @@ class HeartbeatRequest(StrictModel):
     capabilities: WorkerCapabilities
 
 
+class JobOutputRequirement(StrictModel):
+    logical_path: str = Field(min_length=1, max_length=240)
+    role: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+    media_type: str = Field(min_length=3, max_length=127)
+    mandatory: bool
+    max_bytes: int = Field(ge=1, le=5 * 1024**3)
+
+
 class JobAssignment(StrictModel):
     attempt_id: UUID
     job_id: UUID
@@ -152,6 +160,7 @@ class JobAssignment(StrictModel):
     gpu_index: int = Field(ge=0)
     timeout_seconds: int = Field(ge=30, le=3600)
     lease_expires_at: datetime
+    output_requirements: tuple[JobOutputRequirement, ...] = Field(default=(), max_length=100)
 
 
 class HeartbeatResponse(StrictModel):
@@ -174,3 +183,10 @@ class JobResultResponse(StrictModel):
     attempt_id: UUID
     job_id: UUID
     status: str
+
+
+class ArtifactManifestFile(StrictModel):
+    logical_path: str = Field(min_length=1, max_length=240)
+    byte_length: int = Field(ge=0, le=5 * 1024**3)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{6}==$")
