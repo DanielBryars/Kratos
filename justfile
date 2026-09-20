@@ -6,6 +6,7 @@ bootstrap:
     cd workers/agent && uv sync --locked
     cd workers/gpu-health-check && uv sync --locked --python 3.12
     cd workers/training-example && uv sync --locked --python 3.12
+    cd workers/workload-template && uv sync --locked --python 3.12
     cd workers/soak-workload && uv sync --locked --python 3.12
 
 api:
@@ -35,6 +36,10 @@ check:
     cd workers/training-example && uv run ruff check .
     cd workers/training-example && uv run mypy train.py tests
     cd workers/training-example && uv run pytest
+    cd workers/workload-template && uv run ruff format --check .
+    cd workers/workload-template && uv run ruff check .
+    cd workers/workload-template && uv run mypy workload.py tests
+    cd workers/workload-template && uv run pytest
     cd workers/soak-workload && uv run ruff format --check .
     cd workers/soak-workload && uv run ruff check .
     cd workers/soak-workload && uv run mypy soak.py tests
@@ -55,6 +60,13 @@ training-image:
 
 training: training-image
     docker run --rm --gpus device=0 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=1g kratos-training-example
+
+workload-template-image:
+    docker build --file workers/workload-template/Dockerfile --tag kratos-workload-template .
+
+workload-template: workload-template-image
+    mkdir -p .tmp/workload-outputs
+    docker run --rm --gpus device=0 --network none --read-only --cap-drop ALL --security-opt no-new-privileges --memory 8g --cpus 4 --pids-limit 512 --env KRATOS_JOB_ID=22222222-2222-4222-8222-222222222222 --env KRATOS_ATTEMPT_ID=11111111-1111-4111-8111-111111111111 --mount type=bind,source="${PWD}/.tmp/workload-outputs",target=/kratos/outputs --tmpfs /tmp:rw,noexec,nosuid,size=1g kratos-workload-template
 
 soak-image:
     docker build --file workers/soak-workload/Dockerfile --tag kratos-soak-workload .
