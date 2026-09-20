@@ -163,6 +163,33 @@ execute at most one active assignment and SHALL reject an assignment whose lease
 If a heartbeat or result acknowledgement is lost, the control plane SHALL return the same attempt;
 the agent SHALL inspect its stable attempt-named container and SHALL NOT knowingly start a duplicate.
 
+### Execution authority and network loss
+
+The agent SHALL execute an attempt at most once. It SHALL fetch the image, durably record the
+attempt identifier in its protected state and only then create the container. For a recorded
+attempt it SHALL resume the existing container and SHALL NOT create another; if that container is
+missing it SHALL report a failure, because it cannot prove that the workload did not run. A
+container that was created but never started SHALL also be reported as a failure.
+
+A container's authority ends at the earlier of its runtime bound, measured from the container's
+actual start, and the lease deadline. The agent SHALL stop the container at that time without
+needing to reach the control plane, including after an agent restart. A container found to have
+finished after that time while unsupervised SHALL NOT be reported as successful. A container that
+exited within its authority SHALL be reported with its actual exit status even when the result can
+only be delivered after the lease deadline; the control plane decides whether to accept it.
+
+A transport failure, `429` or `5xx` response, or local container-runtime error SHALL NOT end the
+agent. It SHALL retain the container and its recorded attempt, continue heartbeats at the normal
+interval and replay the result when the control plane next returns the same attempt. Any other
+rejection, including `401`, remains fatal. When a heartbeat response no longer carries a recorded
+attempt, the control plane has closed it: the agent SHALL remove that container, running or not,
+and clear its record.
+
+Known limitations of this slice: the lease deadline is compared with the worker's clock, so worker
+clock error shifts the local bound; and the agent sends no heartbeat while it supervises a
+container, so a busy worker is displayed as `stale` and then `offline` for a job longer than the
+connectivity thresholds even when its link is healthy.
+
 The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
 `PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be
 idempotent. The control plane SHALL release the worker only after it has durably recorded a terminal

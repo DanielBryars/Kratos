@@ -136,3 +136,10 @@ The stopped container remains present until the control plane acknowledges its b
 stderr and exit status. This lets a restarted agent report the same attempt instead of knowingly
 starting it twice. The agent removes the container after acknowledgement. The Docker socket therefore
 remains an explicit host-administrative trust boundary.
+
+The agent records each attempt in its state volume before creating the container, so a missing
+container is reported as a failure rather than run again. It stops a container at the earlier of its
+runtime bound and lease deadline without needing the control plane. Losing the control plane, or a
+temporary Docker or registry error, is logged as `{"status": "retrying"}` and does not end the
+agent: heartbeats continue and the retained result is delivered once the link returns. See the
+[worker protocol](../../docs/protocol/worker-v1.md#execution-authority-and-network-loss).

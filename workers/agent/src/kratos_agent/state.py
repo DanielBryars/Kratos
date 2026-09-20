@@ -17,6 +17,8 @@ class AgentState:
     registration_id: UUID | None = None
     next_sequence: int = 0
     heartbeat_interval_seconds: int = 30
+    # Recorded before an attempt's container is created so a restarted agent never starts it twice.
+    started_attempt_id: UUID | None = None
 
     @property
     def is_enrolled(self) -> bool:
@@ -39,6 +41,9 @@ def load_state(path: Path) -> AgentState | None:
         ),
         next_sequence=int(payload["next_sequence"]),
         heartbeat_interval_seconds=int(payload["heartbeat_interval_seconds"]),
+        started_attempt_id=(
+            UUID(payload["started_attempt_id"]) if payload.get("started_attempt_id") else None
+        ),
     )
 
 
@@ -49,6 +54,9 @@ def save_state(path: Path, state: AgentState) -> None:
     payload["agent_instance_id"] = str(state.agent_instance_id)
     payload["worker_id"] = str(state.worker_id) if state.worker_id else None
     payload["registration_id"] = str(state.registration_id) if state.registration_id else None
+    payload["started_attempt_id"] = (
+        str(state.started_attempt_id) if state.started_attempt_id else None
+    )
 
     descriptor, temporary_name = tempfile.mkstemp(prefix=".state-", dir=path.parent)
     temporary_path = Path(temporary_name)
