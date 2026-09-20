@@ -236,6 +236,35 @@ struct UploadSigningMaterial {
     headers: BTreeMap<String, String>,
 }
 
+fn resumable_initiation_request(
+    client: &reqwest::Client,
+    signed_url: String,
+    signed_headers: &BTreeMap<String, String>,
+) -> Result<reqwest::Request, ArtifactStorageError> {
+    let headers = signed_headers
+        .iter()
+        .map(|(name, value)| {
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+            Ok((name, value))
+        })
+        .collect::<Result<reqwest::header::HeaderMap, ArtifactStorageError>>()?;
+    client
+        .post(signed_url)
+        .headers(headers)
+        // GCS requires the initiation POST to declare its empty body. Without this header it
+        // rejects an otherwise valid signed request with 411 before evaluating the signature.
+        .header(
+            reqwest::header::CONTENT_LENGTH,
+            reqwest::header::HeaderValue::from_static("0"),
+        )
+        .body(Vec::new())
+        .build()
+        .map_err(|_| ArtifactStorageError::InvalidResponse)
+}
+
 fn upload_signing_material(
     bucket: &str,
     signer_service_account: &str,
@@ -384,23 +413,10 @@ impl ArtifactStorage for GoogleArtifactStorage {
             "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
             material.canonical_uri, material.canonical_query
         );
+        let request = resumable_initiation_request(&self.client, signed_url, &material.headers)?;
         let response = self
             .client
-            .post(signed_url)
-            .headers(
-                material
-                    .headers
-                    .iter()
-                    .map(|(name, value)| {
-                        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
-                        let value = reqwest::header::HeaderValue::from_str(value)
-                            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
-                        Ok((name, value))
-                    })
-                    .collect::<Result<reqwest::header::HeaderMap, ArtifactStorageError>>()?,
-            )
-            .send()
+            .execute(request)
             .await
             .map_err(|_| ArtifactStorageError::Unavailable)?;
         if !response.status().is_success() {
@@ -614,7 +630,9 @@ fn xml_error_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::{percent_encode, upload_signing_material, xml_error_field};
+    use super::{
+        percent_encode, resumable_initiation_request, upload_signing_material, xml_error_field,
+    };
 
     #[test]
     fn encoding_preserves_only_canonical_path_separators() {
@@ -659,6 +677,39 @@ mod tests {
         assert_eq!(
             material.signed_headers,
             "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length"
+        );
+    }
+
+    #[test]
+    fn resumable_initiation_declares_its_empty_body() {
+        let issued_at = DateTime::parse_from_rfc3339("2026-09-20T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let material = upload_signing_material(
+            "kratos-artifacts",
+            "upload@example.iam.gserviceaccount.com",
+            "v1/owners/owner/artifacts/object",
+            "application/octet-stream",
+            512,
+            &"b".repeat(64),
+            issued_at,
+        );
+
+        let request = resumable_initiation_request(
+            &reqwest::Client::new(),
+            "https://storage.googleapis.com/kratos-artifacts/object?signed=true".to_owned(),
+            &material.headers,
+        )
+        .unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.headers().get(reqwest::header::CONTENT_LENGTH),
+            Some(&reqwest::header::HeaderValue::from_static("0"))
+        );
+        assert_eq!(
+            request.body().and_then(reqwest::Body::as_bytes),
+            Some(&[][..])
         );
     }
 
