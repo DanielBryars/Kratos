@@ -18,16 +18,12 @@ them once they are resolved or merged.
 
 | Agent | Branch | Paths | Status |
 |---|---|---|---|
-| Claude | `feature/r0.2-agent-busy-heartbeats` (PR #37) | `workers/agent/**`, `docs/protocol/worker-v1.md`, the network-loss runbook | 2026-09-20 — merged |
-| Claude | `feature/r0.2-agent-output-manifest` (PR #36) | `workers/agent/src/kratos_agent/outputs.py`, `models.py`, `workers/agent/pyproject.toml`, `uv.lock` | 2026-09-20 — merged |
 | Claude | `docs/adr-015-job-telemetry` (PR #40, P4) | new `docs/architecture/decisions/015-*.md`, `docs/architecture/README.md` | 2026-09-20 — three review findings remain: correlation key, per-sink acknowledgement and concrete v1 limits |
 | Claude | `feature/r0.2-soak-workload` (PR #43, P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — two P1 findings remain: PID-1 supervisor and agent TERM-to-KILL contract |
 | Claude | `feature/observability-compose` (PR #42, P2) | new `observability/**` | 2026-09-20 — waits for PR #40; cardinality, storage response, integration proof and health checks remain |
 | Claude | `feature/observability-terraform` (PR #44, P3) | new `infrastructure/observability/**` | Plan-only and cost-gated; SHALL NOT be applied; waits for corrected PRs #40 and #42 |
-| Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — review findings posted; Claude owns agent-side fixes and a clean rebuild on current `main` |
-| Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
-| Codex | `feature/r0.2-artifact-acceptance` (system diagram) | `docs/architecture/kratos-system.drawio` | 2026-09-20 — editable two-page system and worker-flow diagram requested by the user |
-| Codex | `feature/r0.2-upload-session-recovery` (PR #49) | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — merged as `1ca0450`; agent may now implement the published recovery contract |
+| Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — prior findings fixed; authority during transfer, hostile-owner cleanup, rejected-artifact termination and completion-response validation remain |
+| Codex | `docs/r0.2-acceptance-status` | `COORDINATION.md`, `docs/r0.2-workstreams.md`, `docs/acceptance/r0.2/network-loss-exercise-runbook.md` | 2026-09-20 — align acceptance status and runbook with merged lease recovery and cancellation |
 
 ## Handover notes
 
