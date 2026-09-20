@@ -1,6 +1,6 @@
 # ADR-016 — How a worker authenticates to the telemetry gateway
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-09-20
 
 ## Context
@@ -97,11 +97,27 @@ attempts can therefore have data from far more streams in its queue than a worke
 one, and an age bound alone would have silently stopped covering it. The count is what makes the
 rule hold at both ends.
 
-**The queue SHALL be sized to fit the bound, not the other way round.** ADR-015 caps a worker at
-64 MiB of forwarded bytes per attempt, so a queue capacity above sixteen attempts' worth can hold
-records this token can never authorise. The deployment SHALL configure the collector's queue
-capacity below that, and SHALL treat the two numbers as one decision: raising the queue without
-raising the count reintroduces exactly the undrainable queue this section exists to prevent.
+**The queue SHALL be partitioned by stream, and it is the partitions that are counted.** An
+earlier version of this section tried to bound the streams a queue could hold by bounding its
+bytes, reasoning from ADR-015's 64 MiB per attempt. That arithmetic does not hold: a few small
+batches from each of several hundred short attempts sit far below any byte ceiling while spanning
+far more streams than a token can name. Bytes bound volume; they say nothing about how many
+distinct things produced it.
+
+The worker SHALL therefore persist **at most 16 per-stream queues**, matching the 16 streams a
+token may name, and SHALL apply two absolute bounds beneath that:
+
+| Bound | Value |
+|---|---|
+| Per-stream persisted queue | 64 MiB, matching ADR-015's per-attempt budget |
+| All persisted queues together | 256 MiB |
+
+**A seventeenth stream SHALL close the oldest queue rather than be refused.** A worker taking new
+work must not be stopped by telemetry it has not finished sending, so the oldest partition is
+closed, its undelivered records are discarded, and the loss is reported as an explicit gap for
+that stream with a count of what went. Silently keeping seventeen and hoping, or silently dropping
+the newest, are both worse: the first breaks the token's guarantee, the second loses the run
+someone is currently watching.
 
 This has a property worth stating plainly: **no old token ever needs to be retained.** Whatever
 token is current authorises the whole of what the queue may still hold, so a retry after a restart
@@ -117,10 +133,15 @@ gateway SHALL NOT accept a telemetry token on any route but OTLP ingestion.
 
 ### The gateway verifies it offline, and identity comes from the claims
 
-The gateway SHALL verify the signature, `iss`, `aud` and `exp` with the Collector's `oidc`
-authenticator extension. Verification SHALL NOT call the control plane per request: that is what
-keeps the control plane off the telemetry path, so the gateway can validate every push while the
-control plane is unavailable and an observation is never lost because it was busy.
+**The telemetry admission service is the only thing that authorises a push**, and it does all of
+it: signature, `iss`, `aud`, `exp`, the stream check below, and the trusted identity it stamps on
+what it forwards. The Collector's `oidc` and `attributes/from_context` are **not** used for any of
+this; an earlier draft split the work between them and the admission service, which would have left
+two components each appearing to be the authority and neither being it.
+
+Verification SHALL NOT call the control plane per request: that is what keeps the control plane off
+the telemetry path, so a push can be validated while the control plane is unavailable and an
+observation is never lost because it was busy.
 
 **Publishing the keys is a contract, not a URL.** The `oidc` extension performs OpenID Connect
 discovery against `issuer_url` by default; a JWKS address alone does not satisfy it. The control
@@ -155,21 +176,31 @@ request's records carry; refusal unless all records agree on one stream; and ref
 stream is in `kratos.streams`. Only then does it forward to the collector, whose receiver SHALL be
 bound so that nothing can reach it except through this service.
 
-It SHALL refuse with an HTTP status the sender's exporter treats as retryable or permanent as
-appropriate, and SHALL NOT acknowledge a request it refused. That is the property the whole
-arrangement rests on: an unacknowledged push stays in the worker's queue, so a refusal caused by a
-stream that has aged out of the token is visible as a retry that keeps failing rather than as data
-that quietly vanished.
+**A refusal SHALL say whether trying again could ever work**, because an exporter that retries a
+permanent failure retries it for ever:
+
+| Cause | Status | What the sender does |
+|---|---|---|
+| Token expired, keys unreachable, service overloaded | **5xx** | Retries; the next heartbeat brings a fresh token |
+| Stream not in the token, mixed-stream request, malformed or unverifiable token | **4xx** | Discards, and the worker counts it |
+
+An aged-out stream is therefore **permanent**, not an eternal retry. The records are discarded at
+the sender, counted, and reported as a gap for that stream. Saying otherwise — that it is
+unacknowledged and retried indefinitely — would leave a worker pushing data that can never be
+accepted until its queue filled with it.
+
+The service SHALL NOT acknowledge a request it refused, whichever class it is. A 5xx that was
+acknowledged is data lost to an outage that was about to end.
 
 It is a small service and it holds no state. It is, however, ours to write and operate, and that
 cost belongs in this decision rather than in the surprise of discovering the Collector will not do
 it.
 
 **Identity SHALL be derived from the validated claims, never from what the worker sent.** The
-gateway SHALL overwrite the worker and project resource attributes on every accepted request
-from `auth.claims.*`, using the Collector's `from_context` attribute source, and SHALL accept the
-request's stream only if it is one of `kratos.streams`. A stream cannot simply be assigned from the
-claims now that they name a set, so it is checked against them instead. A resource
+admission service SHALL overwrite the worker and project resource attributes on every request it
+forwards, from the claims it verified, and SHALL accept the request's stream only if it is one of
+`kratos.streams`. A stream cannot be assigned from the claims now that they name a set, so it is
+checked against them instead. A resource
 attribute a worker supplies is an assertion by the sender and SHALL NOT establish authorisation or
 attribution; only a claim the gateway verified may do that.
 
@@ -249,12 +280,21 @@ finished.
 
 ### Transport
 
-The collector SHALL reach the gateway over HTTPS through the existing load balancer. The gateway
-SHALL NOT accept unencrypted ingestion from outside the instance's own network.
+There are three hops and only one of them carries a credential.
 
-The agent-to-local-collector hop carries the same token but does not leave the worker; it is a
-loopback or private-bridge connection on a machine the agent already trusts enough to run the
-workload.
+| Hop | Credential | Transport |
+|---|---|---|
+| Agent to worker-local collector | none | loopback on the worker |
+| Collector to loopback token proxy | none | loopback on the worker |
+| Token proxy to admission service | the bearer token, added per request | HTTPS through the load balancer |
+
+The two local hops are credential-free on purpose: a token on them would be a secret sitting in a
+collector's configuration for no gain, since anything that can reach loopback on that machine can
+already reach the token file. The proxy is where the credential joins, which is why it is the only
+component that reads the file.
+
+The admission service SHALL NOT accept unencrypted ingestion from outside the instance's own
+network, and the collector's own receiver SHALL be reachable only through the admission service.
 
 ### The gate stays shut until this exists
 
