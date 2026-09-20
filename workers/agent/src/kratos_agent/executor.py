@@ -13,11 +13,22 @@ from uuid import UUID
 import docker
 from pydantic import ValidationError
 
+from kratos_agent.logs import LineAssembler, split_timestamp
 from kratos_agent.models import (
     GpuHealthEvidence,
     GpuHealthStatus,
     JobAssignment,
     JobExecutionResult,
+)
+from kratos_agent.observations import MAX_LINE_BYTES, Stream
+
+# One output line, as the classifier will see it. A plain callable rather than an interface:
+# the executor knows nothing about what happens to a line after it hands it over.
+LogObserver = Callable[[Stream, datetime, str], None]
+# Emitted in place of a resumed container's replayed output, so the absence is visible.
+_RESUMED_NOTICE = (
+    "kratos: attempt resumed after a restart; earlier output is not re-read, because "
+    "replaying it would duplicate every observation under new sequence numbers"
 )
 
 IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
@@ -25,6 +36,12 @@ MAX_RESULT_BYTES = 64 * 1024
 MAX_FAILURE_MESSAGE_CHARS = 1_000
 OUTPUT_MOUNT_TARGET = "/kratos/outputs"
 ATTEMPT_DIRECTORY = "attempts"
+# A little above the classifier's own bound, so a line truncated here is still over that
+# bound once its timestamp prefix is removed and is refused rather than silently shortened.
+LOG_LINE_BOUND_BYTES = MAX_LINE_BYTES + 128
+# How long supervision waits for the log reader to finish after the container exits. It is
+# a tail of already-buffered output, not a network call, and nothing waits on the result.
+LOG_DRAIN_SECONDS = 5.0
 # Volume subpath mounts require Docker Engine 26 or later.
 MINIMUM_SUBPATH_ENGINE_MAJOR = 26
 # Cleanup runs a known image, not the workload's: an arbitrary image need not contain a
@@ -190,6 +207,7 @@ class DockerExecutor:
         may_start: bool = True,
         on_tick: Callable[[], bool] | None = None,
         tick_seconds: float = 30,
+        observe: "LogObserver | None" = None,
     ) -> JobExecutionResult:
         """Supervise the attempt's container until it exits or its authority ends.
 
@@ -202,6 +220,10 @@ class DockerExecutor:
 
         Authority ends without a grace period: the container is killed, not asked to stop,
         so a workload that ignores SIGTERM cannot run past its bound.
+
+        ``observe`` receives each output line on a separate thread, so nothing about
+        telemetry can delay the supervision loop. It is only attached to a container this
+        call created: see ``_start_log_reader``.
         """
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
@@ -215,6 +237,7 @@ class DockerExecutor:
                 return _failure(125, "job container was created but never started")
             observed_start = _state_time(container, "StartedAt")
             started_at = observed_start or self._clock()
+            resumed = True
         except docker.errors.NotFound:
             if self._clock() >= assignment.lease_expires_at:
                 return _failure(124, "assignment lease expired before execution", timed_out=True)
@@ -264,6 +287,9 @@ class DockerExecutor:
             # Read back rather than assumed: the runtime's own clock is the evidence.
             container.reload()
             observed_start = _state_time(container, "StartedAt")
+            resumed = False
+
+        reader, reader_stop = self._start_log_reader(container, observe, resumed=resumed)
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
@@ -321,6 +347,7 @@ class DockerExecutor:
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
+        self._stop_log_reader(reader, reader_stop)
         # Both or neither: an interval with one end missing is not evidence.
         whole = observed_start is not None and observed_finish is not None
         return JobExecutionResult(
@@ -432,6 +459,76 @@ class DockerExecutor:
         finally:
             with contextlib.suppress(Exception):
                 container.remove(force=True)
+
+    def _start_log_reader(
+        self,
+        container: Any,
+        observe: "LogObserver | None",
+        *,
+        resumed: bool,
+    ) -> tuple[threading.Thread | None, threading.Event]:
+        """Follow the container's output on its own thread, or decline to.
+
+        A resumed container is deliberately **not** followed. Docker replays a container's log
+        from the beginning, and every replayed line would be given a fresh sequence, so the
+        control plane would receive the same observations twice under different numbers. Batch
+        idempotency does not help: it is keyed on sequence, and these would be new ones. Losing
+        telemetry for a resumed attempt is the lesser fault, and it is counted rather than silent.
+        """
+        stop = threading.Event()
+        if observe is None:
+            return None, stop
+        if resumed:
+            observe(Stream.STDERR, self._clock(), _RESUMED_NOTICE)
+            return None, stop
+        thread = threading.Thread(
+            target=self._follow_logs,
+            args=(container, observe, stop),
+            name="kratos-log-reader",
+            daemon=True,
+        )
+        thread.start()
+        return thread, stop
+
+    def _follow_logs(self, container: Any, observe: "LogObserver", stop: threading.Event) -> None:
+        """Read until the container ends or supervision says stop. Never raises."""
+        assemblers = {
+            Stream.STDOUT: LineAssembler(LOG_LINE_BOUND_BYTES),
+            Stream.STDERR: LineAssembler(LOG_LINE_BOUND_BYTES),
+        }
+
+        def emit(which: Stream, line: str) -> None:
+            at, text = split_timestamp(line, fallback=self._clock())
+            observe(which, at, text)
+
+        try:
+            for out, err in container.logs(
+                stdout=True, stderr=True, stream=True, follow=True, timestamps=True, demux=True
+            ):
+                if stop.is_set():
+                    break
+                for data, which in ((out, Stream.STDOUT), (err, Stream.STDERR)):
+                    if not data:
+                        continue
+                    for line in assemblers[which].feed(data):
+                        emit(which, line)
+        except Exception:  # noqa: BLE001 - reading output must never end a run
+            pass
+        finally:
+            # A container that exits mid-line still wrote that line, and it is often the one
+            # worth having.
+            with contextlib.suppress(Exception):
+                for which, assembler in assemblers.items():
+                    for line in assembler.flush():
+                        emit(which, line)
+
+    @staticmethod
+    def _stop_log_reader(reader: threading.Thread | None, stop: threading.Event) -> None:
+        stop.set()
+        if reader is not None:
+            # Bounded, because nothing may wait on telemetry indefinitely. A reader still going
+            # after this is a daemon thread and does not hold the agent open.
+            reader.join(timeout=LOG_DRAIN_SECONDS)
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""
