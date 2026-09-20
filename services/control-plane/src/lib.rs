@@ -33,8 +33,10 @@ use artifacts::{
 use human_auth::{ClientAuthConfig, HumanAuth};
 use operator::{
     ApproveWorkerRequest, CreateEnrolmentRequest, CreateEnrolmentResponse, CreateJobRequest,
+    OperatorArtifactListResponse, OperatorArtifactResponse, OperatorArtifactStatus,
     OperatorJobResponse, OperatorWorkerResponse, PendingRegistrationResponse,
-    RegistrationDecisionResponse, WorkerActionResponse, WorkerConnectivity, WorkerGroupResponse,
+    RegistrationDecisionResponse, VerifiedArtifactEvidence, WorkerActionResponse,
+    WorkerConnectivity, WorkerGroupResponse,
 };
 use registry::{
     ClaimRegistrationRequest, EnrolmentRequest, EnrolmentResponse, ErrorResponse, GpuCapability,
@@ -86,6 +88,7 @@ pub(crate) struct AppState {
         operator::revoke_worker,
         operator::create_job,
         operator::list_jobs,
+        operator::list_job_artifacts,
         operator::cancel_job,
         registry::enrol_worker,
         registry::request_registration,
@@ -105,7 +108,8 @@ pub(crate) struct AppState {
         RegistrationCreatedResponse, RegistrationStatusResponse, RegistrationState,
         ClaimRegistrationRequest, PendingRegistrationResponse, RegistrationDecisionResponse,
         ApproveWorkerRequest, OperatorWorkerResponse, WorkerActionResponse, WorkerConnectivity,
-        WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, JobAssignment,
+        WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, OperatorArtifactResponse,
+        OperatorArtifactStatus, OperatorArtifactListResponse, VerifiedArtifactEvidence, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
         ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
@@ -284,6 +288,10 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/jobs/{job_id}/cancel",
             post(operator::cancel_job),
+        )
+        .route(
+            "/api/v1/operator/jobs/{job_id}/artifacts",
+            get(operator::list_job_artifacts),
         )
         .route(
             "/api/v1/operator/workers/{worker_id}/approve",

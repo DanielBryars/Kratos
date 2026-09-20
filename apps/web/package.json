@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc -b --pretty false",
+    "test": "node --test --experimental-strip-types src/artifactPresentation.test.mjs"
   },
   "dependencies": {
     "firebase": "12.19.0",

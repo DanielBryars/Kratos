@@ -10,6 +10,12 @@ import {
 } from "firebase/auth";
 import { useEffect, useState } from "react";
 
+import {
+  artifactRows,
+  type ArtifactList,
+  type OutputRequirement,
+} from "./artifactPresentation";
+
 type Version = { name: string; version: string };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
 type Enrolment = { enrolment_credential: string; expires_at: string };
@@ -54,13 +60,22 @@ type Job = {
   stdout: string | null;
   stderr: string | null;
   failure_message: string | null;
+  output_requirements: OutputRequirement[];
 };
+type ArtifactLoad = { response: ArtifactList | null; failed: boolean };
 type ApiError = { message?: string };
 
 const DEMO_WORKLOAD_IMAGE = "ghcr.io/danielbryars/kratos-gpu-health-check@sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9";
 
 function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+}
+
+function formatArtifactBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
 }
 
 function formatDuration(milliseconds: number) {
@@ -110,6 +125,7 @@ export function App() {
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
   const [workerActionId, setWorkerActionId] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [jobArtifacts, setJobArtifacts] = useState<Record<string, ArtifactLoad>>({});
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
@@ -133,6 +149,7 @@ export function App() {
       setPending([]);
       setWorkers([]);
       setJobs([]);
+      setJobArtifacts({});
       return;
     }
     let cancelled = false;
@@ -147,7 +164,23 @@ export function App() {
       if (!cancelled) {
         if (pendingResponse.ok) setPending((await pendingResponse.json()) as PendingRegistration[]);
         if (workersResponse.ok) setWorkers((await workersResponse.json()) as Worker[]);
-        if (jobsResponse.ok) setJobs((await jobsResponse.json()) as Job[]);
+        if (jobsResponse.ok) {
+          const nextJobs = (await jobsResponse.json()) as Job[];
+          setJobs(nextJobs);
+          const artifactEntries = await Promise.all(nextJobs.map(async (job) => {
+            try {
+              const response = await fetch(`/api/v1/operator/jobs/${job.job_id}/artifacts`, { headers });
+              if (!response.ok) return [job.job_id, { response: null, failed: true }] as const;
+              return [
+                job.job_id,
+                { response: (await response.json()) as ArtifactList, failed: false },
+              ] as const;
+            } catch {
+              return [job.job_id, { response: null, failed: true }] as const;
+            }
+          }));
+          if (!cancelled) setJobArtifacts(Object.fromEntries(artifactEntries));
+        }
       }
     }
     void refresh();
@@ -410,6 +443,40 @@ export function App() {
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
                       {job.stdout && <pre>{job.stdout}</pre>}
                       {job.stderr && <pre className="job-failure">{job.stderr}</pre>}
+                      <div className="artifact-list" aria-label={`Outputs for ${job.name}`}>
+                        <div className="artifact-list-heading"><strong>Outputs</strong><span>{job.output_requirements.length} requested</span></div>
+                        {job.output_requirements.length === 0 && <p className="artifact-unavailable">No durable outputs were requested for this job.</p>}
+                        {job.output_requirements.length > 0 && !jobArtifacts[job.job_id] && <p className="artifact-unavailable">Loading output status…</p>}
+                        {job.output_requirements.length > 0 && jobArtifacts[job.job_id] && artifactRows(
+                          job.output_requirements,
+                          jobArtifacts[job.job_id].response,
+                          jobArtifacts[job.job_id].failed,
+                        ).map((row) => (
+                          <div className="artifact" key={row.logical_path}>
+                            <div className="artifact-heading">
+                              <div><strong>{row.logical_path}</strong><span>{row.mandatory ? "Required" : "Optional"} · {row.role}</span></div>
+                              <span className={`badge badge--artifact-${row.artifact?.status ?? "unavailable"}`}>
+                                {row.artifact?.status ?? "unavailable"}
+                              </span>
+                            </div>
+                            {!row.artifact && <p className="artifact-unavailable">{row.availability === "request_failed" ? "Output status is currently unavailable." : "The worker has not declared this output."}</p>}
+                            {row.artifact && (
+                              <div className="artifact-evidence">
+                                <p>Attempt {row.artifact.attempt_number} · {formatArtifactBytes(row.artifact.byte_length)} of {formatArtifactBytes(row.max_bytes)}</p>
+                                <p><span>Declared SHA-256</span><code>{row.artifact.sha256}</code></p>
+                                <p><span>Declared CRC32C</span><code>{row.artifact.crc32c}</code></p>
+                                {row.artifact.verified ? (
+                                  <div className="artifact-verified">
+                                    <p>Storage verified {new Date(row.artifact.verified.verified_at).toLocaleString()} · generation {row.artifact.verified.storage_generation}</p>
+                                    <p><span>Verified SHA-256</span><code>{row.artifact.verified.sha256}</code></p>
+                                    <p><span>Verified CRC32C</span><code>{row.artifact.verified.crc32c}</code></p>
+                                  </div>
+                                ) : <p className="artifact-unavailable">Verified storage evidence is unavailable until verification succeeds.</p>}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
                       {job.status === "cancelling" && <p className="job-cancellation" role="status">Cancellation has been requested. The job will be cancelled when the worker stops or its lease expires.</p>}
                       {(job.status === "queued" || job.status === "assigned" || job.status === "running") && (
                         <button className="button-secondary" type="button" disabled={jobAction} onClick={() => void cancelJob(job.job_id)}>

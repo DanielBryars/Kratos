@@ -76,6 +76,21 @@ h3 { margin-top: 7px; font-size: 1.35rem; }
 .badge--job-assigned, .badge--job-running { border-color: #376791; color: #8cc0ff; }
 .badge--job-cancelling { border-color: #7a6227; color: #ffd978; }
 .job-cancellation { color: #ffd978; }
+.artifact-list { display: grid; gap: 10px; margin-top: 4px; padding-top: 14px; border-top: 1px solid #263242; }
+.artifact-list-heading, .artifact-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.artifact-list-heading > span, .artifact-heading span { color: #7f91a5; font-size: 0.75rem; }
+.artifact { display: grid; gap: 9px; padding: 12px; border: 1px solid #2b394a; border-radius: 8px; background: #0d1520; }
+.artifact-heading > div { display: grid; gap: 5px; min-width: 0; }
+.artifact-heading strong { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.86rem; }
+.artifact-evidence, .artifact-verified { display: grid; gap: 7px; }
+.artifact-evidence p { display: grid; gap: 3px; }
+.artifact-evidence code { overflow-wrap: anywhere; color: #bcd0e4; font-size: 0.74rem; }
+.artifact-verified { margin-top: 2px; padding: 10px; border-left: 2px solid #3fba7c; background: rgba(36, 93, 72, 0.1); }
+.artifact-unavailable { color: #8091a4; font-style: italic; }
+.badge--artifact-verified { border-color: #245d48; color: #66d19e !important; }
+.badge--artifact-verifying, .badge--artifact-uploading { border-color: #376791; color: #8cc0ff !important; }
+.badge--artifact-rejected { border-color: #713737; color: #ff8585 !important; }
+.badge--artifact-unavailable { color: #8091a4 !important; }
 .operator-action { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
 .form-row { flex-wrap: wrap; gap: 12px; }
 .form-row label { color: #9babbc; }
