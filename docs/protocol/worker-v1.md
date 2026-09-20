@@ -249,7 +249,8 @@ The control plane exposes two replay-safe transfer calls:
 
 - `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading` and returns a
   ten-minute, per-object GCS V4 signed `POST` plus the exact headers required to initiate a
-  resumable upload. The worker SHALL send those headers unchanged, keep the returned session URI
+  resumable upload. Those headers include the XML API generation-match precondition and the exact
+  declared upload length. The worker SHALL send them unchanged, keep the returned session URI
   private, and upload only the declared bytes through that session. Replaying the call while the
   attempt is active MAY issue a fresh initiation grant for the same bucket and object key.
 - `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
@@ -265,6 +266,10 @@ temporary GCS failure leaves verification retryable. A metadata mismatch marks t
 `rejected`; it SHALL NOT be published as valid output. A successful job result SHALL be rejected
 while any mandatory output lacks verified evidence. Failed job results do not require mandatory
 outputs, so a workload failure cannot leave the worker permanently occupied.
+
+The control plane SHALL protect verified objects from the seven-day unverified-object lifecycle
+rule. It SHOULD delete a rejected object immediately at its exact generation; lifecycle cleanup is
+the fallback for abandoned uploads and unavailable immediate cleanup.
 
 Upload initiation responses SHALL use `Cache-Control: no-store`. Signed URLs and resumable session
 URIs are credentials: agents SHALL redact them from logs and the control plane SHALL persist only

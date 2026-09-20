@@ -48,6 +48,7 @@ pub trait ArtifactStorage: Send + Sync {
         &self,
         object_key: &str,
         media_type: &str,
+        byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
     ) -> Result<ResumableUploadAuthorization, ArtifactStorageError>;
@@ -58,6 +59,20 @@ pub trait ArtifactStorage: Send + Sync {
         object_key: &str,
         generation: i64,
     ) -> Result<StoredObjectMetadata, ArtifactStorageError>;
+
+    async fn protect_verified_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError>;
+
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError>;
 
     fn bucket(&self) -> &str;
 }
@@ -79,11 +94,12 @@ impl ArtifactStorageClient {
         &self,
         object_key: &str,
         media_type: &str,
+        byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
     ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
         self.0
-            .authorize_resumable_upload(object_key, media_type, sha256, issued_at)
+            .authorize_resumable_upload(object_key, media_type, byte_length, sha256, issued_at)
             .await
     }
 
@@ -98,6 +114,34 @@ impl ArtifactStorageClient {
         generation: i64,
     ) -> Result<StoredObjectMetadata, ArtifactStorageError> {
         self.0.object_metadata(bucket, object_key, generation).await
+    }
+
+    /// Protects a verified object from the unverified-upload lifecycle rule.
+    ///
+    /// # Errors
+    /// Returns an error when the exact object generation cannot be updated.
+    pub async fn protect_verified_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError> {
+        self.0
+            .protect_verified_object(bucket, object_key, generation)
+            .await
+    }
+
+    /// Deletes a rejected object at its exact generation.
+    ///
+    /// # Errors
+    /// Returns an error when the exact object generation cannot be deleted.
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError> {
+        self.0.delete_object(bucket, object_key, generation).await
     }
 
     #[must_use]
@@ -169,6 +213,82 @@ struct GcsObjectResponse {
     metadata: BTreeMap<String, String>,
 }
 
+struct UploadSigningMaterial {
+    canonical_uri: String,
+    canonical_query: String,
+    canonical_headers: String,
+    signed_headers: &'static str,
+    timestamp: String,
+    scope: String,
+    headers: BTreeMap<String, String>,
+}
+
+fn upload_signing_material(
+    bucket: &str,
+    signer_service_account: &str,
+    object_key: &str,
+    media_type: &str,
+    byte_length: u64,
+    sha256: &str,
+    issued_at: DateTime<Utc>,
+) -> UploadSigningMaterial {
+    let date = issued_at.format("%Y%m%d").to_string();
+    let timestamp = issued_at.format("%Y%m%dT%H%M%SZ").to_string();
+    let scope = format!("{date}/auto/storage/goog4_request");
+    let credential = format!("{signer_service_account}/{scope}");
+    let signed_headers = "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length";
+    let canonical_uri = format!(
+        "/{}/{}",
+        percent_encode(bucket, false),
+        percent_encode(object_key, true)
+    );
+    let mut query = [
+        ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_owned()),
+        ("X-Goog-Credential", credential),
+        ("X-Goog-Date", timestamp.clone()),
+        ("X-Goog-Expires", AUTHORIZATION_LIFETIME_SECONDS.to_string()),
+        ("X-Goog-SignedHeaders", signed_headers.to_owned()),
+    ];
+    query.sort_by(|left, right| left.0.cmp(right.0));
+    let canonical_query = query
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                percent_encode(key, false),
+                percent_encode(value, false)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_headers = format!(
+        "content-type:{media_type}\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-if-generation-match:0\nx-goog-meta-kratos-sha256:{sha256}\nx-goog-resumable:start\nx-upload-content-length:{byte_length}\n"
+    );
+    let headers = BTreeMap::from([
+        ("content-type".to_owned(), media_type.to_owned()),
+        (
+            "x-goog-content-sha256".to_owned(),
+            "UNSIGNED-PAYLOAD".to_owned(),
+        ),
+        ("x-goog-if-generation-match".to_owned(), "0".to_owned()),
+        ("x-goog-meta-kratos-sha256".to_owned(), sha256.to_owned()),
+        ("x-goog-resumable".to_owned(), "start".to_owned()),
+        (
+            "x-upload-content-length".to_owned(),
+            byte_length.to_string(),
+        ),
+    ]);
+    UploadSigningMaterial {
+        canonical_uri,
+        canonical_query,
+        canonical_headers,
+        signed_headers,
+        timestamp,
+        scope,
+        headers,
+    }
+}
+
 impl GoogleArtifactStorage {
     async fn access_token(&self) -> Result<String, ArtifactStorageError> {
         let response = self
@@ -221,65 +341,40 @@ impl ArtifactStorage for GoogleArtifactStorage {
         &self,
         object_key: &str,
         media_type: &str,
+        byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
     ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
-        let date = issued_at.format("%Y%m%d").to_string();
-        let timestamp = issued_at.format("%Y%m%dT%H%M%SZ").to_string();
-        let scope = format!("{date}/auto/storage/goog4_request");
-        let credential = format!("{}/{scope}", self.signer_service_account);
-        let signed_headers =
-            "content-type;host;x-goog-content-sha256;x-goog-meta-kratos-sha256;x-goog-resumable";
-        let canonical_uri = format!(
-            "/{}/{}",
-            percent_encode(&self.bucket, false),
-            percent_encode(object_key, true)
-        );
-        let mut query = vec![
-            ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_owned()),
-            ("X-Goog-Credential", credential),
-            ("X-Goog-Date", timestamp.clone()),
-            ("X-Goog-Expires", AUTHORIZATION_LIFETIME_SECONDS.to_string()),
-            ("X-Goog-SignedHeaders", signed_headers.to_owned()),
-            ("ifGenerationMatch", "0".to_owned()),
-        ];
-        query.sort_by(|left, right| left.0.cmp(right.0));
-        let canonical_query = query
-            .iter()
-            .map(|(key, value)| {
-                format!(
-                    "{}={}",
-                    percent_encode(key, false),
-                    percent_encode(value, false)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        let canonical_headers = format!(
-            "content-type:{media_type}\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-meta-kratos-sha256:{sha256}\nx-goog-resumable:start\n"
+        let material = upload_signing_material(
+            &self.bucket,
+            &self.signer_service_account,
+            object_key,
+            media_type,
+            byte_length,
+            sha256,
+            issued_at,
         );
         let canonical_request = format!(
-            "POST\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD"
+            "POST\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+            material.canonical_uri,
+            material.canonical_query,
+            material.canonical_headers,
+            material.signed_headers
         );
         let canonical_hash = hex_lower(&Sha256::digest(canonical_request.as_bytes()));
-        let string_to_sign = format!("GOOG4-RSA-SHA256\n{timestamp}\n{scope}\n{canonical_hash}");
+        let string_to_sign = format!(
+            "GOOG4-RSA-SHA256\n{}\n{}\n{canonical_hash}",
+            material.timestamp, material.scope
+        );
         let signature = hex_lower(&self.sign_blob(string_to_sign.as_bytes()).await?);
         let url = format!(
-            "https://storage.googleapis.com{canonical_uri}?{canonical_query}&X-Goog-Signature={signature}"
+            "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
+            material.canonical_uri, material.canonical_query
         );
-        let headers = BTreeMap::from([
-            ("content-type".to_owned(), media_type.to_owned()),
-            (
-                "x-goog-content-sha256".to_owned(),
-                "UNSIGNED-PAYLOAD".to_owned(),
-            ),
-            ("x-goog-meta-kratos-sha256".to_owned(), sha256.to_owned()),
-            ("x-goog-resumable".to_owned(), "start".to_owned()),
-        ]);
         Ok(ResumableUploadAuthorization {
             url,
             method: "POST".to_owned(),
-            headers,
+            headers: material.headers,
             expires_at: issued_at + TimeDelta::seconds(AUTHORIZATION_LIFETIME_SECONDS),
         })
     }
@@ -340,6 +435,72 @@ impl ArtifactStorage for GoogleArtifactStorage {
     fn bucket(&self) -> &str {
         &self.bucket
     }
+
+    async fn protect_verified_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError> {
+        if bucket != self.bucket {
+            return Err(ArtifactStorageError::InvalidResponse);
+        }
+        let token = self.access_token().await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            percent_encode(bucket, false),
+            percent_encode(object_key, false)
+        );
+        let response = self
+            .client
+            .patch(url)
+            .query(&[("ifGenerationMatch", generation.to_string())])
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "temporaryHold": true }))
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ArtifactStorageError::NotFound);
+        }
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ArtifactStorageError::Unavailable)
+        }
+    }
+
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<(), ArtifactStorageError> {
+        if bucket != self.bucket {
+            return Err(ArtifactStorageError::InvalidResponse);
+        }
+        let token = self.access_token().await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            percent_encode(bucket, false),
+            percent_encode(object_key, false)
+        );
+        let response = self
+            .client
+            .delete(url)
+            .query(&[("ifGenerationMatch", generation.to_string())])
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if response.status().is_success() {
+            Ok(())
+        } else if response.status() == StatusCode::NOT_FOUND {
+            Err(ArtifactStorageError::NotFound)
+        } else {
+            Err(ArtifactStorageError::Unavailable)
+        }
+    }
 }
 
 fn percent_encode(value: &str, preserve_slash: bool) -> String {
@@ -371,7 +532,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::percent_encode;
+    use chrono::{DateTime, Utc};
+
+    use super::{percent_encode, upload_signing_material};
 
     #[test]
     fn encoding_preserves_only_canonical_path_separators() {
@@ -380,5 +543,42 @@ mod tests {
             "v1/owners/a%20b/%2B"
         );
         assert_eq!(percent_encode("a/b", false), "a%2Fb");
+    }
+
+    #[test]
+    fn xml_resumable_fixture_signs_generation_and_size_as_headers() {
+        let issued_at = DateTime::parse_from_rfc3339("2026-09-20T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let material = upload_signing_material(
+            "kratos-artifacts",
+            "upload@example.iam.gserviceaccount.com",
+            "v1/owners/owner/artifacts/object",
+            "application/octet-stream",
+            512,
+            &"b".repeat(64),
+            issued_at,
+        );
+
+        assert!(!material.canonical_query.contains("ifGenerationMatch"));
+        assert_eq!(
+            material.headers.get("x-goog-if-generation-match"),
+            Some(&"0".to_owned())
+        );
+        assert_eq!(
+            material.headers.get("x-upload-content-length"),
+            Some(&"512".to_owned())
+        );
+        assert_eq!(
+            material.canonical_headers,
+            format!(
+                "content-type:application/octet-stream\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-if-generation-match:0\nx-goog-meta-kratos-sha256:{}\nx-goog-resumable:start\nx-upload-content-length:512\n",
+                "b".repeat(64)
+            )
+        );
+        assert_eq!(
+            material.signed_headers,
+            "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length"
+        );
     }
 }

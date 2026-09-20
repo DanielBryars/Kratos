@@ -5,8 +5,8 @@
 
 Implementation note: the R0.2 control plane now issues keyless, ten-minute GCS V4 resumable-upload
 initiation grants through IAM Credentials `signBlob` and synchronously finalizes worker-reported
-uploads from authoritative object metadata. Automated cleanup, downloads and retention policy
-remain deferred as described below.
+uploads from authoritative object metadata. Automated cleanup now removes unverified objects after
+seven days; downloads and project retention remain deferred.
 
 ## Context
 
@@ -39,8 +39,9 @@ approved object. Each URL SHALL:
 
 - initiate a resumable upload for one deterministic object name;
 - expire after ten minutes;
-- include the required resumable-upload and metadata headers in its signature; and
-- include the `ifGenerationMatch=0` precondition so a retry cannot replace an existing object.
+- include the required resumable-upload and metadata headers in its signature;
+- sign `x-goog-if-generation-match: 0`, the XML API precondition that prevents replacement; and
+- sign `x-upload-content-length` with the exact declared byte length.
 
 Completing the initial request returns a Cloud Storage resumable-session URI. That URI is a bearer
 credential scoped to the one object. The agent SHALL store it only in its protected state directory,
@@ -130,6 +131,12 @@ retained run or model references the artefact. Deletion SHALL update catalogue s
 recorded generation precondition. A reconciliation process SHALL inspect stale `uploading` records,
 verify a completed deterministic object where possible, or mark the transfer failed without
 presenting partial data as valid.
+
+The control plane SHALL place a temporary hold on an object only after its authoritative metadata
+passes verification. The lifecycle rule therefore removes abandoned uploads while leaving verified
+objects intact. Retention deletion SHALL clear that hold as part of its later audited flow. An
+object rejected for a size, checksum or metadata mismatch SHOULD also be deleted immediately at its
+exact generation; lifecycle cleanup is the fallback when immediate cleanup is unavailable.
 
 ## Alternatives
 

@@ -15,6 +15,11 @@ read object metadata from the bucket; it cannot use the signer as a general runt
 signer has no JSON key. Reapply the bootstrap root once so the federated deployment identity gains
 the Storage administrator role needed to create these resources.
 
+Unverified objects are subject to a seven-day lifecycle deletion rule. The control plane can read,
+place a temporary hold on a verified generation, and delete a rejected generation through a narrow
+custom bucket role. It cannot create objects directly; upload creation remains isolated to the
+dedicated signer identity.
+
 ## Initial bootstrap
 
 Run these commands inside the development container after authenticating with `gcloud auth application-default login`:

@@ -2,6 +2,21 @@ ALTER TABLE job_artifacts
     ADD COLUMN storage_bucket text,
     ADD COLUMN verified_sha256 text CHECK (verified_sha256 ~ '^[0-9a-f]{64}$');
 
+-- The preceding release allowed tests or operators to record GCS evidence without the bucket or
+-- object SHA metadata. Those rows cannot satisfy the stronger storage-identity proof. Fail closed
+-- instead of manufacturing evidence during the upgrade; a later attempt may upload the output
+-- again under the new contract.
+UPDATE job_artifacts
+SET status = 'rejected',
+    verified_storage_generation = NULL,
+    verified_byte_length = NULL,
+    verified_crc32c = NULL,
+    verification_source = NULL,
+    verified_at = NULL,
+    rejected_at = COALESCE(rejected_at, now()),
+    state_reason = 'storage_identity_requires_reissue'
+WHERE status = 'verified';
+
 ALTER TABLE job_artifacts ADD CONSTRAINT job_artifacts_verified_storage_identity
     CHECK (
         status <> 'verified'

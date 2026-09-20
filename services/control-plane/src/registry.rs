@@ -520,7 +520,7 @@ pub(crate) async fn authenticate_worker(
     headers: &HeaderMap,
     worker_id: Uuid,
     operation: &'static str,
-) -> Result<(), ApiError> {
+) -> Result<Uuid, ApiError> {
     let pool = database(state)?;
     let supplied = bearer(headers)?.to_owned();
     let credential_id = credentials::identifier(CredentialKind::Worker, &supplied)
@@ -545,6 +545,37 @@ pub(crate) async fn authenticate_worker(
             .verification_gate
             .verify(credential_id, supplied, authentication.token_verifier)
             .await?
+    {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(credential_id)
+}
+
+pub(crate) async fn lock_current_worker_authorization(
+    transaction: &mut Transaction<'_, Postgres>,
+    credential_id: Uuid,
+    worker_id: Uuid,
+) -> Result<(), ApiError> {
+    let worker_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM workers WHERE id = $1 FOR UPDATE")
+            .bind(worker_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| ApiError::internal())?
+            .ok_or_else(ApiError::unauthorized)?;
+    let credential = sqlx::query_as::<_, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>(
+        "SELECT expires_at, revoked_at FROM worker_credentials \
+         WHERE id = $1 AND worker_id = $2 FOR UPDATE",
+    )
+    .bind(credential_id)
+    .bind(worker_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ApiError::internal())?
+    .ok_or_else(ApiError::unauthorized)?;
+    if worker_status == "revoked"
+        || credential.1.is_some()
+        || credential.0.is_some_and(|expires| expires <= Utc::now())
     {
         return Err(ApiError::unauthorized());
     }

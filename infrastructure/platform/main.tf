@@ -71,6 +71,16 @@ resource "google_storage_bucket" "artifacts" {
   public_access_prevention    = "enforced"
   force_destroy               = false
 
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["v1/owners/"]
+    }
+    action {
+      type = "Delete"
+    }
+  }
+
   depends_on = [google_project_service.platform]
 }
 
@@ -80,9 +90,21 @@ resource "google_storage_bucket_iam_member" "artifact_upload_create" {
   member = "serviceAccount:${google_service_account.artifact_upload_signer.email}"
 }
 
-resource "google_storage_bucket_iam_member" "artifact_metadata_verify" {
+resource "google_project_iam_custom_role" "artifact_metadata_manager" {
+  project     = var.project_id
+  role_id     = "kratosArtifactVerifier"
+  title       = "Kratos artifact verifier"
+  description = "Read, protect, and clean exact artifact objects after upload."
+  permissions = [
+    "storage.objects.delete",
+    "storage.objects.get",
+    "storage.objects.update",
+  ]
+}
+
+resource "google_storage_bucket_iam_member" "artifact_metadata_manage" {
   bucket = google_storage_bucket.artifacts.name
-  role   = "roles/storage.objectViewer"
+  role   = google_project_iam_custom_role.artifact_metadata_manager.name
   member = "serviceAccount:${google_service_account.control_plane.email}"
 }
 
