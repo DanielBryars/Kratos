@@ -320,3 +320,98 @@ The initial limits are 100 files, 5 GiB per file, 10 GiB across the manifest and
 logical path. Absolute paths, empty segments, `.` and `..` segments, backslashes and control
 characters are rejected. Logical paths remain metadata; object keys use opaque server-generated
 artefact identifiers below the owning identity, job and attempt scopes.
+
+## R0.2 observation streaming (protocol 1.2)
+
+A job container has no network, no credential and no telemetry client, per
+[ADR-008](../architecture/decisions/008-worker-job-execution.md) and
+[ADR-015](../architecture/decisions/015-job-telemetry-without-job-network.md). A workload's only
+telemetry channel is its standard output, which the trusted agent reads and forwards. This section
+defines what leaves the worker; ADR-015 defines what a workload writes.
+
+### The stream identifier
+
+The control plane SHALL allocate an `observation_stream_id` with each attempt, before any
+observation is exported, and SHALL return it in the assignment. It is the cross-system correlation
+key: the MLflow run identifier is not, because it does not exist when the earliest telemetry is
+exported.
+
+The field is **optional** in the assignment. The control plane SHALL omit it for workers
+advertising a protocol below 1.2. An agent SHALL accept an assignment that carries no stream and
+run the job without streaming observations.
+
+Agents reject unknown assignment fields, so the field SHALL exist in an agent before the control
+plane ever sends it. A control plane that emits `observation_stream_id` to an agent that does not
+know it does not degrade that agent's telemetry: the agent rejects the whole assignment and the job
+does not run.
+
+### Submitting a batch
+
+A protocol 1.2 agent SHALL deliver `param`, `metric` and `progress` records to
+
+```
+PUT /api/v1/workers/{worker_id}/observation-streams/{stream_id}/batches/{batch_id}
+```
+
+with a body of `protocol_version`, `first_sequence` and `records`. Each record carries its
+`sequence`, its original container timestamp as `at`, a `record` discriminator of `param`, `metric`
+or `progress`, and the members that kind requires. Log lines are not sent here; they belong to the
+OpenTelemetry path.
+
+The response is `stream_id`, `batch_id` and `accepted_through_sequence`.
+
+Ordering is by the agent's sequence and not by `at`, because container timestamps repeat, can go
+backwards and cannot express a gap. Sequences SHALL start at 1 within an attempt, SHALL be
+contiguous within a batch and SHALL begin at `first_sequence`. A gap inside a batch would make
+`accepted_through_sequence` ambiguous, because the control plane could not say whether a missing
+number was lost or never existed.
+
+A batch SHALL contain at least one and at most **100** records, and its encoded body SHALL be at
+most **256 KiB**.
+
+### Replay, and why the batch identifier is the agent's
+
+Submission SHALL be idempotent on stream and sequence. An **exact** replay of a batch SHALL return
+the same acknowledgement and change nothing. A reused `batch_id` or sequence carrying **different**
+content SHALL be refused with 409.
+
+The agent SHALL therefore persist a batch and its sequence range before sending it, and SHALL
+resend that same identifier after a restart. A batch rebuilt from the agent's records after a crash
+would carry the same sequences under a new identifier, which is precisely the case the 409 exists
+to catch, so replay would fail exactly when it is most needed.
+
+### Delivery never blocks execution
+
+Telemetry SHALL NOT start, stop, fail or extend a job. Deadline enforcement, the lease and the
+result report SHALL NOT wait on any telemetry work, and a telemetry failure SHALL NOT raise into
+supervision. Loss of the control plane SHALL NOT interrupt a run: the agent retains undelivered
+records and replays them from its own cursor when the link returns.
+
+Each sink SHALL hold its own durable cursor, and a record SHALL be retained until every
+**configured** sink has passed it. A sink that is not configured for an attempt SHALL NOT retain
+anything: with no collector configured, log lines are counted rather than held behind a cursor that
+will never advance.
+
+### Reporting what was not delivered
+
+A job result MAY carry `observation_counters`, an object of dotted name to non-negative integer,
+omitted entirely when nothing was counted. The control plane SHALL persist the object unchanged as
+execution evidence.
+
+Two namespaces, and the difference matters on a run view. `dropped.` is a line nobody will ever
+see. `not_exported.` is a line that was kept and delivered, but that one sink did not take, which
+is not a loss and SHALL NOT be presented as one.
+
+| Counter | Meaning |
+|---|---|
+| `dropped.oversize` | A line over 8 KiB including its newline, refused whole rather than truncated |
+| `dropped.malformed` | A line that claimed to be a record and was not one; still forwarded as a log line |
+| `dropped.rate` | Refused by the record or log rate limit |
+| `dropped.budget` | Refused by the attempt's total forwarded-byte budget |
+| `dropped.name_limit` | A new metric or parameter name beyond the per-attempt cap |
+| `not_exported.metric_name_not_allowed` | Delivered to the control plane, and so to MLflow, but kept off the OpenTelemetry metric path |
+| `not_exported.otlp_unconfigured` | A log line for an attempt with no collector configured |
+
+Counters are execution evidence: they SHALL accompany the result even when every observation was
+dropped, so a gap is a number an operator can read rather than silence they have to infer. A
+deployment SHALL NOT treat the absence of this field as an error; it means nothing was counted.
