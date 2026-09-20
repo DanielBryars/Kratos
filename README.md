@@ -7,7 +7,9 @@ See the [requirements overview](requirements/README.md) for the project scope an
 
 See the [release plan](requirements/09-releases-and-acceptance.md) for milestones and the [technology decision register](docs/architecture/README.md) for accepted choices and options under discussion.
 
-The immediate timebox is captured in the [weekend MVP plan](docs/weekend-plan.md).
+The immediate timebox is captured in the [weekend MVP plan](docs/weekend-plan.md). See the
+[R0.2 workstreams and ownership plan](docs/r0.2-workstreams.md) for work that can proceed in
+parallel and the current division between user-owned, Codex-owned and delegated tasks.
 
 ## Local development
 
