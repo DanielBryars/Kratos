@@ -26,6 +26,9 @@ OUTPUT_MOUNT_TARGET = "/kratos/outputs"
 ATTEMPT_DIRECTORY = "attempts"
 # Volume subpath mounts require Docker Engine 26 or later.
 MINIMUM_SUBPATH_ENGINE_MAJOR = 26
+# Cleanup runs a known image, not the workload's: an arbitrary image need not contain a
+# shell or rm, and a hostile one must never be re-entered to tidy up after itself.
+CLEANUP_IMAGE = "busybox@sha256:0872fb3a7632ba9d0ae46a8e832a62b30ce83a6f220b8bb52903d9cf477dabe3"
 SUPERVISION_POLL_SECONDS = 1.0
 # How late a bound may be enforced: one poll plus one in-flight heartbeat and its collection.
 ENFORCEMENT_TOLERANCE = timedelta(seconds=30)
@@ -321,7 +324,7 @@ class DockerExecutor:
             )
         ]
 
-    def discard_attempt_outputs(self, attempt_id: UUID, image_reference: str) -> bool:
+    def discard_attempt_outputs(self, attempt_id: UUID) -> bool:
         """Remove an attempt's output tree that this agent cannot remove itself.
 
         A workload runs as an arbitrary user and can leave a nested directory the agent may not
@@ -333,8 +336,9 @@ class DockerExecutor:
         if self._state_volume is None:
             return False
         try:
+            self._client.images.pull(CLEANUP_IMAGE)
             container = self._client.containers.run(
-                image_reference,
+                CLEANUP_IMAGE,
                 command=["sh", "-c", "rm -rf /attempt/* /attempt/.[!.]* 2>/dev/null; true"],
                 detach=True,
                 network_disabled=True,

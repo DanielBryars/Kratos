@@ -119,11 +119,9 @@ def build_manifest(
             requirement = declared.get(logical_path)
             if requirement is None:
                 raise OutputError(f"output {_shown(logical_path)} was not declared by the job")
-            if still_authorised is not None and not still_authorised():
-                # Hashing 10 GiB outlasts several heartbeats, so authority is proved as it
-                # proceeds rather than only before it starts.
-                raise OutputError("the control plane no longer holds this attempt")
-            output = _describe(name, directory, logical_path, requirement.max_bytes)
+            output = _describe(
+                name, directory, logical_path, requirement.max_bytes, still_authorised
+            )
             total_bytes += output.file.byte_length
             if total_bytes > MAX_OUTPUT_TOTAL_BYTES:
                 raise OutputError("outputs exceed the total size limit")
@@ -184,7 +182,13 @@ def _regular_files(root: int) -> Iterator[tuple[str, str, int]]:
     yield from walk(root, "")
 
 
-def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> VerifiedOutput:
+def _describe(
+    name: str,
+    directory: int,
+    logical_path: str,
+    max_bytes: int,
+    still_authorised: Callable[[], bool] | None = None,
+) -> VerifiedOutput:
     try:
         # O_NONBLOCK keeps a file that was swapped for a named pipe from blocking the open.
         descriptor = os.open(
@@ -207,6 +211,10 @@ def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> V
         crc32c = _new_crc32c()
         byte_length = 0
         while byte_length <= identity.byte_length and (chunk := stream.read(READ_CHUNK_BYTES)):
+            # One supported output is 5 GiB, so a per-file check is not often enough:
+            # authority is proved as the bytes are read.
+            if still_authorised is not None and not still_authorised():
+                raise OutputError("the control plane no longer holds this attempt")
             byte_length += len(chunk)
             sha256.update(chunk)
             crc32c.update(chunk)

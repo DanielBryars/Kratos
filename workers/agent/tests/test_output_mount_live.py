@@ -228,7 +228,7 @@ def test_a_hostile_owned_output_tree_is_still_removed(client: object, state_volu
     )
 
     executor = DockerExecutor(client, state_volume=state_volume)
-    assert executor.discard_attempt_outputs(attempt_id, BUSYBOX) is True
+    assert executor.discard_attempt_outputs(attempt_id) is True
 
     # This attempt is empty, and the neighbouring attempt was never in reach.
     remaining = client.containers.run(  # type: ignore[attr-defined]

@@ -229,9 +229,14 @@ class AgentRunner:
             # The control plane no longer holds this attempt open, so nothing authorises its
             # container to keep running and its retained evidence is no longer required.
             self._executor.remove_job_container(stale_attempt_id)
-            if self._discard_outputs_for(stale_attempt_id, assignment):
-                updated = replace(updated, started_attempt_id=None, started_assignment=None)
-                save_state(self._state_path, updated)
+            updated = replace(
+                updated,
+                started_attempt_id=None,
+                started_assignment=None,
+                retained_attempt_ids=_with(updated.retained_attempt_ids, stale_attempt_id),
+            )
+            save_state(self._state_path, updated)
+            updated = self._clear_retained(updated)
         if assignment is not None:
             updated = self._run_assignment(updated, assignment)
         return updated
@@ -245,20 +250,30 @@ class AgentRunner:
     def _outputs_directory(self, assignment: JobAssignment) -> Path:
         return self._attempt_directory(assignment) / "outputs"
 
-    def _discard_outputs(self, assignment: JobAssignment) -> bool:
-        return self._discard_outputs_for(assignment.attempt_id, assignment)
+    def _clear_retained(self, state: AgentState) -> AgentState:
+        """Remove every output tree this agent still owes, and keep what it could not."""
+        remaining = tuple(
+            attempt_id
+            for attempt_id in state.retained_attempt_ids
+            if not self._discard_outputs_for(attempt_id)
+        )
+        if remaining != state.retained_attempt_ids:
+            state = replace(state, retained_attempt_ids=remaining)
+            save_state(self._state_path, state)
+        return state
 
-    def _discard_outputs_for(self, attempt_id: UUID, assignment: JobAssignment | None) -> bool:
-        """Remove an attempt's retained outputs once its result has been acknowledged.
+    def _discard_outputs_for(self, attempt_id: UUID) -> bool:
+        """Remove one attempt's outputs, escalating past a tree the agent cannot traverse.
 
-        A workload runs as an arbitrary user and can leave a tree the agent may not traverse, so a
-        failure escalates to a throwaway container bounded to this attempt's subpath.
+        A workload runs as an arbitrary user and can leave such a tree, so a failure escalates
+        to a throwaway container bounded to this attempt's subpath and running a known tool
+        image rather than the workload's own.
         """
         if discard_tree(self._attempt_directory_for(attempt_id)):
             return True
-        if self._executor is None or assignment is None:
+        if self._executor is None:
             return False
-        if not self._executor.discard_attempt_outputs(attempt_id, assignment.image_reference):
+        if not self._executor.discard_attempt_outputs(attempt_id):
             return False
         return discard_tree(self._attempt_directory_for(attempt_id))
 
@@ -295,7 +310,7 @@ class AgentRunner:
 
     def _deliver_outputs(
         self, state: AgentState, assignment: JobAssignment, result: JobExecutionResult
-    ) -> JobExecutionResult:
+    ) -> tuple[AgentState, JobExecutionResult]:
         """Declare and upload this attempt's outputs before its result is reported.
 
         A job that produced no usable outputs becomes a failure: the control plane refuses a
@@ -315,14 +330,14 @@ class AgentRunner:
             )
         except OutputError as error:
             if result.exit_code == 0 and not result.timed_out:
-                return result.model_copy(
+                return state_holder[0], result.model_copy(
                     update={
                         "exit_code": 125,
                         "failure_message": f"outputs could not be collected: {error}"[:1000],
                     }
                 )
             # The workload had already failed; its missing outputs are not the reason.
-            return result
+            return state_holder[0], result
 
         manifest = self._client.declare_artifact_manifest(
             worker_id,
@@ -339,7 +354,7 @@ class AgentRunner:
                 # The control plane has durably refused this object. Retrying can never verify it,
                 # and raising would restart this attempt forever, so the execution becomes a
                 # bounded delivery failure instead.
-                return result.model_copy(
+                return state_holder[0], result.model_copy(
                     update={
                         "exit_code": 125,
                         "failure_message": (
@@ -373,7 +388,7 @@ class AgentRunner:
                 generation,
             )
             _check_completed(completed, artifact, generation)
-        return result
+        return state_holder[0], result
 
     def _transfer(
         self,
@@ -422,6 +437,12 @@ class AgentRunner:
         if worker_id is None or worker_credential is None:
             raise ValueError("worker is not enrolled")
         resuming = state.started_attempt_id == assignment.attempt_id
+        if not resuming and state.retained_attempt_ids:
+            # Taking new work while an earlier attempt's data is still on disk is how the
+            # state volume fills unnoticed. Retry that first; the lease will be reassigned.
+            raise CleanupError(
+                f"{len(state.retained_attempt_ids)} attempt output trees are still retained"
+            )
         result = None
         authorised = True
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
@@ -441,7 +462,8 @@ class AgentRunner:
             # Only a successful result is gated on verified outputs. A failed or timed-out
             # workload is reported through the critical path, so storage being unavailable can
             # never hide the failure or leave the worker occupied.
-            result = self._deliver_outputs(state, assignment, result)
+            # Delivery advances the heartbeat sequence, so its state is what continues.
+            state, result = self._deliver_outputs(state, assignment, result)
         acknowledgement = self._client.report_job_result(
             worker_id, worker_credential, assignment.attempt_id, result
         )
@@ -450,12 +472,16 @@ class AgentRunner:
                 200, "invalid_response", "job result acknowledgement is inconsistent"
             )
         self._executor.remove_job_container(assignment.attempt_id)
-        if not self._discard_outputs(assignment):
-            # Retained data nobody is tracking is how a state volume fills, so the attempt stays
-            # recorded and cleanup is retried rather than forgotten.
-            raise CleanupError(f"attempt {assignment.attempt_id} outputs could not be removed")
-        state = replace(state, started_attempt_id=None, started_assignment=None)
+        # Record the obligation before clearing the attempt: the assignment that named this
+        # tree is gone once its result is acknowledged, but the tree is not.
+        state = replace(
+            state,
+            started_attempt_id=None,
+            started_assignment=None,
+            retained_attempt_ids=_with(state.retained_attempt_ids, assignment.attempt_id),
+        )
         save_state(self._state_path, state)
+        state = self._clear_retained(state)
         return state
 
     def _supervise(
@@ -506,6 +532,7 @@ class AgentRunner:
                 else:
                     # A state file written before the bounds were recorded.
                     self._executor.stop_unbounded_attempt(recorded_attempt_id)
+            state = self._clear_retained(state)
             return self.heartbeat_once(state)
         except (
             CapabilityCollectionError,
@@ -551,6 +578,10 @@ def _check_completed(
             "invalid_response",
             f"artefact is {completed.status!r} after completion, not verified",
         )
+
+
+def _with(existing: tuple[UUID, ...], attempt_id: UUID) -> tuple[UUID, ...]:
+    return existing if attempt_id in existing else (*existing, attempt_id)
 
 
 def _manifest_id(attempt_id: UUID) -> UUID:

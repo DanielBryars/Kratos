@@ -246,6 +246,10 @@ class FakeJobExecutor(DockerExecutor):
     def remove_job_container(self, attempt_id: UUID) -> None:
         self.removed.append(attempt_id)
 
+    def discard_attempt_outputs(self, attempt_id: UUID) -> bool:
+        # This fake has no Docker daemon, so the escalation cannot succeed.
+        return False
+
     def stop_unbounded_attempt(self, attempt_id: UUID) -> None:
         self.stopped_unbounded.append(attempt_id)
 

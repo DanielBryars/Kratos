@@ -2,8 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Iterator
-from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,7 @@ import httpx
 import pytest
 from test_protocol import WORKER_ID, WORKER_SECRET, FakeJobExecutor, capabilities
 
+from kratos_agent import runner as runner_module
 from kratos_agent.models import (
     JobAssignment,
     JobExecutionResult,
@@ -32,13 +32,13 @@ needs_posix = pytest.mark.skipif(
 )
 
 
-def requirement(mandatory: bool = True) -> dict[str, object]:
+def requirement(mandatory: bool = True, max_bytes: int = 1024) -> dict[str, object]:
     return {
         "logical_path": "model.pt",
         "role": "model",
         "media_type": "application/octet-stream",
         "mandatory": mandatory,
-        "max_bytes": 1024,
+        "max_bytes": max_bytes,
     }
 
 
@@ -516,6 +516,7 @@ def test_delivery_keeps_heartbeating_and_stops_when_authority_is_withdrawn(
         return recorder(request)
 
     executor = ProducingExecutor(state_path, content=b"x" * (4 * 1024 * 1024))
+    recorder.requirements = [requirement(max_bytes=8 * 1024 * 1024)]
     with WorkerProtocolClient(
         "https://control.example", transport=httpx.MockTransport(handler)
     ) as client:
@@ -630,37 +631,50 @@ def test_a_completion_that_does_not_verify_this_object_is_refused(
 
 
 @needs_posix
-def test_state_is_not_cleared_when_outputs_could_not_be_removed(tmp_path: Path) -> None:
+def test_state_is_not_cleared_when_outputs_could_not_be_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Clearing the attempt while its data remains is how a state volume silently fills."""
     state_path = tmp_path / "agent.json"
     state = enrolled(state_path)
     recorder = Recorder()
 
     class UnremovableExecutor(ProducingExecutor):
-        def discard_attempt_outputs(self, attempt_id: UUID, image_reference: str) -> bool:
+        def discard_attempt_outputs(self, attempt_id: UUID) -> bool:
             return False
 
-    executor = UnremovableExecutor(state_path)
-    with (
-        WorkerProtocolClient(
-            "https://control.example", transport=httpx.MockTransport(recorder)
-        ) as client,
-        _unremovable(outputs_directory(state_path)),
-    ):
-        after = runner(client, state_path, executor).step(state)
+    # A tree neither the agent nor the bounded container can remove, whatever this test runs as.
+    monkeypatch.setattr(runner_module, "discard_tree", lambda root: False)
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(recorder)
+    ) as client:
+        after = runner(client, state_path, UnremovableExecutor(state_path)).step(state)
 
     assert "result" in recorder.calls
-    assert after.started_attempt_id == ATTEMPT_ID
+    # The attempt is finished, but the obligation to remove its data outlives it.
+    assert after.started_attempt_id is None
+    assert after.retained_attempt_ids == (ATTEMPT_ID,)
 
 
-@contextmanager
-def _unremovable(outputs: Path) -> Iterator[None]:
-    """Make the attempt tree undeletable the way a hostile workload would."""
-    nested = outputs / "locked"
-    nested.mkdir(parents=True, exist_ok=True)
-    (nested / "kept.bin").write_bytes(b"retained")
-    nested.chmod(0o000)
-    try:
-        yield
-    finally:
-        nested.chmod(0o700)
+@needs_posix
+def test_a_worker_owing_cleanup_does_not_start_new_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Taking new work while an earlier tree is retained is how the volume fills unnoticed."""
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    state = replace(state, retained_attempt_ids=(UUID(int=7),))
+    save_state(state_path, state)
+    recorder = Recorder()
+    executor = ProducingExecutor(state_path)
+
+    monkeypatch.setattr(runner_module, "discard_tree", lambda root: False)
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(recorder)
+    ) as client:
+        runner(client, state_path, executor).step(state)
+
+    assert executor.runs == []
+    assert "result" not in recorder.calls
