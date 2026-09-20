@@ -95,7 +95,9 @@ def _new_crc32c() -> _Checksum:
 
 
 def build_manifest(
-    outputs_dir: Path, requirements: Sequence[JobOutputRequirement]
+    outputs_dir: Path,
+    requirements: Sequence[JobOutputRequirement],
+    still_authorised: Callable[[], bool] | None = None,
 ) -> tuple[VerifiedOutput, ...]:
     """Describe every declared output beneath ``outputs_dir``.
 
@@ -117,6 +119,10 @@ def build_manifest(
             requirement = declared.get(logical_path)
             if requirement is None:
                 raise OutputError(f"output {_shown(logical_path)} was not declared by the job")
+            if still_authorised is not None and not still_authorised():
+                # Hashing 10 GiB outlasts several heartbeats, so authority is proved as it
+                # proceeds rather than only before it starts.
+                raise OutputError("the control plane no longer holds this attempt")
             output = _describe(name, directory, logical_path, requirement.max_bytes)
             total_bytes += output.file.byte_length
             if total_bytes > MAX_OUTPUT_TOTAL_BYTES:
@@ -254,20 +260,23 @@ def create_attempt_tree(attempt_root: Path) -> Path:
     return outputs
 
 
-def discard_tree(root: Path) -> None:
+def discard_tree(root: Path) -> bool:
     """Remove an attempt's retained outputs, undoing the read-only sealing first.
 
-    Collection seals the tree, so a non-root agent cannot delete what it just sealed until the
-    write bit is restored. Anything it does not own is left behind rather than forced.
+    Returns whether the tree is gone. A workload runs as an arbitrary user and can leave a nested
+    directory the agent may neither traverse nor remove, so this cannot be assumed to succeed and
+    the caller SHALL NOT clear its attempt state on a false result: retained data that nobody is
+    tracking is how a state volume fills.
     """
     if not root.exists():
-        return
+        return True
     for directory, _, files in os.walk(root, topdown=False):
         for name in (*files, ""):
             target = Path(directory) / name if name else Path(directory)
             with contextlib.suppress(OSError):
                 target.chmod(UNSEALED_DIRECTORY_MODE if not name else UNSEALED_FILE_MODE)
     shutil.rmtree(root, ignore_errors=True)
+    return not root.exists()
 
 
 def _seal(descriptor: int, mode: int) -> None:

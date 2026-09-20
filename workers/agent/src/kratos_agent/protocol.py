@@ -14,6 +14,7 @@ from kratos_agent.models import (
     AbandonArtifactUploadRequest,
     ArtifactManifestFile,
     ArtifactManifestResponse,
+    ArtifactResponse,
     BeginArtifactUploadRequest,
     BeginArtifactUploadResponse,
     ClaimRegistrationRequest,
@@ -33,6 +34,7 @@ from kratos_agent.models import (
 
 ResponseModel = TypeVar(
     "ResponseModel",
+    ArtifactResponse,
     EnrolmentResponse,
     HeartbeatResponse,
     RegistrationCreatedResponse,
@@ -201,7 +203,7 @@ class WorkerProtocolClient:
         artifact: ArtifactManifestFile,
         artifact_id: UUID,
         storage_generation: int,
-    ) -> None:
+    ) -> ArtifactResponse:
         request = CompleteArtifactUploadRequest(
             protocol_version=PROTOCOL_VERSION,
             storage_generation=storage_generation,
@@ -215,8 +217,7 @@ class WorkerProtocolClient:
             headers={"Authorization": f"Bearer {credential}"},
             json=request.model_dump(mode="json"),
         )
-        if not response.is_success:
-            self._parse(response, ArtifactManifestResponse)
+        return self._parse(response, ArtifactResponse)
 
     def abandon_artifact_upload(
         self,

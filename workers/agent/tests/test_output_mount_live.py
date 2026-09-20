@@ -19,6 +19,7 @@ docker = pytest.importorskip("docker")
 from kratos_agent.executor import (  # noqa: E402
     MINIMUM_SUBPATH_ENGINE_MAJOR,
     OUTPUT_MOUNT_TARGET,
+    DockerExecutor,
 )
 from kratos_agent.models import JobOutputRequirement  # noqa: E402
 from kratos_agent.outputs import build_manifest, create_attempt_tree, discard_tree  # noqa: E402
@@ -189,3 +190,52 @@ def test_the_agent_collects_what_another_user_wrote(tmp_path: Path) -> None:
     assert output.file.crc32c == "4waSgw=="
     discard_tree(attempt)
     assert not attempt.exists()
+
+
+@pytest.mark.slow
+def test_a_hostile_owned_output_tree_is_still_removed(client: object, state_volume: str) -> None:
+    """A workload can leave a tree its own user owns and the agent cannot traverse.
+
+    The agent's own removal fails; the bounded container removal must still clear it, and must
+    only ever see this attempt's subpath.
+    """
+    attempt_id = uuid.uuid4()
+    other = uuid.uuid4()
+    prepare_attempt(client, state_volume, attempt_id)
+    prepare_attempt(client, state_volume, other)
+
+    # A nested directory owned by another user with no permissions at all.
+    client.containers.run(  # type: ignore[attr-defined]
+        BUSYBOX,
+        command=[
+            "sh",
+            "-c",
+            f"mkdir -p {OUTPUT_MOUNT_TARGET}/locked && "
+            f"echo retained > {OUTPUT_MOUNT_TARGET}/locked/kept.bin && "
+            f"chown -R {WORKLOAD_UID}:{WORKLOAD_UID} {OUTPUT_MOUNT_TARGET}/locked && "
+            f"chmod 000 {OUTPUT_MOUNT_TARGET}/locked",
+        ],
+        mounts=[
+            docker.types.Mount(
+                target=OUTPUT_MOUNT_TARGET,
+                source=state_volume,
+                type="volume",
+                read_only=False,
+                subpath=f"attempts/{attempt_id}/outputs",
+            )
+        ],
+        remove=True,
+    )
+
+    executor = DockerExecutor(client, state_volume=state_volume)
+    assert executor.discard_attempt_outputs(attempt_id, BUSYBOX) is True
+
+    # This attempt is empty, and the neighbouring attempt was never in reach.
+    remaining = client.containers.run(  # type: ignore[attr-defined]
+        BUSYBOX,
+        command=["sh", "-c", f"ls -A /state/attempts/{attempt_id}; ls /state/attempts"],
+        mounts=[docker.types.Mount("/state", state_volume, type="volume")],
+        remove=True,
+    ).decode()
+    assert "locked" not in remaining
+    assert str(other) in remaining

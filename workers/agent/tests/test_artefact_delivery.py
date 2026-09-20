@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,7 @@ from kratos_agent.models import (
     JobExecutionResult,
 )
 from kratos_agent.outputs import DESCRIPTOR_WALK_SUPPORTED
-from kratos_agent.protocol import WorkerProtocolClient
+from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.runner import AgentRunner
 from kratos_agent.state import AgentState, save_state
 
@@ -127,7 +129,11 @@ class Recorder:
         if path.endswith("/complete-upload"):
             self.calls.append("complete-upload")
             self.completed = json.loads(request.content)
-            return httpx.Response(200, json={"status": "verified"})
+            verified = artifact_body("verified") | {
+                "storage_generation": self.completed["storage_generation"],
+                "verification_pending": False,
+            }
+            return httpx.Response(200, json=verified)
         self.calls.append("result")
         return httpx.Response(
             200, json={"attempt_id": str(ATTEMPT_ID), "job_id": str(JOB_ID), "status": "succeeded"}
@@ -155,11 +161,32 @@ def outputs_directory(state_path: Path) -> Path:
     return state_path.parent / "attempts" / str(ATTEMPT_ID) / "outputs"
 
 
+class StepClock:
+    """Time only moves when the agent asks for it, so a heartbeat interval passes at once."""
+
+    def __init__(self, step_seconds: int = 31) -> None:
+        self.now = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+        self.step = timedelta(seconds=step_seconds)
+
+    def __call__(self) -> datetime:
+        self.now += self.step
+        return self.now
+
+
 def runner(
-    client: WorkerProtocolClient, state_path: Path, executor: FakeJobExecutor
+    client: WorkerProtocolClient,
+    state_path: Path,
+    executor: FakeJobExecutor,
+    clock: StepClock | None = None,
 ) -> AgentRunner:
     return AgentRunner(
-        client, "GPU host", state_path, None, capability_collector=capabilities, executor=executor
+        client,
+        "GPU host",
+        state_path,
+        None,
+        capability_collector=capabilities,
+        executor=executor,
+        clock=clock or (lambda: datetime.now(UTC)),
     )
 
 
@@ -461,3 +488,179 @@ def test_a_dead_session_is_abandoned_and_replaced(tmp_path: Path) -> None:
     assert "abandon" in recorder.calls
     assert fingerprints == [hashlib.sha256(SESSION.encode()).hexdigest()]
     assert recorder.completed["storage_generation"] == 41
+
+
+@needs_posix
+def test_delivery_keeps_heartbeating_and_stops_when_authority_is_withdrawn(
+    tmp_path: Path,
+) -> None:
+    """A slow transfer must keep proving authority, and stop the moment it is withdrawn."""
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    recorder = Recorder()
+    chunks_sent = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chunks_sent
+        if request.url.path.endswith("/heartbeat"):
+            # The attempt is held for the first two heartbeats, then closed.
+            recorder.assigned = len([c for c in recorder.calls if c == "heartbeat"]) < 2
+            return recorder(request)
+        if str(request.url).startswith(SESSION.split("?")[0]):
+            sent = request.headers["Content-Range"]
+            if sent.startswith("bytes */"):
+                return httpx.Response(308)
+            chunks_sent += 1
+            # Never finish, so delivery depends on authority rather than on completion.
+            return httpx.Response(308, headers={"Range": f"bytes=0-{chunks_sent - 1}"})
+        return recorder(request)
+
+    executor = ProducingExecutor(state_path, content=b"x" * (4 * 1024 * 1024))
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        runner(client, state_path, executor, StepClock()).step(state)
+
+    # More than one heartbeat happened during delivery, and it stopped rather than looping.
+    assert recorder.calls.count("heartbeat") >= 2
+    assert "complete-upload" not in recorder.calls
+
+
+@needs_posix
+def test_a_rejected_artefact_ends_as_a_delivery_failure_rather_than_a_restart_loop(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    recorder = Recorder()
+    reported: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/artifact-manifest"):
+            recorder.calls.append("manifest")
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "manifest_id": payload["manifest_id"],
+                    "attempt_id": str(ATTEMPT_ID),
+                    "artifacts": [artifact_body("rejected")],
+                },
+            )
+        if request.url.path.endswith("/result"):
+            reported.update(json.loads(request.content))
+        return recorder(request)
+
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        after = runner(client, state_path, ProducingExecutor(state_path)).step(state)
+
+    # Reported once, as a bounded failure, and the attempt is finished rather than retried forever.
+    assert reported["exit_code"] == 125
+    assert "rejected by the control plane" in reported["failure_message"]
+    assert "begin-upload" not in recorder.calls
+    assert after.started_attempt_id is None
+
+
+@needs_posix
+def test_an_unknown_artefact_state_is_an_invalid_response(tmp_path: Path) -> None:
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    recorder = Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/artifact-manifest"):
+            payload = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={
+                    "manifest_id": payload["manifest_id"],
+                    "attempt_id": str(ATTEMPT_ID),
+                    "artifacts": [artifact_body("quarantined")],
+                },
+            )
+        return recorder(request)
+
+    with (
+        WorkerProtocolClient(
+            "https://control.example", transport=httpx.MockTransport(handler)
+        ) as client,
+        pytest.raises(ControlPlaneError, match="unknown state"),
+    ):
+        runner(client, state_path, ProducingExecutor(state_path)).heartbeat_once(state)
+
+
+@needs_posix
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("artifact_id", str(UUID(int=9)), "different artefact"),
+        ("storage_generation", 999, "different object generation"),
+        ("sha256", "b" * 64, "different content checksums"),
+        ("status", "uploading", "not verified"),
+    ],
+)
+def test_a_completion_that_does_not_verify_this_object_is_refused(
+    tmp_path: Path, field: str, value: Any, expected: str
+) -> None:
+    """A 2xx is not evidence; the server must say this exact object is verified."""
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    recorder = Recorder()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/complete-upload"):
+            sent = json.loads(request.content)
+            body = artifact_body("verified") | {
+                "storage_generation": sent["storage_generation"],
+                "verification_pending": False,
+                field: value,
+            }
+            return httpx.Response(200, json=body)
+        return recorder(request)
+
+    with (
+        WorkerProtocolClient(
+            "https://control.example", transport=httpx.MockTransport(handler)
+        ) as client,
+        pytest.raises(ControlPlaneError, match=expected),
+    ):
+        runner(client, state_path, ProducingExecutor(state_path)).heartbeat_once(state)
+
+
+@needs_posix
+def test_state_is_not_cleared_when_outputs_could_not_be_removed(tmp_path: Path) -> None:
+    """Clearing the attempt while its data remains is how a state volume silently fills."""
+    state_path = tmp_path / "agent.json"
+    state = enrolled(state_path)
+    recorder = Recorder()
+
+    class UnremovableExecutor(ProducingExecutor):
+        def discard_attempt_outputs(self, attempt_id: UUID, image_reference: str) -> bool:
+            return False
+
+    executor = UnremovableExecutor(state_path)
+    with (
+        WorkerProtocolClient(
+            "https://control.example", transport=httpx.MockTransport(recorder)
+        ) as client,
+        _unremovable(outputs_directory(state_path)),
+    ):
+        after = runner(client, state_path, executor).step(state)
+
+    assert "result" in recorder.calls
+    assert after.started_attempt_id == ATTEMPT_ID
+
+
+@contextmanager
+def _unremovable(outputs: Path) -> Iterator[None]:
+    """Make the attempt tree undeletable the way a hostile workload would."""
+    nested = outputs / "locked"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "kept.bin").write_bytes(b"retained")
+    nested.chmod(0o000)
+    try:
+        yield
+    finally:
+        nested.chmod(0o700)

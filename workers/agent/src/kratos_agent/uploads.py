@@ -5,6 +5,7 @@ session URI it was given. The URI is a bearer credential scoped to one object, s
 logged, never persisted here and never sent anywhere but Cloud Storage.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,12 @@ import httpx
 
 from kratos_agent.outputs import OutputIdentity, open_verified
 
-# Cloud Storage requires every chunk except the last to be a multiple of 256 KiB.
-CHUNK_BYTES = 8 * 1024 * 1024
-UPLOAD_TIMEOUT_SECONDS = 300
+# Cloud Storage requires every chunk except the last to be a multiple of 256 KiB. The chunk is
+# deliberately small: authority is re-proved between chunks, so the chunk size bounds how long
+# the agent can go without a heartbeat while delivering, and a worker must not read as stale
+# after 90 seconds just because it is uploading.
+CHUNK_BYTES = 2 * 1024 * 1024
+UPLOAD_TIMEOUT_SECONDS = 60
 
 
 class UploadError(RuntimeError):
@@ -24,6 +28,10 @@ class UploadError(RuntimeError):
 
 class UploadConflict(UploadError):
     """Cloud Storage refused the session permanently; a new one must be requested."""
+
+
+class AuthorityLost(UploadError):
+    """The control plane stopped holding this attempt, so its bytes may no longer be sent."""
 
 
 @dataclass(frozen=True)
@@ -38,18 +46,25 @@ def upload_object(
     source: Path,
     identity: OutputIdentity,
     byte_length: int,
+    still_authorised: Callable[[], bool] | None = None,
 ) -> CompletedUpload:
     """Send one output through its session, resuming from whatever Cloud Storage already holds.
 
     ``identity`` is re-checked on the opened descriptor, so a file replaced or rewritten since it
     was hashed is never uploaded under the manifest's checksums.
+
+    ``still_authorised`` is consulted before every chunk. A transfer can outlast several heartbeat
+    intervals, so authority is proved as it proceeds rather than once at the start, and storage
+    input and output stops the moment the control plane stops holding the attempt.
     """
+    _check(still_authorised)
     probed = _probe(client, session_uri, byte_length)
     if isinstance(probed, CompletedUpload):
         return probed
     offset = probed
     with open_verified(source, identity) as stream:
         while offset < byte_length:
+            _check(still_authorised)
             stream.seek(offset)
             chunk = stream.read(CHUNK_BYTES)
             if not chunk:
@@ -80,6 +95,11 @@ def upload_object(
     if isinstance(final, CompletedUpload):
         return final
     raise UploadError("Cloud Storage did not report the completed object")
+
+
+def _check(still_authorised: Callable[[], bool] | None) -> None:
+    if still_authorised is not None and not still_authorised():
+        raise AuthorityLost("the control plane no longer holds this attempt")
 
 
 def _probe(client: httpx.Client, session_uri: str, byte_length: int) -> CompletedUpload | int:

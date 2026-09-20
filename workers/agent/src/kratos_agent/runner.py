@@ -5,7 +5,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5
 
@@ -17,6 +17,7 @@ from docker.errors import DockerException
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import (
     ATTEMPT_DIRECTORY,
+    CleanupError,
     DockerExecutor,
     EnforcementError,
     ExecutorError,
@@ -44,6 +45,11 @@ from kratos_agent.uploads import UploadConflict, UploadError, upload_object
 MANIFEST_NAMESPACE = UUID("6f5bb2ac-0f0a-4c6f-9a4a-0a5f1e0c7d21")
 # One replacement session per artefact per pass; a further failure waits for the next tick.
 UPLOAD_SESSION_ATTEMPTS = 2
+VERIFIED = "verified"
+REJECTED = "rejected"
+# Every state from which this worker may still act. Anything else is a contract change and is
+# treated as an invalid response rather than guessed at.
+DELIVERABLE = frozenset({"declared", "uploading"})
 
 
 class CapabilityCollectionError(RuntimeError):
@@ -59,6 +65,7 @@ class AgentRunner:
         enrolment_credential_path: Path | None,
         capability_collector: Callable[[], WorkerCapabilities] = collect_capabilities,
         executor: DockerExecutor | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._client = client
         self._display_name = display_name
@@ -66,6 +73,7 @@ class AgentRunner:
         self._enrolment_credential_path = enrolment_credential_path
         self._collect = capability_collector
         self._executor = executor
+        self._clock = clock
 
     def ensure_enrolled(self) -> AgentState:
         existing = load_state(self._state_path)
@@ -221,9 +229,9 @@ class AgentRunner:
             # The control plane no longer holds this attempt open, so nothing authorises its
             # container to keep running and its retained evidence is no longer required.
             self._executor.remove_job_container(stale_attempt_id)
-            _discard_outputs(self._attempt_directory_for(stale_attempt_id))
-            updated = replace(updated, started_attempt_id=None, started_assignment=None)
-            save_state(self._state_path, updated)
+            if self._discard_outputs_for(stale_attempt_id, assignment):
+                updated = replace(updated, started_attempt_id=None, started_assignment=None)
+                save_state(self._state_path, updated)
         if assignment is not None:
             updated = self._run_assignment(updated, assignment)
         return updated
@@ -237,6 +245,54 @@ class AgentRunner:
     def _outputs_directory(self, assignment: JobAssignment) -> Path:
         return self._attempt_directory(assignment) / "outputs"
 
+    def _discard_outputs(self, assignment: JobAssignment) -> bool:
+        return self._discard_outputs_for(assignment.attempt_id, assignment)
+
+    def _discard_outputs_for(self, attempt_id: UUID, assignment: JobAssignment | None) -> bool:
+        """Remove an attempt's retained outputs once its result has been acknowledged.
+
+        A workload runs as an arbitrary user and can leave a tree the agent may not traverse, so a
+        failure escalates to a throwaway container bounded to this attempt's subpath.
+        """
+        if discard_tree(self._attempt_directory_for(attempt_id)):
+            return True
+        if self._executor is None or assignment is None:
+            return False
+        if not self._executor.discard_attempt_outputs(attempt_id, assignment.image_reference):
+            return False
+        return discard_tree(self._attempt_directory_for(attempt_id))
+
+    def _delivery_tick(
+        self, state_holder: list[AgentState], assignment: JobAssignment
+    ) -> Callable[[], bool]:
+        """Heartbeat while delivering, and report whether the attempt is still held.
+
+        Delivery runs after the container has stopped and can outlast several heartbeat intervals,
+        so the worker must keep reporting or it reads as stale and cannot observe a cancellation.
+        The execution lease is never extended: this only proves that the control plane still holds
+        the attempt, which is the server's own delivery window rather than the workload's.
+        """
+        due = [self._clock() + timedelta(seconds=state_holder[0].heartbeat_interval_seconds)]
+
+        def tick() -> bool:
+            if self._clock() < due[0]:
+                return True
+            try:
+                state_holder[0], response = self._exchange_heartbeat(state_holder[0])
+            except Exception as error:
+                print(json.dumps({"status": "retrying", "detail": str(error)}), flush=True)
+                state_holder[0] = load_state(self._state_path) or state_holder[0]
+                due[0] = self._clock() + timedelta(
+                    seconds=state_holder[0].heartbeat_interval_seconds
+                )
+                # Only an explicit refusal withdraws authority; being unreachable does not.
+                return not _is_rejection(error)
+            due[0] = self._clock() + timedelta(seconds=state_holder[0].heartbeat_interval_seconds)
+            held = response.assignment
+            return held is not None and held.attempt_id == assignment.attempt_id
+
+        return tick
+
     def _deliver_outputs(
         self, state: AgentState, assignment: JobAssignment, result: JobExecutionResult
     ) -> JobExecutionResult:
@@ -249,9 +305,13 @@ class AgentRunner:
         worker_id, credential = state.worker_id, state.worker_credential
         if worker_id is None or credential is None:
             raise ValueError("worker is not enrolled")
+        state_holder = [state]
+        tick = self._delivery_tick(state_holder, assignment)
         try:
             outputs = build_manifest(
-                self._outputs_directory(assignment), assignment.output_requirements
+                self._outputs_directory(assignment),
+                assignment.output_requirements,
+                still_authorised=tick,
             )
         except OutputError as error:
             if result.exit_code == 0 and not result.timed_out:
@@ -273,8 +333,24 @@ class AgentRunner:
         )
         by_path = {output.file.logical_path: output for output in outputs}
         for artifact in manifest.artifacts:
-            if artifact.status == "verified":
+            if artifact.status == VERIFIED:
                 continue
+            if artifact.status == REJECTED:
+                # The control plane has durably refused this object. Retrying can never verify it,
+                # and raising would restart this attempt forever, so the execution becomes a
+                # bounded delivery failure instead.
+                return result.model_copy(
+                    update={
+                        "exit_code": 125,
+                        "failure_message": (
+                            f"output {artifact.logical_path!r} was rejected by the control plane"
+                        )[:1000],
+                    }
+                )
+            if artifact.status not in DELIVERABLE:
+                raise ControlPlaneError(
+                    200, "invalid_response", f"artefact is in unknown state {artifact.status!r}"
+                )
             output = by_path.get(artifact.logical_path)
             if output is None:
                 raise ControlPlaneError(
@@ -283,17 +359,12 @@ class AgentRunner:
             if artifact.storage_generation is not None:
                 # The bytes already reached Cloud Storage and the server recorded the generation;
                 # only the completion acknowledgement was lost. Beginning again would be refused.
-                self._client.complete_artifact_upload(
-                    worker_id,
-                    credential,
-                    assignment.attempt_id,
-                    output.file,
-                    artifact.artifact_id,
-                    artifact.storage_generation,
+                generation = artifact.storage_generation
+            else:
+                generation = self._transfer(
+                    state_holder, assignment, artifact, output, worker_id, credential, tick
                 )
-                continue
-            generation = self._transfer(state, assignment, artifact, output, worker_id, credential)
-            self._client.complete_artifact_upload(
+            completed = self._client.complete_artifact_upload(
                 worker_id,
                 credential,
                 assignment.attempt_id,
@@ -301,16 +372,18 @@ class AgentRunner:
                 artifact.artifact_id,
                 generation,
             )
+            _check_completed(completed, artifact, generation)
         return result
 
     def _transfer(
         self,
-        state: AgentState,
+        state_holder: list[AgentState],
         assignment: JobAssignment,
         artifact: ArtifactResponse,
         output: VerifiedOutput,
         worker_id: UUID,
         credential: str,
+        still_authorised: Callable[[], bool],
     ) -> int:
         """Send one artefact, replacing a session Cloud Storage has permanently rejected."""
         source = self._outputs_directory(assignment) / artifact.logical_path
@@ -325,6 +398,7 @@ class AgentRunner:
                     source,
                     output.identity,
                     artifact.byte_length,
+                    still_authorised=still_authorised,
                 )
             except UploadConflict:
                 if not remaining:
@@ -376,7 +450,10 @@ class AgentRunner:
                 200, "invalid_response", "job result acknowledgement is inconsistent"
             )
         self._executor.remove_job_container(assignment.attempt_id)
-        _discard_outputs(self._attempt_directory(assignment))
+        if not self._discard_outputs(assignment):
+            # Retained data nobody is tracking is how a state volume fills, so the attempt stays
+            # recorded and cleanup is retried rather than forgotten.
+            raise CleanupError(f"attempt {assignment.attempt_id} outputs could not be removed")
         state = replace(state, started_attempt_id=None, started_assignment=None)
         save_state(self._state_path, state)
         return state
@@ -432,6 +509,7 @@ class AgentRunner:
             return self.heartbeat_once(state)
         except (
             CapabilityCollectionError,
+            CleanupError,
             DockerException,
             EnforcementError,
             UploadError,
@@ -453,14 +531,31 @@ class AgentRunner:
             time.sleep(state.heartbeat_interval_seconds)
 
 
+def _check_completed(
+    completed: ArtifactResponse, declared: ArtifactResponse, generation: int
+) -> None:
+    """Refuse to treat an upload as done unless the server says this exact object is verified."""
+    if completed.artifact_id != declared.artifact_id:
+        raise ControlPlaneError(200, "invalid_response", "completion named a different artefact")
+    if completed.storage_generation != generation:
+        raise ControlPlaneError(
+            200, "invalid_response", "completion named a different object generation"
+        )
+    if completed.sha256 != declared.sha256 or completed.crc32c != declared.crc32c:
+        raise ControlPlaneError(
+            200, "invalid_response", "completion returned different content checksums"
+        )
+    if completed.status != VERIFIED or completed.verification_pending:
+        raise ControlPlaneError(
+            200,
+            "invalid_response",
+            f"artefact is {completed.status!r} after completion, not verified",
+        )
+
+
 def _manifest_id(attempt_id: UUID) -> UUID:
     """One stable manifest identifier per attempt, so a replay is the same manifest."""
     return uuid5(MANIFEST_NAMESPACE, str(attempt_id))
-
-
-def _discard_outputs(attempt_directory: Path) -> None:
-    """Remove an attempt's retained outputs once the control plane has acknowledged its result."""
-    discard_tree(attempt_directory)
 
 
 def _is_transient(error: ControlPlaneError) -> bool:

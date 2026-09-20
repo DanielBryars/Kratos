@@ -39,6 +39,10 @@ class ExecutorError(RuntimeError):
     """The local container executor could not produce trustworthy evidence."""
 
 
+class CleanupError(ExecutorError):
+    """An attempt's data could not be removed, so its state must not be cleared."""
+
+
 class EnforcementError(ExecutorError):
     """A container outlived its authority and could not be stopped.
 
@@ -316,6 +320,50 @@ class DockerExecutor:
                 subpath=f"{ATTEMPT_DIRECTORY}/{assignment.attempt_id}/outputs",
             )
         ]
+
+    def discard_attempt_outputs(self, attempt_id: UUID, image_reference: str) -> bool:
+        """Remove an attempt's output tree that this agent cannot remove itself.
+
+        A workload runs as an arbitrary user and can leave a nested directory the agent may not
+        traverse. The removal therefore runs in a throwaway container as root, but it is bound to
+        the one attempt: the container sees only that attempt's subpath of the state volume, never
+        the volume root, and it has no network and no capabilities beyond the two it needs to
+        traverse and unlink what another user owns.
+        """
+        if self._state_volume is None:
+            return False
+        try:
+            container = self._client.containers.run(
+                image_reference,
+                command=["sh", "-c", "rm -rf /attempt/* /attempt/.[!.]* 2>/dev/null; true"],
+                detach=True,
+                network_disabled=True,
+                read_only=True,
+                cap_drop=["ALL"],
+                cap_add=["DAC_OVERRIDE", "DAC_READ_SEARCH"],
+                security_opt=["no-new-privileges"],
+                mem_limit="128m",
+                pids_limit=32,
+                mounts=[
+                    docker.types.Mount(
+                        target="/attempt",
+                        source=self._state_volume,
+                        type="volume",
+                        read_only=False,
+                        subpath=f"{ATTEMPT_DIRECTORY}/{attempt_id}",
+                    )
+                ],
+                labels={"com.kratos.role": "cleanup", "com.kratos.managed": "true"},
+            )
+        except docker.errors.APIError:
+            return False
+        try:
+            return int(container.wait(timeout=60)["StatusCode"]) == 0
+        except Exception:
+            return False
+        finally:
+            with contextlib.suppress(Exception):
+                container.remove(force=True)
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""
