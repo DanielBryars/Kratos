@@ -5,27 +5,10 @@
 #
 # Only Grafana, MLflow and the OTLP gateway are reachable, all through an HTTPS load balancer.
 # Grafana and MLflow sit behind Identity-Aware Proxy so a human must sign in before reaching the
-# service itself. Prometheus, Loki and Tempo have no route from outside the VPC, which is what
+# service itself. Kratos itself authenticates humans through Cloud Identity Platform rather than
+# IAP; the two are different mechanisms, and the principal authorised here is the same Google
+# account either way. Prometheus, Loki and Tempo have no route from outside the VPC, which is what
 # ADR-009 requires of the backends.
-
-# Fail the plan, before anything billable exists, rather than creating backend services with IAP
-# disabled and publishing Grafana and MLflow unauthenticated.
-resource "terraform_data" "iap_client_required" {
-  count = local.enabled
-
-  lifecycle {
-    precondition {
-      condition = !var.require_iap_client || (
-        var.oauth_client_id != "" && var.oauth_client_secret != ""
-      )
-      error_message = join(" ", [
-        "enable_observability is true but no IAP OAuth client was supplied.",
-        "Create the client, then pass oauth_client_id and oauth_client_secret.",
-        "Grafana and MLflow would otherwise be published without authentication.",
-      ])
-    }
-  }
-}
 
 locals {
   enabled = var.enable_observability ? 1 : 0
@@ -463,10 +446,15 @@ resource "google_compute_backend_service" "human" {
 
   # Human access is IAP-only. Without an OAuth client the service is created with IAP disabled,
   # which would publish it unauthenticated, so the plan requires the client identifier.
+  # Identity-Aware Proxy with a Google-managed OAuth client. No client is configured here, and
+  # none can be: Google shut down the IAP OAuth Admin APIs on 19 March 2026, so a custom client
+  # cannot be created any more. The managed client is now the only supported path, and it is the
+  # better one -- no secret exists to be created, rotated, or held in Terraform state.
+  #
+  # `enabled` is unconditional. A backend service published without it would serve Grafana and
+  # MLflow to the internet unauthenticated, so it is not a variable anyone can turn off.
   iap {
-    enabled              = true
-    oauth2_client_id     = var.oauth_client_id
-    oauth2_client_secret = var.oauth_client_secret
+    enabled = true
   }
 
   log_config {

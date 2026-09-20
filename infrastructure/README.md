@@ -150,14 +150,26 @@ authentication boundary is a larger blast radius than the convenience is worth.
    (`roles/billing.costsManager`), on the account named in `billing_account` — otherwise the apply
    fails on the budget before it reaches anything else. Alerts then go by email to that account's
    administrators and billing account users.
-3. **Create the IAP OAuth client** in the console and keep its identifier and secret. Terraform does
-   not create it, and an enabled plan **fails** without it rather than creating backend services
-   with IAP disabled, which would publish Grafana and MLflow unauthenticated.
-4. **Decide where the OAuth secret lives.** Terraform holds `oauth_client_secret` in state, so the
-   state bucket is exactly as sensitive as the secret. It is the bucket created by the bootstrap
-   root, which is private and versioned; treat access to it accordingly.
-5. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
+3. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
    platform database enabled first.
+
+There is no OAuth client to create. Identity-Aware Proxy uses a Google-managed client, which is now
+the only supported path: Google shut down the IAP OAuth Admin APIs on **19 March 2026**, so a custom
+client can no longer be created. It is also the better path, because no secret exists to be rotated
+or to sit in Terraform state.
+
+### Who can reach Grafana and MLflow
+
+`iap_member` names the single principal allowed through IAP, as an IAM member string such as
+`user:someone@example.com`.
+
+Kratos itself authenticates humans through **Cloud Identity Platform**, while Grafana and MLflow sit
+behind **Identity-Aware Proxy**. Those are different mechanisms, which is worth being precise about
+— but the principal is the same Google account, so whoever signs in to the Kratos console signs in
+to Grafana and MLflow with those same credentials.
+
+IAP is unconditional here. No variable turns it off, because a backend service published without it
+would serve both tools to the internet unauthenticated.
 
 ### Applying
 
@@ -174,12 +186,10 @@ terraform -chdir=infrastructure/observability apply \
   -var domain_name=kratos.bryars.com \
   -var 'iap_member=user:you@example.com' \
   -var billing_account=012345-6789AB-CDEF01 \
-  -var enable_observability=true \
-  -var oauth_client_id=YOUR_CLIENT_ID
+  -var enable_observability=true
 ```
 
-Leave `oauth_client_secret` off the command line: Terraform prompts for it, so it does not reach
-the shell history or the process list. In PowerShell the same commands work with the quoting
+In PowerShell the same commands work with the quoting
 reversed — use `--%` or double quotes around `iap_member`, for example
 `terraform -chdir=infrastructure/observability apply -var "iap_member=user:you@example.com"`.
 
