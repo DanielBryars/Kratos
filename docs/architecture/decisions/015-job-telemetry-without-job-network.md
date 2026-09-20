@@ -37,7 +37,8 @@ SHALL NOT need an OpenTelemetry or MLflow client library.
 ### Standard output is the workload's only telemetry channel
 
 A supported workload SHALL write **Kratos records** to stdout: one JSON object per line, UTF-8, at
-most 8 KiB, carrying `schema_version` and a `record` discriminator. Version 1 defines:
+most 8 KiB including its newline, carrying `schema_version` and a `record` discriminator. Version 1
+defines:
 
 | `record` | Meaning | Required fields |
 |---|---|---|
@@ -46,29 +47,52 @@ most 8 KiB, carrying `schema_version` and a `record` discriminator. Version 1 de
 | `progress` | Position in the run | `step`; optional `total_steps`, `unit` |
 | `result` | The final structured result | The workload's existing result object |
 
+Value types are exact. A `metric` `value` SHALL be a finite JSON number: `NaN` and both infinities
+are rejected, not coerced. A `step` SHALL be an integer in `[0, 2^53)` and SHALL NOT decrease within
+a name. A `param` `value` SHALL be a string, finite number or boolean, at most 512 bytes once
+encoded; a structured parameter SHALL be flattened by the workload. A `unit` SHALL be at most 32
+bytes. Names SHALL match `^[a-z][a-z0-9_.]{0,63}$`. A record that breaks any of these is not a
+record.
+
 Any other stdout line, and every stderr line, SHALL be treated as an opaque log line. An image that
 knows nothing about Kratos records therefore still has its logs collected.
 
-A record SHALL NOT carry labels or dimensions in version 1. Metric and parameter names SHALL match
-`^[a-z][a-z0-9_.]{0,63}$`. A workload MAY repeat the job and attempt identifiers it was given, as
-the training example does, but the agent SHALL ignore them as identity.
+A record SHALL NOT carry labels or dimensions in version 1. A workload MAY repeat the job and
+attempt identifiers it was given, as the training example does, but the agent SHALL ignore them as
+identity.
 
 ### The trusted agent reads, bounds, stamps and forwards
 
 While it supervises a container, the agent SHALL follow the container's stdout and stderr through
-the Docker Engine API it already holds. It SHALL start each job container with bounded local log
-retention so a workload cannot fill the host disk through its log driver.
+the Docker Engine API it already holds. Reading, parsing and export SHALL run off the supervision
+path: the agent SHALL start each job container with a bounded, non-blocking local log driver so a
+workload cannot stall on a full pipe or fill the host disk, and SHALL hand lines to a separate
+bounded reader and export queue. Deadline enforcement, the lease and the result report SHALL NOT
+wait on any telemetry work, and a telemetry failure SHALL NOT raise into supervision.
 
 The agent SHALL apply documented limits before forwarding: the line length above, a maximum record
-and log-line rate, a maximum number of distinct metric names per attempt and a total byte budget.
-On exhaustion it SHALL drop diagnostic data, count what it dropped by reason, report those counts,
-and continue to supervise the job. Malformed or over-long records SHALL be counted and forwarded
-as log lines at most, never parsed further. These limits satisfy MON-019 for the job boundary.
+and log-line rate, a maximum number of distinct metric and parameter names per attempt, and a total
+byte budget per attempt. On exhaustion it SHALL drop diagnostic data rather than block. It SHALL
+count what it dropped by reason — rate, budget, name limit, malformed, oversize — and SHALL report
+those counters with the attempt so a gap is visible as a number rather than as silence. Those
+counters are execution evidence: they SHALL survive queue exhaustion and accompany the job result
+even when every observation was dropped. Malformed or over-long records SHALL be counted and
+forwarded as log lines at most, never parsed further.
 
-The agent SHALL attach the worker, job, attempt, project and MLflow run identifiers from its
-**assignment**, never from the stream. It SHALL preserve each line's original Docker timestamp.
-After a restart it SHALL resume from the last forwarded timestamp, and downstream writes SHALL be
-idempotent on attempt, record name, step and timestamp so a replayed line is harmless.
+The agent SHALL attach the worker, job, attempt and project identifiers, and the observation-stream
+identifier below, from its **assignment**, never from the stream. It SHALL preserve each line's
+original Docker timestamp as an attribute.
+
+Delivery is ordered by an agent-assigned sequence, not by timestamp, because container timestamps
+can repeat and are not a cursor. The agent SHALL number every forwarded record within an attempt
+with a monotonic sequence starting at one, SHALL group records into batches with a durable batch
+identifier, and SHALL persist the batch and its sequence range in its protected state before
+sending. A sink SHALL acknowledge a batch identifier, and the agent SHALL advance a durable
+acknowledged high-water mark only on acknowledgement, updating that cursor atomically with the
+spool. After a restart it SHALL resume from the high-water mark. Replaying a batch SHALL be
+harmless: a sink SHALL be idempotent on attempt and sequence. Where retention or a bounded spool
+has discarded records below the mark, the agent SHALL report the missing sequence range explicitly
+as a gap rather than leave the absence to be inferred.
 
 The agent SHALL report the **last** `result` record as the job's structured result, within the
 existing 64 KiB bound, instead of the first 64 KiB of stdout.
@@ -77,15 +101,30 @@ existing 64 KiB bound, instead of the first 64 KiB of stdout.
 
 Operational signals: the agent SHALL convert log lines to OpenTelemetry logs, and `metric` and
 `progress` records to OpenTelemetry metrics, and export them by OTLP to the worker-local collector
-required by ADR-009. Until that collector is delivered, the agent MAY export directly to the
-gateway; the rest of this decision is unchanged when the collector arrives.
+required by ADR-009. That collector, with the scoped revocable credential and bounded persistent
+queue ADR-009 requires, is a prerequisite: this decision SHALL NOT be implemented through a direct
+agent-to-gateway path, because that path has neither equivalent authentication nor equivalent
+durable queueing.
 
-Experiment records: the **control plane** SHALL own MLflow runs. When it creates an attempt it
-SHALL create the MLflow run, tag it with the Kratos job, attempt, image and dataset identities,
-record the run identifier on the attempt and return it in the assignment. The agent SHALL send
-`param`, `metric` and `progress` records in bounded batches to an authenticated attempt endpoint,
-and the control plane SHALL write them to MLflow. A worker SHALL NOT hold an MLflow credential,
-and MLflow SHALL NOT be reachable with a worker credential.
+Metric identity is deliberately narrow. Only `service.name` and the worker identifier SHALL become
+metric attributes. The project, job, attempt and MLflow run identifiers SHALL NOT be attached to
+metric series, because one series per attempt is unbounded growth across a fleet however few labels
+the workload supplies. They remain on logs, on traces and in MLflow, and metrics SHALL carry
+exemplars referencing the attempt so a chart can still reach the run behind a point. A deployment
+SHALL additionally enforce an active-series ceiling and a metric-name allowlist at the collector,
+so a new workload cannot expand cardinality without a configuration change.
+
+Experiment records: the **control plane** SHALL own MLflow runs, and MLflow SHALL NOT be a
+scheduling dependency. Creating an attempt SHALL NOT call MLflow. The control plane SHALL instead
+allocate a Kratos-owned `observation_stream_id` with the attempt, record it on the attempt, return
+it in the assignment, and durably enqueue an outbox entry describing the run to be created. A
+separate worker SHALL create and tag the MLflow run from that outbox and record the resulting
+MLflow run identifier against the stream. The agent SHALL send `param`, `metric` and `progress`
+records in bounded batches to an authenticated attempt endpoint, addressed by the stream identifier;
+the control plane SHALL durably accept and acknowledge them whether or not the MLflow run exists
+yet, and SHALL apply them in sequence order once it does. MLflow being unavailable SHALL therefore
+delay visibility, never job admission, execution or completion. A worker SHALL NOT hold an MLflow
+credential, and MLflow SHALL NOT be reachable with a worker credential.
 
 As ADR-009 requires, an observation useful in both systems is written to both, carrying the same
 identifiers, by the agent's fan-out rather than by the workload.
@@ -94,10 +133,10 @@ identifiers, by the agent's fan-out rather than by the workload.
 
 Telemetry SHALL NOT start, stop, fail or extend a job. Loss of the collector, gateway, control plane
 or MLflow SHALL NOT interrupt supervision or lease enforcement. The agent SHALL keep undelivered
-experiment records in a bounded spool in its protected state directory and replay them when the
-link returns; on exhaustion it SHALL drop the oldest diagnostic records first, never the job
-result, and SHALL make the loss visible in the run view. Durable replay across long outages remains
-R0.4 scope.
+records in a bounded spool in its protected state directory and replay them from the acknowledged
+high-water mark when the link returns. On exhaustion it SHALL drop the oldest diagnostic records
+first, never the job result and never the drop counters or the resulting gap report, and the loss
+SHALL be visible in the run view. Durable replay across long outages remains R0.4 scope.
 
 ## Alternatives
 
@@ -110,6 +149,9 @@ R0.4 scope.
 | Give each worker an MLflow credential | MLflow's access control is coarse; one worker could write to any project's runs. The control plane already authorises attempts. |
 | A bridge on the observability host that turns OpenTelemetry metrics into MLflow writes | Removes MLflow traffic from the control plane and inherits the collector's queue, but adds a custom service and creates runs lazily, so the run identifier is unknown to the agent and the control plane. Worth revisiting if relay volume becomes material. |
 | Keep reporting only the final output | Cannot satisfy MON-001 or MON-003 for a running job. |
+| Create the MLflow run synchronously when the attempt is created | Simplest mapping, but makes MLflow availability a scheduling dependency, which contradicts the failure guarantee. Rejected in favour of a Kratos-owned stream identifier and an outbox. |
+| Identify metric series by job and attempt | Gives a chart the run for free, but creates one series per attempt across the fleet, which no workload-label rule bounds. Exemplars carry the association instead. |
+| Order delivery by container timestamp | Needs no extra state, but timestamps repeat, can go backwards and cannot express a gap. An agent-assigned sequence with acknowledged batches can. |
 
 ## Consequences
 
@@ -117,19 +159,26 @@ R0.4 scope.
   sandbox, credential boundary and ADR-014 are unchanged.
 - The agent gains a parser for untrusted input. It must be bounded, must never raise into
   supervision, and needs the same adversarial testing as the output manifest builder.
+- The agent gains durable per-attempt telemetry state: a spool, batch identifiers and an
+  acknowledged high-water mark, all of which must survive restart alongside the execution
+  authority it already persists.
+- The worker-local collector becomes a prerequisite for this decision rather than a later
+  refinement, which brings ADR-009's scoped worker telemetry credential onto the critical path.
 - Stdout becomes a contract. Human-readable output belongs on stderr, and the result-extraction
   change must ship with the first record-aware agent.
 - Spans from inside a workload are not supported. Traces cover the control plane and agent only.
-- The control plane gains an MLflow client, a run identifier on the attempt, an observation
-  endpoint and a route to MLflow. Scalar metrics are small, unlike the artefact bytes that ADR-014
-  deliberately keeps away from Cloud Run.
-- Metric cardinality is bounded by construction, because the workload supplies names but no labels.
+- The control plane gains an MLflow client, an observation-stream identifier and outbox, an
+  observation endpoint and a route to MLflow. Scalar metrics are small, unlike the artefact bytes
+  that ADR-014 deliberately keeps away from Cloud Run.
+- Metric cardinality is bounded by the narrow attribute set and the collector's ceilings, not by
+  the absence of workload labels alone.
 
 ## Deliberately deferred
 
 How the gateway authenticates a worker, which ADR-009 requires to be scoped and revocable, needs its
 own decision; a short-lived token issued by the control plane and verified by the collector is the
-expected direction. This ADR does not define MLflow artefact or model registration, which SHALL
+expected direction. Because the worker-local collector is now a prerequisite, that decision blocks
+implementation of this one. This ADR does not define MLflow artefact or model registration, which SHALL
 reference verified ADR-014 artefacts; labelled metrics; workload spans; or the worker-local
 collector's configuration.
 
