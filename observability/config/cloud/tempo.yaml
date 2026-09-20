@@ -1,0 +1,35 @@
+# Tempo for the cloud instance: blocks live in Cloud Storage, the disk holds only the write-ahead
+# log. Limits are identical to the local bundle; only storage differs. Block retention stays a
+# command-line flag, as Tempo 3 no longer accepts it here.
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: gcs
+    gcs:
+      bucket_name: ${KRATOS_TELEMETRY_BUCKET}
+      prefix: tempo
+    wal:
+      path: /var/tempo/wal
+
+overrides:
+  defaults:
+    ingestion:
+      rate_limit_bytes: 4000000
+      burst_size_bytes: 8000000
+      max_traces_per_user: 10000
+      max_global_traces_per_user: 10000
+    global:
+      max_bytes_per_trace: 5000000
+
+usage_report:
+  reporting_enabled: false

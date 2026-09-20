@@ -13,7 +13,9 @@ before anything is deployed to GCP. It costs nothing to run and creates no cloud
 > that decision is still open and blocks
 > [ADR-015](../docs/architecture/decisions/015-job-telemetry-without-job-network.md). Treat the
 > service configuration as a starting point to be re-reviewed against an authenticated edge, not as
-> settled.
+> settled. The cloud overlay `compose.cloud.yaml`, applied by
+> [`infrastructure/observability`](../infrastructure/README.md#observability-cost-gate), is what
+> adds the authenticated edge, durable storage and secret delivery.
 
 ## Validate it without running it
 
@@ -106,6 +108,10 @@ included, and as noted above only Prometheus has an enforced byte ceiling.
   `otlp` aliases warn.
 - SQLite and local artefact and block storage are local conveniences. ADR-009 puts MLflow metadata
   in PostgreSQL, and MLflow, Loki and Tempo object data in Cloud Storage.
+- The cloud overlay republishes each service on the port its load-balancer backend expects,
+  moves Prometheus, Loki, Tempo and Grafana state onto the persistent disk, sends Loki chunks,
+  Tempo blocks and MLflow artefacts to Cloud Storage, and points MLflow at Cloud SQL through
+  the Auth Proxy. `validate.sh` checks it alongside the local bundle.
 - Nothing here authenticates a worker sending OTLP. ADR-009 requires a scoped, revocable
   credential; that decision is still open and is noted in
   [ADR-015](../docs/architecture/decisions/015-job-telemetry-without-job-network.md).

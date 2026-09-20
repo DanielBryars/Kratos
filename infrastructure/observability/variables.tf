@@ -66,16 +66,64 @@ variable "iap_member" {
 }
 
 variable "oauth_client_id" {
-  description = "IAP OAuth client identifier. Created by the user; not managed by Terraform."
+  description = <<-EOT
+    IAP OAuth client identifier. Created by the user; not managed by Terraform. Required whenever
+    observability is enabled, because a backend service created with IAP disabled would publish
+    Grafana and MLflow to the internet unauthenticated.
+  EOT
   type        = string
   default     = ""
 }
 
 variable "oauth_client_secret" {
-  description = "IAP OAuth client secret. Created by the user; not managed by Terraform."
+  description = <<-EOT
+    IAP OAuth client secret. Created by the user; not managed by Terraform. Terraform stores this
+    in state, so the state bucket is as sensitive as the secret; see the README.
+  EOT
   type        = string
   default     = ""
   sensitive   = true
+}
+
+variable "require_iap_client" {
+  description = <<-EOT
+    Refuse to plan an enabled stack without an IAP OAuth client. Leave this true: turning it off
+    creates backend services with IAP disabled, which publishes Grafana and MLflow to the internet.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "enable_otlp_ingress" {
+  description = <<-EOT
+    Publish the OTLP ingestion endpoint. Separate from enable_observability and off by default:
+    nothing authenticates a worker sending telemetry yet. ADR-009 requires a scoped, revocable
+    worker credential and ADR-015 records that decision as open, so enabling this would expose an
+    unauthenticated ingestion endpoint to the internet.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "grafana_admin_user" {
+  description = "Grafana administrator account name. Its password lives in Secret Manager."
+  type        = string
+  default     = "kratos-admin"
+}
+
+variable "compose_url" {
+  description = "Docker Compose binary the instance fetches, since Container-Optimized OS has none."
+  type        = string
+  default     = "https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64"
+}
+
+variable "compose_sha256" {
+  description = <<-EOT
+    SHA-256 of that binary. The instance refuses to run a download that does not match, so the
+    startup path stays pinned rather than trusting whatever the URL serves that day.
+  EOT
+  type        = string
+  default     = "db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576"
 }
 
 variable "config_bundle_object" {
