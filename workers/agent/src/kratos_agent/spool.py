@@ -109,7 +109,10 @@ def _atomic_write(path: Path, payload: object) -> None:
 class ObservationSpool:
     """One attempt's observations on disk, plus where each sink has got to.
 
-    Not thread-safe. The agent gives it to the single reader that owns the attempt's output.
+    Thread-safe, and it has to be: the attempt's log reader appends while the agent-level courier
+    reads, acknowledges and eventually removes. Anything that both inspects and then acts -- most
+    of all `discard_if_empty` -- does so inside a single acquisition, because releasing between
+    the two is what lets a record be written and then deleted without ever being seen.
     """
 
     def __init__(self, root: Path, sinks: Iterable[str]) -> None:
@@ -136,25 +139,41 @@ class ObservationSpool:
     # --- Stream identity -------------------------------------------------------------------------
 
     def record_stream(self, stream_id: UUID) -> None:
-        """Write down which control-plane stream these records belong to.
+        """Bind these records to a control-plane stream, once and only once.
 
         The courier that delivers a spool after a restart has no assignment to read this from:
         the attempt is gone, and with it the only thing that knew where its observations were
         addressed. Without this on disk, a spool that survived a crash could never be sent.
+
+        Binding is **write-once**. Recording the same identifier again is accepted and changes
+        nothing; recording a different one raises, leaving every file untouched. An overwrite would
+        silently redirect records that were already spooled for one stream into another, which is
+        worse than refusing: the records would arrive, be accepted, and be attributed to the wrong
+        run. An existing file that cannot be read is treated the same way, because a spool whose
+        address is unreadable is not a spool whose address may be replaced.
         """
         with self._lock:
+            existing = self._stream_path.exists()
+            if existing:
+                current = self._stream_id()
+                if current == stream_id:
+                    return
+                raise SpoolError("spool is already bound to a different observation stream")
             _atomic_write(self._stream_path, {"schema_version": 1, "stream_id": str(stream_id)})
 
     @property
     def stream_id(self) -> UUID | None:
         with self._lock:
-            if not self._stream_path.exists():
-                return None
-            try:
-                stored = json.loads(self._stream_path.read_text(encoding="utf-8"))
-                return UUID(str(stored["stream_id"]))
-            except (OSError, ValueError, KeyError):
-                return None
+            return self._stream_id()
+
+    def _stream_id(self) -> UUID | None:
+        if not self._stream_path.exists():
+            return None
+        try:
+            stored = json.loads(self._stream_path.read_text(encoding="utf-8"))
+            return UUID(str(stored["stream_id"]))
+        except (OSError, ValueError, KeyError):
+            return None
 
     # --- Recovery ------------------------------------------------------------------------------
 
@@ -447,6 +466,23 @@ class ObservationSpool:
 
     def _pending(self, sink: str) -> bool:
         return self._cursors[sink] < self._last_sequence
+
+    def discard_if_empty(self, sink: str) -> bool:
+        """Remove the spool only if this sink has taken everything, without letting go.
+
+        The emptiness check and the removal are one critical section on purpose. Checking under
+        one lock acquisition and discarding under another leaves a window in which the attempt's
+        log reader appends a record, and the discard then deletes a record nobody has seen. The
+        window is small, which is exactly what makes it the kind of loss that is never reproduced
+        and never explained.
+        """
+        with self._lock:
+            if sink not in self._cursors:
+                raise SpoolError("unknown sink")
+            if self._cursors[sink] < self._last_sequence:
+                return False
+            self._discard()
+            return True
 
     def discard(self) -> None:
         with self._lock:

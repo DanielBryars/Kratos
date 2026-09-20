@@ -8,6 +8,7 @@ a restart — only exist at the filesystem.
 import json
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -285,3 +286,76 @@ def test_a_batch_knows_the_range_it_covers() -> None:
         records=({"sequence": 7}, {"sequence": 8}),
     )
     assert batch.last_sequence == 8
+
+
+# --- Recovery correctness ------------------------------------------------------------------
+#
+# Found in re-review rather than by me. Each of these is a window small enough that it would
+# never have been reproduced from a bug report.
+
+
+def test_stream_binding_is_write_once(root: Path) -> None:
+    """Rebinding would silently redirect already-spooled records into another run's stream.
+
+    They would arrive, be accepted, and be attributed to the wrong run, which is worse than a
+    refusal because nothing would look broken.
+    """
+    store = spool(root)
+    first = UUID("55555555-5555-4555-8555-555555555555")
+    store.record_stream(first)
+
+    # The same identifier is idempotent: re-binding on a resumed attempt is normal.
+    store.record_stream(first)
+    assert store.stream_id == first
+
+    other = UUID("66666666-6666-4666-8666-666666666666")
+    with pytest.raises(SpoolError):
+        store.record_stream(other)
+    assert store.stream_id == first, "a refused rebinding leaves the address untouched"
+
+
+def test_an_unreadable_stream_file_is_not_treated_as_absent(root: Path) -> None:
+    """A spool whose address cannot be read is not a spool whose address may be replaced."""
+    store = spool(root)
+    store.record_stream(UUID("55555555-5555-4555-8555-555555555555"))
+    (root / "stream.json").write_text("{ not json", encoding="utf-8")
+
+    with pytest.raises(SpoolError):
+        store.record_stream(UUID("66666666-6666-4666-8666-666666666666"))
+
+
+def test_discard_refuses_when_a_record_arrived_after_the_last_acknowledgement(
+    root: Path,
+) -> None:
+    """The check and the removal are one critical section.
+
+    Asking "is it empty?" and then discarding are two moments, and the attempt's log reader can
+    append between them. Under the old two-acquisition form that record was deleted having never
+    been sent.
+    """
+    store = spool(root)
+    fill(store, 2)
+    store.acknowledge(CONTROL_PLANE, 2)
+    assert not store.pending(CONTROL_PLANE)
+
+    # The log reader gets one last line in before retirement runs.
+    store.append(record(99))
+
+    assert store.discard_if_empty(CONTROL_PLANE) is False
+    assert (root / "records.jsonl").exists()
+    batch = store.next_batch(CONTROL_PLANE, limit=10, max_bytes=MAX_SPOOL_BYTES)
+    assert batch is not None and batch.first_sequence == 3
+
+
+def test_discard_removes_the_spool_when_it_really_is_empty(root: Path) -> None:
+    store = spool(root)
+    fill(store, 2)
+    store.acknowledge(CONTROL_PLANE, 2)
+    assert store.discard_if_empty(CONTROL_PLANE) is True
+    assert not root.exists()
+
+
+def test_discard_if_empty_refuses_an_unknown_sink(root: Path) -> None:
+    store = spool(root)
+    with pytest.raises(SpoolError):
+        store.discard_if_empty("nowhere")

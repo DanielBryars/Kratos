@@ -658,6 +658,11 @@ class AgentRunner:
 
     def run(self) -> None:
         state = self.ensure_enrolled()
+        # Before the first heartbeat, and without waiting for an assignment. A worker that
+        # restarts holding undelivered records and is then never given another job would
+        # otherwise keep them for ever: the courier was only ever built when work arrived, which
+        # is precisely the case recovery is for.
+        self._courier_for(state)
         while True:
             state = self.step(state)
             time.sleep(state.heartbeat_interval_seconds)
@@ -701,7 +706,7 @@ def _is_transient(error: ControlPlaneError) -> bool:
 def _with_observations(
     result: JobExecutionResult, pump: "ObservationPump | None"
 ) -> JobExecutionResult:
-    """Put the observation counters on the result, if there are any.
+    """Put the observation counters and the workload's own result on the job result.
 
     A snapshot, taken now, because the result is reported without waiting for delivery to finish.
     The field is omitted when nothing was counted: the model refuses an empty object, so an
@@ -713,9 +718,19 @@ def _with_observations(
         counters = pump.counters()
     except Exception:  # noqa: BLE001 - a result is never lost over its telemetry
         return result
-    if not counters:
+    update: dict[str, object] = {}
+    if counters:
+        update["observation_counters"] = counters
+    # The workload's own result, carried through untouched. The agent does not parse it and the
+    # control plane stores it opaquely; it is the workload's output, not a measurement of it.
+    if pump.result is not None:
+        update["structured_result"] = pump.result
+    if not update:
         return result
-    return result.model_copy(update={"observation_counters": counters})
+    try:
+        return result.model_copy(update=update)
+    except Exception:  # noqa: BLE001 - a result is never lost over what it was carrying
+        return result
 
 
 def _is_rejection(error: Exception) -> bool:

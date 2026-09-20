@@ -168,8 +168,12 @@ class ObservationCourier:
         if self._clock() - first_idle < RETIREMENT_SECONDS:
             return
         try:
-            spool.discard()
-        except OSError:
+            # Rechecked and removed inside one lock. Asking whether it is empty and then removing
+            # it are two moments, and a log reader can append between them.
+            if not spool.discard_if_empty(CONTROL_PLANE_SINK):
+                self._idle_since.pop(path, None)
+                return
+        except (OSError, SpoolError):
             self.failures += 1
             return
         with self._lock:

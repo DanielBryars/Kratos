@@ -188,3 +188,83 @@ def test_a_batch_whose_acknowledgement_names_another_stream_is_refused(
     assert courier.deliver_once() == 0
     assert courier.failures == 1
     assert pump.pending() is True, "an unacknowledged batch is kept"
+
+
+def test_a_restarted_agent_delivers_a_pending_spool_with_no_new_assignment(
+    tmp_path: Path,
+) -> None:
+    """The recovery case the whole design exists for, proved through the agent's own startup.
+
+    The courier used to be built only by `_build_pump`, which needs a 1.2 assignment. A worker
+    that restarted holding undelivered records and was then never given another job would have
+    kept them for ever. Constructing a courier directly in a test does not prove this; entering
+    `run()` does.
+    """
+    from kratos_agent.pump import CONTROL_PLANE_SINK as SINK
+    from kratos_agent.spool import ObservationSpool
+
+    # A previous process left records behind, bound to their stream.
+    directory = tmp_path / "observations" / str(ATTEMPT_ID)
+    orphan = ObservationSpool(directory, (SINK,))
+    orphan.record_stream(STREAM_ID)
+    orphan.append({"record": "progress", "step": 1, "at": "2026-09-20T12:00:00Z"})
+
+    client = Client()
+    runner = AgentRunner(
+        client=client,  # type: ignore[arg-type]
+        display_name="test",
+        state_path=tmp_path / "state.json",
+        enrolment_credential_path=None,
+    )
+
+    class Stop(RuntimeError):
+        pass
+
+    runner.ensure_enrolled = lambda: state()  # type: ignore[method-assign]
+
+    def no_heartbeat(_: AgentState) -> AgentState:
+        # The courier must already exist by the time the heartbeat loop is entered.
+        raise Stop
+
+    runner.step = no_heartbeat  # type: ignore[assignment,method-assign]
+
+    with pytest.raises(Stop):
+        runner.run()
+
+    courier = runner._courier
+    assert courier is not None, "the courier is built at startup, not when work arrives"
+
+    # The courier's own thread is already running and may have sent this before the
+    # assertion, so stop it and deliver explicitly. Whichever got there first, exactly
+    # one batch is sent: the second attempt finds the cursor past everything.
+    courier.stop()
+    courier.deliver_once()
+    assert client.batches, "the pending spool was delivered after a restart"
+    # The thread and this call can both send before either acknowledges. That is a replay
+    # of the same persisted batch, which the control plane answers idempotently on stream
+    # and sequence, so the test asserts what was sent rather than how many times.
+    assert set(client.batches) == {(STREAM_ID, 1, 1)}
+    assert courier.pending_paths() == []
+
+
+def test_the_workloads_own_result_is_carried_through(runner: AgentRunner) -> None:
+    """Opaque to the agent and to the control plane: the workload's output, not a measurement."""
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    summary = {"model": {"id": "lerobot/smolvla_base"}, "steps": 2000}
+    pump.ingest(Stream.STDOUT, T0, record(record="result", result=summary))
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    assert _with_observations(result, pump).structured_result == summary
+
+
+def test_a_workload_that_emits_no_result_record_sends_no_field(runner: AgentRunner) -> None:
+    """Every image predating the contract is in this case, so it must stay a 1.1-shaped result."""
+    pump = runner._build_pump(state(), assignment(stream=STREAM_ID))
+    assert pump is not None
+    pump.ingest(Stream.STDOUT, T0, '{"status": "ok"}')  # bare JSON, not a Kratos record
+
+    result = JobExecutionResult(exit_code=0, timed_out=False, stdout="", stderr="")
+    reported = _with_observations(result, pump)
+    assert reported.structured_result is None
+    assert "structured_result" not in reported.model_dump(exclude_none=True)

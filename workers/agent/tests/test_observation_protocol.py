@@ -266,3 +266,17 @@ def test_every_accepted_counter_name_passes_the_models_own_rule() -> None:
         "delivery.failures",
     ):
         assert result(observation_counters={name: 1}).observation_counters == {name: 1}
+
+
+def test_a_structured_result_larger_than_the_control_planes_bound_is_refused() -> None:
+    """64 KiB, matching MAX_STRUCTURED_RESULT_BYTES in registry.rs.
+
+    Checked here as well as there so an over-long result is reported without one rather than
+    having the whole result submission refused.
+    """
+    from kratos_agent.models import MAX_STRUCTURED_RESULT_BYTES
+
+    assert MAX_STRUCTURED_RESULT_BYTES == 65_536
+    result(structured_result={"ok": "x" * 100})
+    with pytest.raises(ValidationError):
+        result(structured_result={"too_big": "x" * (MAX_STRUCTURED_RESULT_BYTES + 1)})

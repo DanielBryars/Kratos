@@ -1,9 +1,10 @@
 """Versioned messages shared with the Kratos worker API."""
 
+import json
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -36,6 +37,9 @@ MAX_OBSERVATION_BATCH_RECORDS = 100
 MAX_OBSERVATION_BATCH_BYTES = 256 * 1024
 # The first minor version that can stream observations.
 OBSERVATION_MINOR_VERSION = 2
+# Matches MAX_STRUCTURED_RESULT_BYTES in the control plane. Checked here as well as there
+# so an over-long workload result is reported without one rather than refused outright.
+MAX_STRUCTURED_RESULT_BYTES = 65_536
 
 
 class StrictModel(BaseModel):
@@ -261,6 +265,19 @@ class JobExecutionResult(StrictModel):
     # evidence: they survive even when every observation was dropped, which is what makes a
     # gap a number an operator can read rather than silence they have to infer.
     observation_counters: dict[str, StrictInt] | None = None
+    # The workload's own last `result` record, opaque to the agent and to the control
+    # plane. Omitted when the workload emitted none, which is every image that predates
+    # the contract, so a 1.1 result is unchanged.
+    structured_result: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def the_structured_result_fits(self) -> "JobExecutionResult":
+        if self.structured_result is None:
+            return self
+        encoded = json.dumps(self.structured_result, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_STRUCTURED_RESULT_BYTES:
+            raise ValueError("structured result exceeds its size limit")
+        return self
 
     @model_validator(mode="after")
     def counters_are_present_and_countable(self) -> "JobExecutionResult":

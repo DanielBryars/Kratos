@@ -201,3 +201,26 @@ def test_many_spools_are_all_made_progress_on(tmp_path: Path, link: Link, clock:
 
     post = courier(tmp_path, link, clock)
     assert post.deliver_once() == 4
+
+
+def test_a_record_arriving_during_retirement_is_kept_and_delivered(
+    tmp_path: Path, link: Link, clock: Clock
+) -> None:
+    """The attempt's log reader can append after the last acknowledgement and before removal.
+
+    The courier now asks the spool to recheck and discard inside one lock, so the late record
+    survives and is sent. Under the earlier two-step form it was deleted having never been seen.
+    """
+    spool = make_spool(tmp_path, "attempt-h", records=2)
+    post = courier(tmp_path, link, clock)
+    post.adopt(spool, tmp_path / "attempt-h")
+
+    post.deliver_once()  # sends 1-2
+    post.deliver_once()  # nothing left; the idle wait starts
+    spool.append({"record": "progress", "step": 99, "at": "2026-09-20T12:00:00Z"})
+
+    clock.advance(120)
+    post.deliver_once()
+
+    assert (tmp_path / "attempt-h").exists(), "a spool with an unsent record is never removed"
+    assert link.sent[-1] == (STREAM_ID, 3, 1)
