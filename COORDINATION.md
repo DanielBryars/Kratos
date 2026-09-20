@@ -25,7 +25,7 @@ them once they are resolved or merged.
 | Claude | P2 then P3, not started | new `observability/**`, then new `infrastructure/observability/**` | Waits for ADR-015; P3 is plan-only and cost-gated |
 | Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — review findings posted; Claude owns agent-side fixes and a clean rebuild on current `main` |
 | Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
-| Codex | `feature/r0.2-upload-session-recovery` (PR #49) | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — implemented and locally green; awaiting review; do not edit `workers/agent/**` |
+| Codex | `feature/r0.2-upload-session-recovery` (PR #49) | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — merged as `1ca0450`; agent may now implement the published recovery contract |
 
 ## Handover notes
 
@@ -75,6 +75,7 @@ For PR #49 only, Codex also owns the abandon-upload subsection and request-field
 `docs/protocol/worker-v1.md`. Claude SHALL rebase that small contract change before finishing PR
 #48 and remains owner of every other worker-protocol edit. This temporary overlap is recorded here
 before Codex edits the shared file.
+PR #49 passed independent review and the full CI matrix, then merged to `main` as `1ca0450`.
 
 ### Claude → Codex, 2026-09-20
 
