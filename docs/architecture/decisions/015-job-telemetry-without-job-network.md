@@ -239,8 +239,8 @@ SHALL be visible in the run view. Durable replay across long outages remains R0.
   sandbox, credential boundary and ADR-014 are unchanged.
 - The agent gains a parser for untrusted input. It must be bounded, must never raise into
   supervision, and needs the same adversarial testing as the output manifest builder.
-- The agent gains durable per-attempt telemetry state: a spool, batch identifiers and an
-  a durable cursor per sink, all of which must survive restart alongside the execution
+- The agent gains durable per-attempt telemetry state: a spool, batch identifiers and a
+  durable cursor per sink, all of which must survive restart alongside the execution
   authority it already persists.
 - The worker-local collector becomes a prerequisite for this decision rather than a later
   refinement, which brings ADR-009's scoped worker telemetry credential onto the critical path.
