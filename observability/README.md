@@ -5,8 +5,24 @@ Prometheus, Loki, Tempo, an OpenTelemetry Collector gateway and MLflow — as a 
 runs on one machine. It exists so the configuration, retention and cardinality limits can be proven
 before anything is deployed to GCP. It costs nothing to run and creates no cloud resource.
 
-This is **not** the deployment. The cloud stack is a separate, cost-gated Terraform root; these
-files are its rehearsal and the source of its configuration.
+> **Local rehearsal only.** This bundle is not a deployable configuration and is not the source of
+> a cloud configuration as it stands. Its OTLP and MLflow endpoints are plaintext and
+> unauthenticated, which is safe only because every published port binds to `127.0.0.1` on a single
+> trusted machine. A cloud deployment SHALL put an authenticated edge in front of these services,
+> and nothing here resolves the scoped, revocable worker telemetry credential ADR-009 requires;
+> that decision is still open and blocks
+> [ADR-015](../docs/architecture/decisions/015-job-telemetry-without-job-network.md). Treat the
+> service configuration as a starting point to be re-reviewed against an authenticated edge, not as
+> settled.
+
+## Validate it without running it
+
+```shell
+sh observability/validate.sh
+```
+
+This checks the Compose file and every service configuration with that component's own validator,
+at the pinned digests, and fails if any image is not pinned. CI runs it on every change.
 
 ## Run it
 
@@ -40,15 +56,23 @@ read-only. MLflow's host-header middleware is left enabled and given an explicit
 preinstall is disabled, because it otherwise downloads unpinned plugins at startup.
 
 **Identity (MON-018).** `service.name` and the Kratos worker, job and attempt identifiers travel as
-OTLP resource attributes and are promoted to Prometheus labels. In Loki only `service.name` and the
-worker identifier become index labels; job and attempt stay in structured metadata, which is
-searchable without creating a stream per run.
+OTLP resource attributes. Only `service.name` and the worker identifier become Prometheus labels or
+Loki index labels: a per-run identifier as a metric label would create a new series for every
+attempt across the fleet, which no workload-label rule bounds. Job and attempt identity stays in
+Loki structured metadata and on traces, and ADR-015 carries the association onto metrics through
+exemplars instead. Prometheus also enforces sample, label-count and label-length ceilings.
 
 **Retention and cardinality (MON-019).** Prometheus keeps 15 days or 4 GB, whichever comes first,
 and accepts samples up to 30 minutes late so a worker that was offline can replay. Loki keeps 7
-days, with ingestion-rate, stream-count, label-count and line-length limits and truncation of long
-lines. Tempo keeps 72 hours with per-tenant ingestion and trace-size limits. The collector has a
-memory limiter, so exhaustion is a visible refusal rather than a kill.
+days, with ingestion-rate, stream-count, per-stream-rate, label-count and line-length limits and
+truncation of long lines. Tempo keeps 72 hours with per-tenant ingestion and trace-size limits. The
+collector has a memory limiter, so exhaustion is a visible refusal rather than a kill.
+
+Only Prometheus has an enforced **byte** ceiling. Loki, Tempo, MLflow and Grafana are bounded by
+age and by ingestion rate, which bounds how fast they can grow but not the absolute bytes on disk,
+and MLflow has no automatic cleanup at all: a run and its artefacts stay until deleted. Treat the
+figures below as a floor, watch the volumes, and do not rely on this bundle to stop filling a disk.
+Deriving real byte ceilings is part of the cloud deployment, not of this rehearsal.
 
 **Containers.** Every service runs read-only, drops all capabilities, sets `no-new-privileges`, has
 a memory limit and uses bounded local logging.
@@ -68,7 +92,7 @@ memory, with the smoke test passing:
 | OTel gateway | ~37 MiB | 512 MiB |
 
 About 1 GiB in total at idle, which is the floor for sizing the eventual VM. Storage is not
-included; the retention limits above bound it.
+included, and as noted above only Prometheus has an enforced byte ceiling.
 
 ## Notes for the cloud deployment
 

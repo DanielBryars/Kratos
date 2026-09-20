@@ -4,14 +4,14 @@ global:
   evaluation_interval: 30s
 
 otlp:
-  # Each promoted attribute becomes a label on every series from that resource. Job and attempt
-  # identifiers create new series per run, so their lifetime is bounded by the retention flags and
-  # the list is kept to the identifiers MON-018 requires.
+  # Each promoted attribute becomes a label on every series from that resource, so a per-run
+  # identifier would create a new series for every attempt across the fleet. Only stable, low
+  # cardinality identity is promoted. Run identity lives on logs, traces and MLflow, and metrics
+  # carry exemplars that reach the attempt behind a point (ADR-015).
   promote_resource_attributes:
     - service.name
     - kratos.worker.id
-    - kratos.job.id
-    - kratos.attempt.id
+  keep_identifying_resource_attributes: true
   translation_strategy: UnderscoreEscapingWithSuffixes
 
 storage:
@@ -23,3 +23,8 @@ scrape_configs:
   - job_name: prometheus
     static_configs:
       - targets: [localhost:9090]
+    # A ceiling on how much this instance will hold, whatever is sent to it (MON-019).
+    sample_limit: 50000
+    label_limit: 24
+    label_name_length_limit: 128
+    label_value_length_limit: 512
