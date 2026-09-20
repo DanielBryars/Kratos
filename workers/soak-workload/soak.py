@@ -11,7 +11,7 @@ import signal
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import perf_counter
 from types import FrameType
@@ -44,6 +44,9 @@ OUTPUT_LIMIT_BYTES = 16 * 1024
 RESULT_RESERVE_BYTES = 4 * 1024
 PROGRESS_RECORD_LIMIT_BYTES = 512
 EXIT_INTERRUPTED = 128 + signal.SIGTERM
+# The agent allows a short grace between SIGTERM and SIGKILL, so no single start-up phase may take
+# anything like that long; the driver probe is a subprocess and is bounded tightly.
+DRIVER_PROBE_TIMEOUT_SECONDS = 3
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,10 @@ def encode_record(payload: dict[str, Any]) -> str:
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+class StopRequested(Exception):
+    """Abandon start-up because termination was requested before the soak loop began."""
+
+
 class StopRequest:
     """Remember a termination signal so the soak loop can finish its record and exit."""
 
@@ -165,6 +172,11 @@ class StopRequest:
     def install(self) -> None:
         # The workload is PID 1 in its container, where SIGTERM is ignored unless handled.
         signal.signal(signal.SIGTERM, self._handle)
+
+    def check(self) -> None:
+        """Give up at a start-up phase boundary when a stop has already been requested."""
+        if self.requested:
+            raise StopRequested
 
     def _handle(self, signal_number: int, _frame: FrameType | None) -> None:
         self.signal_name = signal.Signals(signal_number).name
@@ -202,16 +214,20 @@ class CudaTrainingWorkload:
     never simply memorise its data and the loss stays meaningful for the whole soak.
     """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, stop: StopRequest) -> None:
         self._device = device
         self._generator = torch.Generator(device=device)
         self._generator.manual_seed(SEED)
+        # Allocating the teacher and moving the model are separate multi-second phases on a cold
+        # device, so a stop request is honoured between them rather than at the first training step.
         self._teacher = self._randn(FEATURES, CLASSES)
-        self._model = Classifier().to(device)
         if not self._teacher.is_cuda:
             raise RuntimeError("soak data was not placed on CUDA; CPU fallback is disabled")
+        stop.check()
+        self._model = Classifier().to(device)
         if not all(parameter.is_cuda for parameter in self._model.parameters()):
             raise RuntimeError("model was not placed on CUDA; CPU fallback is disabled")
+        stop.check()
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=LEARNING_RATE)
         self._loss_function = nn.CrossEntropyLoss()
         self._last_loss: Tensor | None = None
@@ -264,14 +280,18 @@ def require_cuda() -> torch.device:
 
 
 def query_driver_version() -> str | None:
-    """Ask the NVIDIA driver for its version; report nothing rather than guess when it fails."""
+    """Ask the NVIDIA driver for its version; report nothing rather than guess when it fails.
+
+    The probe is a subprocess that cannot be interrupted by the workload's own signal handler, so a
+    tight timeout keeps a wedged `nvidia-smi` from holding up a stop request.
+    """
     try:
         completed = subprocess.run(
             ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
             capture_output=True,
             check=True,
             text=True,
-            timeout=10,
+            timeout=DRIVER_PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -364,7 +384,8 @@ def result_record(
     started_at: datetime,
     finished_at: datetime,
     environment: dict[str, Any],
-    peak_gpu_memory_bytes: int,
+    peak_gpu_memory_bytes: int | None,
+    deterministic_algorithms: bool = True,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "record": "result",
@@ -388,7 +409,7 @@ def result_record(
                 f"Linear({FEATURES},{HIDDEN})-Tanh-Linear({HIDDEN},{HIDDEN})-Tanh-"
                 f"Linear({HIDDEN},{CLASSES})"
             ),
-            "deterministic_algorithms": True,
+            "deterministic_algorithms": deterministic_algorithms,
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
             "cpu_fallback": False,
         },
@@ -423,31 +444,91 @@ def _rounded(value: float | None) -> float | None:
     return None if value is None else round(value, 6)
 
 
-def describe_environment(device: torch.device) -> dict[str, Any]:
-    properties = torch.cuda.get_device_properties(device)
+def describe_runtime() -> dict[str, Any]:
+    """Describe what is known before any device is touched; none of this can block."""
     return {
         "python": platform.python_version(),
         "platform": platform.platform()[:128],
         "pytorch": torch.__version__,
         "cuda_runtime": torch.version.cuda,
-        "nvidia_driver": query_driver_version(),
+    }
+
+
+def describe_gpu(device: torch.device) -> dict[str, Any]:
+    properties = torch.cuda.get_device_properties(device)
+    return {
         "gpu_name": properties.name,
         "gpu_compute_capability": f"{properties.major}.{properties.minor}",
     }
 
 
+@dataclass
+class SetupFacts:
+    """What start-up has established so far.
+
+    A stop during start-up reports these and nothing else: whatever had not been observed by then
+    is absent from the result rather than guessed at.
+    """
+
+    environment: dict[str, Any] = field(default_factory=dict)
+    deterministic_algorithms: bool = False
+    device: torch.device | None = None
+
+    def peak_gpu_memory_bytes(self) -> int | None:
+        """Report peak device memory, or nothing when no device was ever selected."""
+        if self.device is None:
+            return None
+        return int(torch.cuda.max_memory_allocated(self.device))
+
+
+def prepare_workload(stop: StopRequest, facts: SetupFacts) -> Workload:
+    """Bring the GPU up one phase at a time, giving up at the first phase boundary after a stop.
+
+    The driver probe, CUDA initialisation and the first device allocation each take seconds and
+    none of them can be abandoned part way through, so the termination flag is checked between
+    every phase instead of only once the soak loop starts.
+    """
+    facts.environment.update(describe_runtime())
+    stop.check()
+    # The driver is queried before the clock starts so a stop request is never delayed by it.
+    facts.environment["nvidia_driver"] = query_driver_version()
+    stop.check()
+    configure_determinism()
+    facts.deterministic_algorithms = True
+    stop.check()
+    facts.device = require_cuda()
+    facts.environment.update(describe_gpu(facts.device))
+    stop.check()
+    return CudaTrainingWorkload(facts.device, stop)
+
+
+def interrupted_during_setup(stop: StopRequest) -> SoakOutcome:
+    """Describe a run stopped before the loop began: no step ran, so no measurement is claimed."""
+    return SoakOutcome(
+        status="interrupted",
+        signal_name=stop.signal_name,
+        steps_completed=0,
+        elapsed_seconds=0.0,
+        initial_loss=None,
+        final_loss=None,
+    )
+
+
 def run_soak(budget: OutputBudget, stop: StopRequest) -> dict[str, Any]:
     run_identity = load_run_identity()
     duration = load_duration()
-    configure_determinism()
-    device = require_cuda()
-    # The driver is queried before the clock starts so a stop request is never delayed by it.
-    environment = describe_environment(device)
-    workload = CudaTrainingWorkload(device)
-
-    started_at = datetime.now(UTC)
-    outcome = soak_loop(workload, run_identity, duration, stop, budget)
-    finished_at = datetime.now(UTC)
+    facts = SetupFacts()
+    setup_started_at = datetime.now(UTC)
+    try:
+        workload = prepare_workload(stop, facts)
+    except StopRequested:
+        # Start-up never reached the loop, so the run began when start-up did.
+        outcome = interrupted_during_setup(stop)
+        started_at, finished_at = setup_started_at, datetime.now(UTC)
+    else:
+        started_at = datetime.now(UTC)
+        outcome = soak_loop(workload, run_identity, duration, stop, budget)
+        finished_at = datetime.now(UTC)
     return result_record(
         run_identity,
         duration,
@@ -455,8 +536,9 @@ def run_soak(budget: OutputBudget, stop: StopRequest) -> dict[str, Any]:
         budget,
         started_at,
         finished_at,
-        environment,
-        peak_gpu_memory_bytes=int(torch.cuda.max_memory_allocated(device)),
+        facts.environment,
+        peak_gpu_memory_bytes=facts.peak_gpu_memory_bytes(),
+        deterministic_algorithms=facts.deterministic_algorithms,
     )
 
 

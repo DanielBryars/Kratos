@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import signal
 import subprocess
 from collections.abc import Iterator
@@ -44,6 +45,47 @@ class FakeWorkload:
 
     def loss(self) -> float:
         return 1.0 / self.steps
+
+
+SETUP_PHASES = ("duration", "driver", "determinism", "device", "gpu", "workload")
+
+
+class FakeSetup:
+    """Stands in for every start-up phase so start-up can be driven without a GPU.
+
+    The named phase raises SIGTERM as it runs, standing in for the agent withdrawing execution
+    authority while that phase blocks; the phase still completes, as a real one would, so the stop
+    is honoured at the checkpoint that follows it.
+    """
+
+    def __init__(self, interrupt_during: str | None = None) -> None:
+        self.interrupt_during = interrupt_during
+        self.phases_run: list[str] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        duration = soak.SoakDuration(seconds=soak.DEFAULT_DURATION_SECONDS, source="image-default")
+        gpu = {"gpu_name": "test double", "gpu_compute_capability": "12.0"}
+        monkeypatch.setattr(soak, "load_duration", lambda: self.phase("duration", duration))
+        monkeypatch.setattr(soak, "query_driver_version", lambda: self.phase("driver", "580.65.06"))
+        monkeypatch.setattr(soak, "configure_determinism", lambda: self.phase("determinism", None))
+        monkeypatch.setattr(soak, "require_cuda", lambda: self.phase("device", torch.device("cpu")))
+        monkeypatch.setattr(soak, "describe_gpu", lambda _device: self.phase("gpu", gpu))
+        monkeypatch.setattr(soak, "CudaTrainingWorkload", self.build_workload)
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 4096)
+
+    def phase[T](self, name: str, value: T) -> T:
+        self.phases_run.append(name)
+        if name == self.interrupt_during:
+            signal.raise_signal(signal.SIGTERM)
+        return value
+
+    def build_workload(self, _device: torch.device, stop: soak.StopRequest) -> soak.Workload:
+        self.phase("workload", None)
+        stop.check()
+        return FakeWorkload(seconds_per_step=0.0625)
+
+    def reached(self, phase: str) -> bool:
+        return phase in self.phases_run
 
 
 class Lines:
@@ -305,6 +347,85 @@ def test_a_stop_requested_before_the_loop_completes_no_steps() -> None:
     assert outcome.initial_loss is None
     assert outcome.final_loss is None
     assert soak.throughput(0, 0.0) == {"value": 0.0, "unit": "steps/s"}
+
+
+@pytest.mark.parametrize("interrupted_phase", SETUP_PHASES)
+def test_sigterm_during_start_up_still_reports_a_single_interrupted_result(
+    interrupted_phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    restore_sigterm: None,
+) -> None:
+    setup = FakeSetup(interrupt_during=interrupted_phase)
+    setup.install(monkeypatch)
+    for name, value in ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+    assert soak.main() == soak.EXIT_INTERRUPTED
+
+    expected = SETUP_PHASES[: SETUP_PHASES.index(interrupted_phase) + 1]
+    if interrupted_phase == "device":
+        # Describing the GPU costs nothing once it is selected, so it shares that checkpoint.
+        expected += ("gpu",)
+    assert setup.phases_run == list(expected)
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    result = json.loads(lines[0])
+    assert result["record"] == "result"
+    assert result["status"] == "interrupted"
+    assert result["signal"] == "SIGTERM"
+    assert result["run"] == RUN
+    assert result["cpu_fallback"] is False
+    assert result["configuration"]["configured_duration_seconds"] == 600
+    assert result["metrics"]["steps_completed"] == 0
+    assert result["metrics"]["actual_duration_seconds"] == 0.0
+    assert result["metrics"]["throughput"] == {"value": 0.0, "unit": "steps/s"}
+    # Nothing start-up had not yet observed may appear in the record.
+    assert result["metrics"]["initial_train_loss"] is None
+    assert result["metrics"]["final_train_loss"] is None
+    assert result["environment"]["python"] == platform.python_version()
+    assert ("nvidia_driver" in result["environment"]) is setup.reached("driver")
+    assert ("gpu_name" in result["environment"]) is setup.reached("gpu")
+    assert result["configuration"]["deterministic_algorithms"] is setup.reached("determinism")
+    assert (result["metrics"]["peak_gpu_memory_bytes"] is None) is not setup.reached("device")
+
+
+def test_a_start_up_phase_is_only_abandoned_once_a_stop_has_been_requested() -> None:
+    stop = soak.StopRequest()
+
+    stop.check()
+
+    stop.signal_name = "SIGTERM"
+    with pytest.raises(soak.StopRequested):
+        stop.check()
+
+
+def test_a_hanging_driver_probe_neither_blocks_nor_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    restore_sigterm: None,
+) -> None:
+    probe = soak.query_driver_version
+    recorded: dict[str, Any] = {}
+
+    def wedged(*_args: object, **kwargs: Any) -> None:
+        recorded.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=kwargs["timeout"])
+
+    setup = FakeSetup(interrupt_during="device")
+    setup.install(monkeypatch)
+    monkeypatch.setattr(soak, "query_driver_version", probe)
+    monkeypatch.setattr(subprocess, "run", wedged)
+    for name, value in ENVIRONMENT.items():
+        monkeypatch.setenv(name, value)
+
+    assert soak.main() == soak.EXIT_INTERRUPTED
+
+    assert recorded["timeout"] == soak.DRIVER_PROBE_TIMEOUT_SECONDS
+    assert soak.DRIVER_PROBE_TIMEOUT_SECONDS <= 5
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "interrupted"
+    assert result["environment"]["nvidia_driver"] is None
 
 
 def test_result_record_reports_provenance_without_claiming_determinism() -> None:

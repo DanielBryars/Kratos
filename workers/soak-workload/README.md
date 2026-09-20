@@ -56,8 +56,23 @@ the result states plainly that these values are not claimed to be reproducible.
 
 On `SIGTERM` the workload stops within a few training steps, prints a `result` record with status
 `interrupted` describing what had been completed, and exits with code 143. It exits 0 only when the
-full duration has elapsed, and 1 on any failure. The handler is installed once Python and PyTorch
-have loaded; a signal in the first few seconds of start-up is left to Docker's stop timeout.
+full duration has elapsed, and 1 on any failure.
+
+Start-up is treated the same way. The driver probe, CUDA initialisation, device selection and the
+construction of the model and optimiser each take seconds and none can be abandoned part way
+through, so the termination flag is checked between every one of them. A stop during start-up still
+prints exactly one `interrupted` result record and exits 143. That record carries only what
+start-up had actually established: whatever was not yet known, such as the GPU name or the driver
+version, is absent rather than guessed, no loss or throughput is claimed for a run that completed
+no steps, and `deterministic_algorithms` is `false` when the stop arrived before determinism was
+configured. The `nvidia-smi` probe is bounded by a three second timeout so a wedged driver cannot
+hold up a stop; on timeout the driver is reported as `null` and the run continues.
+
+Two windows remain. A `SIGTERM` that arrives before the interpreter has installed the handler — the
+few seconds Python and PyTorch take to load — is ignored, because the workload is PID 1 in its
+container, and the stop falls back to the agent's SIGKILL. A `SIGTERM` that arrives inside a
+start-up call that cannot be interrupted is acted upon only when that call returns, so an unusually
+slow CUDA initialisation can still outlast the agent's grace period.
 
 Nothing is written to the filesystem, so the workload runs under the worker sandbox: no network, a
 read-only root filesystem, all capabilities dropped and a non-root user.
