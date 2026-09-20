@@ -12,6 +12,7 @@ malformed line or a broken spool can do is lose diagnostic data and leave a numb
 
 import json
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -209,6 +210,48 @@ class ObservationPump:
             # the `dropped.` namespace where it would read as loss.
             counters[FAILURE_COUNTER] = self._failures
         return counters
+
+
+class DeliveryThread:
+    """Runs a pump's deliveries on its own thread.
+
+    Delivery is not called from the supervision tick on purpose. A batch request has a
+    fifteen-second timeout and the tick is what drives heartbeats, so a slow control plane would
+    delay a heartbeat by up to that much and could cost the worker its lease. The same rule that
+    keeps a result from waiting on telemetry applies one layer down.
+    """
+
+    def __init__(
+        self,
+        pump: ObservationPump,
+        *,
+        poll_seconds: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._pump = pump
+        self._poll = poll_seconds
+        self._sleep = sleep
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="kratos-observations", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._pump.deliver()
+            self._sleep(self._poll)
+
+    def stop(self) -> None:
+        """Ask the thread to finish, and do not wait for it.
+
+        Nothing about a result waits on telemetry, including this. The thread is a daemon, and
+        anything still unsent stays in the spool for the agent to deliver later.
+        """
+        self._stop.set()
 
 
 def _wire_record(observation: Observation) -> dict[str, object]:

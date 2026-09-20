@@ -30,6 +30,7 @@ from kratos_agent.models import (
     JobExecutionResult,
     WorkerCapabilities,
 )
+from kratos_agent.observations import ObservationCollector
 from kratos_agent.outputs import (
     OutputError,
     VerifiedOutput,
@@ -38,6 +39,8 @@ from kratos_agent.outputs import (
     discard_tree,
 )
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
+from kratos_agent.pump import CONTROL_PLANE_SINK, DeliveryThread, ObservationPump, batch_records
+from kratos_agent.spool import Batch, ObservationSpool
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 from kratos_agent.uploads import UploadConflict, UploadError, upload_object
 
@@ -241,6 +244,55 @@ class AgentRunner:
         if assignment is not None:
             updated = self._run_assignment(updated, assignment)
         return updated
+
+    def _observation_directory(self, attempt_id: UUID) -> Path:
+        return self._state_path.parent / "observations" / str(attempt_id)
+
+    def _build_pump(
+        self, state: AgentState, assignment: JobAssignment
+    ) -> tuple[ObservationPump | None, DeliveryThread | None]:
+        """Create the pump for this attempt, or decline when there is nowhere to send.
+
+        No stream means the control plane did not allocate one, which is how it addresses an
+        agent below protocol 1.2 and how it behaves before its own side is deployed. Collecting
+        observations with nowhere to put them would fill the state volume for nothing.
+        """
+        stream_id = assignment.observation_stream_id
+        worker_id, credential = state.worker_id, state.worker_credential
+        if stream_id is None or worker_id is None or credential is None:
+            return None, None
+        try:
+            spool = ObservationSpool(
+                self._observation_directory(assignment.attempt_id), (CONTROL_PLANE_SINK,)
+            )
+        except Exception as error:  # noqa: BLE001 - telemetry never stops a job starting
+            print(json.dumps({"status": "observations_unavailable", "detail": str(error)}))
+            return None, None
+
+        def send(batch: Batch) -> int:
+            response = self._client.submit_observation_batch(
+                worker_id,
+                credential,
+                stream_id,
+                batch.batch_id,
+                batch.first_sequence,
+                batch_records(batch),
+            )
+            if response.stream_id != stream_id or response.batch_id != batch.batch_id:
+                raise ControlPlaneError(
+                    200, "invalid_response", "observation acknowledgement is inconsistent"
+                )
+            return response.accepted_through_sequence
+
+        pump = ObservationPump(
+            spool=spool,
+            collector=ObservationCollector(clock=time.monotonic),
+            send=send,
+            clock=time.monotonic,
+        )
+        delivery = DeliveryThread(pump)
+        delivery.start()
+        return pump, delivery
 
     def _attempt_directory_for(self, attempt_id: UUID) -> Path:
         return self._state_path.parent / ATTEMPT_DIRECTORY / str(attempt_id)
@@ -446,6 +498,7 @@ class AgentRunner:
             )
         result = None
         authorised = True
+        pump, delivery = self._build_pump(state, assignment)
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
             # The pull can take minutes for a multi-gigabyte image, so it heartbeats too.
             pull_state = [state]
@@ -464,7 +517,13 @@ class AgentRunner:
                 )
                 save_state(self._state_path, state)
         if result is None:
-            state, result, authorised = self._supervise(state, assignment, may_start=not resuming)
+            state, result, authorised = self._supervise(
+                state, assignment, may_start=not resuming, pump=pump
+            )
+        result = _with_observations(result, pump)
+        if delivery is not None:
+            # Signalled, not waited on. Anything unsent stays in the spool.
+            delivery.stop()
         succeeded = result.exit_code == 0 and not result.timed_out and not result.failure_message
         if assignment.output_requirements and authorised and succeeded:
             # Only a successful result is gated on verified outputs. A failed or timed-out
@@ -493,7 +552,12 @@ class AgentRunner:
         return state
 
     def _supervise(
-        self, state: AgentState, assignment: JobAssignment, *, may_start: bool
+        self,
+        state: AgentState,
+        assignment: JobAssignment,
+        *,
+        may_start: bool,
+        pump: ObservationPump | None = None,
     ) -> tuple[AgentState, JobExecutionResult, bool]:
         """Run the attempt's container to the end of its authority, heartbeating meanwhile."""
         if self._executor is None:
@@ -520,6 +584,7 @@ class AgentRunner:
             may_start=may_start,
             on_tick=still_authorised,
             tick_seconds=state.heartbeat_interval_seconds,
+            observe=None if pump is None else pump.ingest,
         )
         return state, result, authorised
 
@@ -600,6 +665,26 @@ def _manifest_id(attempt_id: UUID) -> UUID:
 
 def _is_transient(error: ControlPlaneError) -> bool:
     return error.status_code == 429 or error.status_code >= 500
+
+
+def _with_observations(
+    result: JobExecutionResult, pump: "ObservationPump | None"
+) -> JobExecutionResult:
+    """Put the observation counters on the result, if there are any.
+
+    A snapshot, taken now, because the result is reported without waiting for delivery to finish.
+    The field is omitted when nothing was counted: the model refuses an empty object, so an
+    absent field and "nothing happened" are the same thing rather than two.
+    """
+    if pump is None:
+        return result
+    try:
+        counters = pump.counters()
+    except Exception:  # noqa: BLE001 - a result is never lost over its telemetry
+        return result
+    if not counters:
+        return result
+    return result.model_copy(update={"observation_counters": counters})
 
 
 def _is_rejection(error: Exception) -> bool:
