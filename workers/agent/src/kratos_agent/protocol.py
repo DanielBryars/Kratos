@@ -182,8 +182,9 @@ class WorkerProtocolClient:
         """Deliver one contiguous batch, addressed by the stream the control plane allocated.
 
         The batch identifier comes from the caller rather than being minted here, because it was
-        written down before the first attempt to send: an exact replay has to carry the identity
-        it carried the first time, or the control plane answers 409 instead of acknowledging.
+        written down before the first attempt to send. Idempotency is on stream and sequence, so
+        identical content replays safely whatever the identifier; sending the original keeps the
+        resend identical by construction and leaves the audit trail intact.
         """
         request = SubmitObservationBatchRequest(
             protocol_version=PROTOCOL_VERSION,

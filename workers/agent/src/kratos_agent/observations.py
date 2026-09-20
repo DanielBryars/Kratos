@@ -77,9 +77,12 @@ class Kind(Enum):
 class Drop(Enum):
     """Why a line was not delivered, in the names the control plane persists unchanged.
 
-    Two namespaces, and the difference is the point. `dropped.` means the agent refused the line
-    and nobody will ever see it. `not_exported.` means the line was kept and delivered, but one
-    sink did not take it, which is not a loss and should not read as one on a run view.
+    Two namespaces, and the difference is the point. `dropped.` means the line was rejected from
+    its intended forwarding path by a limit or a validation rule here; it does not promise the
+    line is gone everywhere, since a malformed record is rejected as a record and still forwarded
+    as a log. `not_exported.` means the line was intentionally not sent to one named sink, because
+    of policy or configuration rather than any fault in it, and makes no stronger promise about
+    any other sink. Neither should read as loss on a run view without that distinction.
 
     The names are deliberately coarser than the checks that produce them: an operator asking
     "what did I lose" is served by `dropped.rate`, and which bucket ran out is a detail of this
@@ -95,7 +98,8 @@ class Drop(Enum):
     METRIC_NAME_NOT_ALLOWED = "not_exported.metric_name_not_allowed"
     # A log line with no collector configured for this attempt. ADR-015 would have it wait behind
     # an OTLP cursor; with no OTLP sink that cursor is fictional, so the line is counted here
-    # instead. It is not a delivery gap, because no sink was ever configured to take it.
+    # instead. It is not a delivery gap, because no sink was configured to take it -- but nor does
+    # it reach anything else beyond the bounded stdout capture the result already carries.
     OTLP_UNCONFIGURED = "not_exported.otlp_unconfigured"
 
 

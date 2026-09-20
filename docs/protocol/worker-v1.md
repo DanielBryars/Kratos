@@ -369,16 +369,22 @@ number was lost or never existed.
 A batch SHALL contain at least one and at most **100** records, and its encoded body SHALL be at
 most **256 KiB**.
 
-### Replay, and why the batch identifier is the agent's
+### Replay
 
-Submission SHALL be idempotent on stream and sequence. An **exact** replay of a batch SHALL return
-the same acknowledgement and change nothing. A reused `batch_id` or sequence carrying **different**
-content SHALL be refused with 409.
+Submission SHALL be idempotent on **stream and sequence**, not on the batch identifier. A replay of
+the same sequences with byte-identical record content SHALL succeed and acknowledge the existing
+high-water mark, **including under a new `batch_id`**. An agent that loses its memory of a batch and
+rebuilds an identical one is therefore safe.
 
-The agent SHALL therefore persist a batch and its sequence range before sending it, and SHALL
-resend that same identifier after a restart. A batch rebuilt from the agent's records after a crash
-would carry the same sequences under a new identifier, which is precisely the case the 409 exists
-to catch, so replay would fail exactly when it is most needed.
+The control plane SHALL refuse with 409 in exactly two cases: a `batch_id` reused with different
+content, and an existing sequence presented with different content. Both mean the same number now
+names something else, which no acknowledgement can express.
+
+An agent SHOULD persist a batch and its sequence range before sending it, and SHOULD resend that
+same identifier after a restart. That is not what makes replay safe — identical content is — but it
+keeps the audit trail intact, and it avoids the case that a 409 does catch: a batch rebuilt from
+whatever records happen to be available after a restart can split the stream differently, and
+presenting an already-accepted sequence inside a differently-shaped batch is a content change.
 
 ### Delivery never blocks execution
 
@@ -398,9 +404,15 @@ A job result MAY carry `observation_counters`, an object of dotted name to non-n
 omitted entirely when nothing was counted. The control plane SHALL persist the object unchanged as
 execution evidence.
 
-Two namespaces, and the difference matters on a run view. `dropped.` is a line nobody will ever
-see. `not_exported.` is a line that was kept and delivered, but that one sink did not take, which
-is not a loss and SHALL NOT be presented as one.
+Two namespaces, and the difference matters on a run view.
+
+**`dropped.`** means the line was rejected from its intended forwarding path by an agent limit or a
+validation rule. It does not mean the line is gone everywhere: a malformed record is rejected as a
+record and still forwarded as a log line.
+
+**`not_exported.`** means the line was intentionally not sent to the named sink, because of policy
+or configuration rather than any fault in it. It makes no stronger promise about any other sink,
+and SHALL NOT be presented as loss.
 
 | Counter | Meaning |
 |---|---|
@@ -410,7 +422,7 @@ is not a loss and SHALL NOT be presented as one.
 | `dropped.budget` | Refused by the attempt's total forwarded-byte budget |
 | `dropped.name_limit` | A new metric or parameter name beyond the per-attempt cap |
 | `not_exported.metric_name_not_allowed` | Delivered to the control plane, and so to MLflow, but kept off the OpenTelemetry metric path |
-| `not_exported.otlp_unconfigured` | A log line for an attempt with no collector configured |
+| `not_exported.otlp_unconfigured` | A log line for an attempt with no collector configured; it reaches nothing beyond the existing bounded stdout capture |
 
 Counters are execution evidence: they SHALL accompany the result even when every observation was
 dropped, so a gap is a number an operator can read rather than silence they have to infer. A

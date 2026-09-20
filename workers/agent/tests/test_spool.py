@@ -154,10 +154,12 @@ def test_a_reopened_spool_resumes_where_it_stopped(root: Path) -> None:
 
 
 def test_an_inflight_batch_is_resent_with_the_same_identity(root: Path) -> None:
-    """The point of writing the batch down: a restart must replay, not invent a new batch.
+    """A restart resends the batch it had, rather than assembling a new one.
 
-    Rebuilding from the records after a crash would produce the same sequences under a new batch
-    id, which the control plane answers with a 409 rather than the idempotent acknowledgement.
+    A new identifier alone would be harmless, because the control plane is idempotent on stream
+    and sequence. What this prevents is the batch being rebuilt with a different shape from
+    whatever records are present after the restart, because presenting an already-accepted
+    sequence inside a differently-shaped batch is a content change, and that is a 409.
     """
     store = spool(root)
     fill(store, 4)

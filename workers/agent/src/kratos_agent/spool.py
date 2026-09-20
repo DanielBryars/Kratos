@@ -14,10 +14,12 @@ reportable rather than merely absent.
 different times and fail independently. One mark either advances past records a sink never received
 or replays records another already holds; there is no single number that is correct for both.
 
-**A batch is written down before it is sent.** An acknowledgement that arrives after a crash is
-worthless if the agent cannot say what it sent, and a batch rebuilt from scratch after a restart
-would carry the same sequences with a different identity, which the control plane answers with a
-409. So the in-flight batch is durable, and a restart resends exactly what it sent before.
+**A batch is written down before it is sent.** Not because a new identifier would be refused --
+the control plane is idempotent on stream and sequence, so an identical batch replays safely under
+any identifier -- but because a batch rebuilt from whatever records happen to be present after a
+restart can split the stream differently. Presenting an already-accepted sequence inside a
+differently-shaped batch is a content change, and that is what earns a 409. Writing the batch down
+makes the resend identical by construction, and keeps the audit trail intact.
 
 The spool is bounded. When it fills, the oldest records a sink has not yet taken are discarded
 first, and the discarded range is remembered as a gap for that sink, because ADR-015 requires loss
