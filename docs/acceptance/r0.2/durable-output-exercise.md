@@ -1,7 +1,7 @@
 # Durable training output exercise
 
-**Status:** Prepared; execution is blocked until the protocol 1.1 worker upload loop is merged and
-deployed.
+**Status:** Control-plane prerequisites are deployed; execution is blocked until the protocol 1.1
+worker upload loop is merged and deployed.
 
 This exercise proves that a real CUDA training job can stage a model checkpoint on a worker, upload
 it directly to private Cloud Storage, and expose independently verified storage evidence without
@@ -18,6 +18,24 @@ giving the workload network access or a cloud credential.
 
 The exercise MUST NOT start while the worker still advertises protocol 1.0. The scheduler is
 expected to leave an output job queued in that state.
+
+## Worker upgrade checkpoint
+
+The existing THESHED2 enrolment SHALL be upgraded in place. The replacement SHALL remove only the
+`kratos-agent` container and SHALL preserve the `kratos-agent-state` Docker volume. Before the
+replacement, the operator SHALL verify that the volume exists and retain the current immutable
+agent digest as the rollback target. The replacement SHALL reuse the same display name, control
+plane, state volume and immutable GPU health-check image. If the new container does not reconnect
+under the existing worker identity, the operator SHALL restore the rollback digest with the same
+arguments; the state volume SHALL NOT be deleted or recreated.
+
+| Upgrade input | Recorded value |
+|---|---|
+| Container | `kratos-agent` |
+| Worker | `THESHED2` |
+| State volume | `kratos-agent-state` |
+| Rollback agent digest | `sha256:6b47ca98310f9278dc4df7f6295298ade41c66db6aab119fb765a4b5a68d1312` |
+| Health-check digest | `sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9` |
 
 ## Procedure
 
@@ -50,7 +68,7 @@ expected to leave an output job queued in that state.
 
 | Item | Value |
 |---|---|
-| Control-plane revision | Pending live run |
+| Control-plane revision | `1ca045014b4b0d4da38dd45012ba81c1432cd39a` |
 | Worker image digest | Pending protocol 1.1 release |
 | Training image digest | `sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31` |
 | Job ID | Pending live run |
@@ -60,6 +78,12 @@ expected to leave an output job queued in that state.
 | Declared SHA-256 / CRC32C | Pending live run |
 | Verified SHA-256 / CRC32C | Pending live run |
 | Result | Pending live run |
+
+The deployment workflow for control-plane revision `1ca0450` completed successfully. Live
+`/healthz` and `/readyz` checks returned `ok`, the database reported `ready`, and the published
+OpenAPI document included the authenticated protocol 1.1 `abandon-upload` operation with its two
+required request fields. This proves the server recovery prerequisite is deployed; it is not a
+substitute for the end-to-end workload evidence above.
 
 Local preflight on an NVIDIA GeForce RTX 5090 completed successfully before publication. The
 container ran with no network and a read-only root filesystem, wrote a 3,081-byte `model.pt` through
