@@ -138,6 +138,12 @@ stderr and exit status. This lets a restarted agent report the same attempt inst
 starting it twice. The agent removes the container after acknowledgement. The Docker socket therefore
 remains an explicit host-administrative trust boundary.
 
+The agent heartbeats while it pulls a job's image. A cold multi-gigabyte pull takes minutes on
+a home link, and without this the worker sends nothing for all of it: it reads `stale` and then
+`offline` exactly as a job begins, and cannot observe a cancellation until the pull ends. If the
+control plane stops holding the attempt during the pull, the agent abandons it before any
+container is created.
+
 The agent records each attempt in its state volume before creating the container, so a missing
 container is reported as a failure rather than run again. It stops a container at the earlier of its
 runtime bound and lease deadline without needing the control plane. Losing the control plane, or a

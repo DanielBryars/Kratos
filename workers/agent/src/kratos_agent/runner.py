@@ -17,6 +17,7 @@ from docker.errors import DockerException
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import (
     ATTEMPT_DIRECTORY,
+    AuthorityLost,
     CleanupError,
     DockerExecutor,
     EnforcementError,
@@ -446,7 +447,14 @@ class AgentRunner:
         result = None
         authorised = True
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
-            result = self._executor.prepare_job(assignment)
+            # The pull can take minutes for a multi-gigabyte image, so it heartbeats too.
+            pull_state = [state]
+            result = self._executor.prepare_job(
+                assignment,
+                still_authorised=self._delivery_tick(pull_state, assignment),
+                tick_seconds=state.heartbeat_interval_seconds,
+            )
+            state = pull_state[0]
             if result is None:
                 if assignment.output_requirements:
                     # Docker needs the subpath to exist before it creates the container.
@@ -535,6 +543,7 @@ class AgentRunner:
             state = self._clear_retained(state)
             return self.heartbeat_once(state)
         except (
+            AuthorityLost,
             CapabilityCollectionError,
             CleanupError,
             DockerException,
