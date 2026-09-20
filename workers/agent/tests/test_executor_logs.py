@@ -158,8 +158,8 @@ def test_a_final_line_without_a_newline_still_arrives() -> None:
 def test_output_buffered_until_container_exit_is_drained_after_result() -> None:
     """A short job may exit before Docker yields its first buffered log chunk.
 
-    Reporting the result must not wait for telemetry, but it also must not tell the daemon reader
-    to discard that finite stream. The reader owns the drain and may finish just after the result.
+    Reporting the result must not wait for telemetry. When the reader has delivered nothing, the
+    completed static capture is reconciled synchronously and the late streaming chunk is ignored.
     """
 
     release = threading.Event()
@@ -176,7 +176,7 @@ def test_output_buffered_until_container_exit_is_drained_after_result() -> None:
 
         def logs(self, **options: Any) -> Any:
             if not options.get("stream"):
-                return b"captured\n"
+                return b"buffered until exit\n" if options.get("stdout") else b""
 
             def after_exit() -> Any:
                 assert self.exited.wait(timeout=1)
@@ -201,9 +201,12 @@ def test_output_buffered_until_container_exit_is_drained_after_result() -> None:
     result = executor.run_job(assignment(), tick_seconds=1, observe=observe)
 
     assert result.exit_code == 0
-    assert not delivered.is_set()
+    assert delivered.is_set()
+    assert [(stream, text) for stream, _, text in seen] == [(Stream.STDOUT, "buffered until exit")]
     release.set()
-    assert delivered.wait(timeout=1)
+    # The delayed stream gets a chance to produce the same line, but sealing prevents a duplicate.
+    assert container.exited.wait(timeout=1)
+    threading.Event().wait(0.01)
     assert [(stream, text) for stream, _, text in seen] == [(Stream.STDOUT, "buffered until exit")]
 
 

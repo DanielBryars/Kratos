@@ -74,6 +74,40 @@ KILL_RETRY_SECONDS = 1.0
 ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 
+class _LogReader:
+    """Own the asynchronous reader and reconcile a wholly delayed stream exactly once."""
+
+    def __init__(self, observe: LogObserver, clock: Callable[[], datetime]) -> None:
+        self._observe = observe
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._delivered = 0
+        self._sealed = False
+
+    def observe(self, stream: Stream, at: datetime, text: str) -> None:
+        with self._lock:
+            if self._sealed:
+                return
+            self._delivered += 1
+        self._observe(stream, at, text)
+
+    def reconcile_if_empty(self, stdout: str, stderr: str) -> None:
+        """Use the already captured result logs only if the reader delivered no lines.
+
+        Docker may not yield the first buffered streaming chunk until after a short container has
+        exited. The result path already captures both completed streams synchronously; using that
+        evidence closes the zero-line race without waiting for telemetry. Sealing first makes a
+        later streaming chunk a no-op instead of a duplicate observation.
+        """
+        with self._lock:
+            if self._delivered or self._sealed:
+                return
+            self._sealed = True
+        for stream, captured in ((Stream.STDOUT, stdout), (Stream.STDERR, stderr)):
+            for line in captured.splitlines():
+                self._observe(stream, self._clock(), line)
+
+
 class ExecutorError(RuntimeError):
     """The local container executor could not produce trustworthy evidence."""
 
@@ -308,7 +342,7 @@ class DockerExecutor:
             observed_start = _state_time(container, "StartedAt")
             resumed = False
 
-        self._start_log_reader(container, observe, resumed=resumed)
+        log_reader = self._start_log_reader(container, observe, resumed=resumed)
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
@@ -364,12 +398,14 @@ class DockerExecutor:
                 )
         stdout = self._bounded_log(container, stdout=True, stderr=False)
         stderr = self._bounded_log(container, stdout=False, stderr=True)
+        if log_reader is not None:
+            log_reader.reconcile_if_empty(stdout, stderr)
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
-        # The reader is deliberately left to drain Docker's finite log stream on its daemon
-        # thread. The result goes now without waiting for it. Asking it to stop here used to race
-        # a short-lived container: Docker could yield the first buffered chunk after supervision
-        # observed the exit, at which point the stop flag discarded every line the job wrote.
+        # The reader is deliberately never joined: the result path cannot wait on telemetry. When
+        # it has delivered nothing, the completed captures above are reconciled first and the
+        # reader is sealed; otherwise it keeps draining Docker's finite stream on its daemon
+        # thread. Both paths avoid duplicates and the zero-line short-container race.
         # Both or neither: an interval with one end missing is not evidence.
         whole = observed_start is not None and observed_finish is not None
         return JobExecutionResult(
@@ -488,7 +524,7 @@ class DockerExecutor:
         observe: "LogObserver | None",
         *,
         resumed: bool,
-    ) -> None:
+    ) -> _LogReader | None:
         """Follow the container's output on its own thread, or decline to.
 
         A resumed container is deliberately **not** followed. Docker replays a container's log
@@ -498,17 +534,19 @@ class DockerExecutor:
         telemetry for a resumed attempt is the lesser fault, and it is counted rather than silent.
         """
         if observe is None:
-            return
+            return None
         if resumed:
             observe(Stream.STDERR, self._clock(), _RESUMED_NOTICE)
-            return
+            return None
+        reader = _LogReader(observe, self._clock)
         thread = threading.Thread(
             target=self._follow_logs,
-            args=(container, observe),
+            args=(container, reader.observe),
             name="kratos-log-reader",
             daemon=True,
         )
         thread.start()
+        return reader
 
     def _follow_logs(self, container: Any, observe: "LogObserver") -> None:
         """Read until Docker closes the exited container's finite log stream. Never raises."""
