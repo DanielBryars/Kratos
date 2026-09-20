@@ -151,3 +151,47 @@ variable "enable_mlflow_database" {
   type        = bool
   default     = false
 }
+
+
+variable "billing_account" {
+  description = <<-EOT
+    Billing account that pays for this stack, as the bare identifier such as "012345-6789AB-CDEF01".
+    Required when enable_budget is true. Find it with `gcloud billing projects describe PROJECT
+    --format='value(billingAccountName)'`.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "enable_budget" {
+  description = <<-EOT
+    Create a billing budget covering this project. On by default: a stack that bills continuously
+    should not do so unwatched. It raises alerts; it does not stop spending. See the README.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "monthly_budget" {
+  description = <<-EOT
+    Budget amount per month, in the billing account's own currency, so it is pounds on a sterling
+    account and dollars on a US one. Alerts fire at half, ninety per cent and the whole amount, and
+    again when spend is forecast to exceed it.
+  EOT
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.monthly_budget > 0
+    error_message = "A budget of zero would alert immediately and tell you nothing."
+  }
+}
+
+variable "budget_alert_emails" {
+  description = <<-EOT
+    Extra addresses to notify. Billing administrators and the account owner are notified anyway, so
+    this can stay empty.
+  EOT
+  type        = list(string)
+  default     = []
+}

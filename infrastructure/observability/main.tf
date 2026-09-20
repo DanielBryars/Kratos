@@ -52,11 +52,64 @@ locals {
   ) : ""
 }
 
+# The budget is deliberately not behind enable_observability: it should exist before, and outlive,
+# anything that spends. Terraform refuses to plan an enabled stack without one.
+resource "terraform_data" "budget_required" {
+  count = local.enabled
+
+  lifecycle {
+    precondition {
+      condition = !var.enable_budget || var.billing_account != ""
+      error_message = join(" ", [
+        "enable_budget is true but billing_account is empty, so no budget would be created.",
+        "Supply the billing account, or set enable_budget=false to accept unwatched spend.",
+      ])
+    }
+  }
+}
+
+resource "google_billing_budget" "observability" {
+  count = var.enable_budget && var.billing_account != "" ? 1 : 0
+
+  billing_account = var.billing_account
+  display_name    = "Kratos ${var.project_id}"
+
+  budget_filter {
+    projects = ["projects/${var.project_id}"]
+  }
+
+  amount {
+    specified_amount {
+      # No currency_code: the budget then uses the billing account's own currency.
+      units = tostring(var.monthly_budget)
+    }
+  }
+
+  dynamic "threshold_rules" {
+    for_each = [0.5, 0.9, 1.0]
+    content {
+      threshold_percent = threshold_rules.value
+    }
+  }
+
+  # Tells you before it happens, not only after.
+  threshold_rules {
+    threshold_percent = 1.0
+    spend_basis       = "FORECASTED_SPEND"
+  }
+
+  all_updates_rule {
+    monitoring_notification_channels = []
+    disable_default_iam_recipients   = false
+  }
+}
+
 resource "google_project_service" "observability" {
   for_each = var.enable_observability ? toset([
     "compute.googleapis.com",
     "iap.googleapis.com",
     "oslogin.googleapis.com",
+    "billingbudgets.googleapis.com",
   ]) : toset([])
 
   project            = var.project_id

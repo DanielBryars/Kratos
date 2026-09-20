@@ -156,6 +156,7 @@ terraform -chdir=infrastructure/observability apply \
   -var project_id=YOUR_PROJECT \
   -var domain_name=kratos.bryars.com \
   -var 'iap_member=user:you@example.com' \
+  -var billing_account=012345-6789AB-CDEF01 \
   -var enable_observability=true \
   -var oauth_client_id=YOUR_CLIENT_ID
 ```
