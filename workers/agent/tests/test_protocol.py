@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import stat
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -216,13 +217,26 @@ class FakeJobExecutor(DockerExecutor):
         self.prepared: list[UUID] = []
         self.runs: list[tuple[UUID, bool]] = []
         self.removed: list[UUID] = []
+        self.ticks = 0
+        self.authorised: list[bool] = []
+        self.tick_seconds: float | None = None
 
     def prepare_job(self, assignment: JobAssignment) -> JobExecutionResult | None:
         self.prepared.append(assignment.attempt_id)
         return None
 
-    def run_job(self, assignment: JobAssignment, *, may_start: bool = True) -> JobExecutionResult:
+    def run_job(
+        self,
+        assignment: JobAssignment,
+        *,
+        may_start: bool = True,
+        on_tick: Callable[[], bool] | None = None,
+        tick_seconds: float = 30,
+    ) -> JobExecutionResult:
         self.runs.append((assignment.attempt_id, may_start))
+        self.tick_seconds = tick_seconds
+        if on_tick is not None:
+            self.authorised = [on_tick() for _ in range(self.ticks)]
         return JobExecutionResult(
             exit_code=0, timed_out=False, stdout="done\n", stderr="", failure_message=None
         )
@@ -312,12 +326,19 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
 
     class LinkDropsDuringJob(FakeJobExecutor):
         def run_job(
-            self, assignment: JobAssignment, *, may_start: bool = True
+            self,
+            assignment: JobAssignment,
+            *,
+            may_start: bool = True,
+            on_tick: Callable[[], bool] | None = None,
+            tick_seconds: float = 30,
         ) -> JobExecutionResult:
             nonlocal link_up
             if may_start:
                 link_up = False
-            return super().run_job(assignment, may_start=may_start)
+            return super().run_job(
+                assignment, may_start=may_start, on_tick=on_tick, tick_seconds=tick_seconds
+            )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if not link_up:
@@ -330,6 +351,7 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
     state_path = tmp_path / "agent.json"
     state = enrolled_state(state_path)
     executor = LinkDropsDuringJob()
+    executor.ticks = 2
     with WorkerProtocolClient(
         "https://control.example", transport=httpx.MockTransport(handler)
     ) as client:
@@ -350,6 +372,7 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
 
     assert executor.prepared == [ATTEMPT_ID]
     assert executor.runs == [(ATTEMPT_ID, True), (ATTEMPT_ID, False)]
+    assert executor.authorised == [True, True]
     assert len(delivered) == 1
     assert executor.removed == [ATTEMPT_ID]
     assert state.started_attempt_id is None
@@ -427,3 +450,73 @@ def test_state_without_an_attempt_journal_remains_readable(tmp_path: Path) -> No
     assert state is not None
     assert state.next_sequence == 7
     assert state.started_attempt_id is None
+
+
+def test_worker_keeps_heartbeating_while_its_job_runs(tmp_path: Path) -> None:
+    sequences: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            sequences.append(json.loads(request.content)["sequence"])
+            return heartbeat_response(request, assigned=True)
+        return result_acknowledgement()
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = FakeJobExecutor()
+    executor.ticks = 2
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        updated = job_runner(client, state_path, executor).step(state)
+
+    assert sequences == [0, 1, 2]
+    assert executor.authorised == [True, True]
+    assert executor.tick_seconds == 30
+    assert executor.runs == [(ATTEMPT_ID, True)]
+    assert updated.next_sequence == 3
+    assert updated.started_attempt_id is None
+    assert load_state(state_path) == updated
+
+
+def test_attempt_closed_by_the_control_plane_withdraws_authority(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/heartbeat"):
+            first = json.loads(request.content)["sequence"] == 0
+            return heartbeat_response(request, assigned=first)
+        return result_acknowledgement()
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = FakeJobExecutor()
+    executor.ticks = 1
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        job_runner(client, state_path, executor).step(state)
+
+    assert executor.authorised == [False]
+
+
+@pytest.mark.parametrize(("status_code", "authorised"), [(401, False), (409, False), (503, True)])
+def test_only_an_explicit_rejection_withdraws_authority_mid_job(
+    tmp_path: Path, status_code: int, authorised: bool
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/heartbeat"):
+            return result_acknowledgement()
+        if json.loads(request.content)["sequence"] == 0:
+            return heartbeat_response(request, assigned=True)
+        return httpx.Response(status_code, json={"code": "refused", "message": "refused"})
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = FakeJobExecutor()
+    executor.ticks = 1
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        updated = job_runner(client, state_path, executor).step(state)
+
+    assert executor.authorised == [authorised]
+    assert updated.next_sequence == 1

@@ -121,40 +121,65 @@ def test_invalid_output_is_rejected_and_container_removed() -> None:
     assert container.removed is True
 
 
+T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = T0
+        self.slept: list[float] = []
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += timedelta(seconds=seconds)
+
+
 class JobContainer:
     def __init__(
         self,
+        clock: FakeClock,
         *,
         status: str = "running",
         exit_code: int = 0,
         started_at: datetime | None = None,
-        finished_at: datetime | None = None,
-        exits: bool = True,
+        exits_at: datetime | None = None,
     ) -> None:
+        self.clock = clock
         self.status = status
         self.exit_code = exit_code
-        self.exits = exits
-        self.wait_timeouts: list[int] = []
+        self.started_at = started_at
+        self.exits_at = exits_at
         self.stopped = False
+        self.attrs: dict[str, Any] = {}
+        self._publish()
+
+    def _publish(self) -> None:
+        exited = self.status == "exited"
         self.attrs = {
             "State": {
-                "StartedAt": _docker_time(started_at),
-                "FinishedAt": _docker_time(finished_at),
+                "StartedAt": _docker_time(self.started_at),
+                "FinishedAt": _docker_time(self.exits_at if exited else None),
             }
         }
 
-    def wait(self, timeout: int) -> dict[str, int]:
-        self.wait_timeouts.append(timeout)
-        if not self.exits:
-            raise TimeoutError("container is still running")
-        return {"StatusCode": self.exit_code}
-
     def reload(self) -> None:
-        return None
+        if self.status == "created":
+            self.status = "running"
+        if self.exits_at is not None and self.clock.now >= self.exits_at:
+            self.status = "exited"
+        self._publish()
+
+    def wait(self, timeout: int) -> dict[str, int]:
+        assert self.status == "exited"
+        return {"StatusCode": self.exit_code}
 
     def stop(self, *, timeout: int) -> None:
         assert timeout == 10
         self.stopped = True
+        self.status = "exited"
 
     def logs(self, *, stdout: bool, stderr: bool) -> bytes:
         return b"completed\n" if stdout else b""
@@ -166,9 +191,10 @@ def _docker_time(value: datetime | None) -> str:
 
 
 class JobContainers:
-    def __init__(self, existing: JobContainer | None = None) -> None:
+    def __init__(self, clock: FakeClock, existing: JobContainer | None = None) -> None:
         self.existing = existing
-        self.container = JobContainer()
+        # docker-py returns a freshly run container with the status it had when created.
+        self.container = JobContainer(clock, status="created", exits_at=T0 + timedelta(seconds=5))
         self.options: dict[str, Any] | None = None
         self.start_error: Exception | None = None
 
@@ -196,8 +222,8 @@ class JobImages:
 
 
 class JobClient:
-    def __init__(self, existing: JobContainer | None = None) -> None:
-        self.containers = JobContainers(existing)
+    def __init__(self, clock: FakeClock, existing: JobContainer | None = None) -> None:
+        self.containers = JobContainers(clock, existing)
         self.images = JobImages()
 
 
@@ -212,14 +238,19 @@ def job_assignment(*, lease: timedelta = timedelta(minutes=5)) -> JobAssignment:
         image_reference=JOB_IMAGE,
         gpu_index=0,
         timeout_seconds=120,
-        lease_expires_at=datetime.now(UTC) + lease,
+        lease_expires_at=T0 + lease,
     )
+
+
+def job_executor(clock: FakeClock, client: JobClient) -> DockerExecutor:
+    return DockerExecutor(client, clock=clock, sleep=clock.sleep)
 
 
 def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
     assignment = job_assignment()
-    client = JobClient()
-    executor = DockerExecutor(client)
+    clock = FakeClock()
+    client = JobClient(clock)
+    executor = job_executor(clock, client)
 
     assert executor.prepare_job(assignment) is None
     result = executor.run_job(assignment)
@@ -227,7 +258,7 @@ def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
     assert result.exit_code == 0
     assert result.stdout == "completed\n"
     assert client.images.pulled == [JOB_IMAGE]
-    assert client.containers.container.wait_timeouts == [120]
+    assert clock.now == T0 + timedelta(seconds=5)
     options = client.containers.options
     assert options is not None
     assert options["name"] == f"kratos-job-{assignment.attempt_id}"
@@ -247,10 +278,11 @@ def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
 
 
 def test_image_absent_from_registry_is_a_terminal_failure() -> None:
-    client = JobClient()
+    clock = FakeClock()
+    client = JobClient(clock)
     client.images.pull_error = docker.errors.NotFound("manifest unknown")
 
-    result = DockerExecutor(client).prepare_job(job_assignment())
+    result = job_executor(clock, client).prepare_job(job_assignment())
 
     assert result is not None
     assert result.exit_code == 125
@@ -258,26 +290,28 @@ def test_image_absent_from_registry_is_a_terminal_failure() -> None:
 
 
 def test_registry_outage_is_left_for_the_caller_to_retry() -> None:
-    client = JobClient()
+    clock = FakeClock()
+    client = JobClient(clock)
     client.images.pull_error = docker.errors.APIError("registry unreachable")
 
     with pytest.raises(docker.errors.APIError):
-        DockerExecutor(client).prepare_job(job_assignment())
+        job_executor(clock, client).prepare_job(job_assignment())
 
 
 def test_exited_container_is_reported_not_restarted_after_lease_expiry() -> None:
     # A result withheld by a network outage: the work finished inside its lease, but the
     # worker could only reach the control plane after the lease had passed.
-    now = datetime.now(UTC)
+    clock = FakeClock()
     existing = JobContainer(
+        clock,
         status="exited",
-        started_at=now - timedelta(minutes=10),
-        finished_at=now - timedelta(minutes=9),
+        started_at=T0 - timedelta(minutes=10),
+        exits_at=T0 - timedelta(minutes=9),
     )
-    client = JobClient(existing)
+    client = JobClient(clock, existing)
     assignment = job_assignment(lease=timedelta(minutes=-5))
 
-    result = DockerExecutor(client).run_job(assignment, may_start=False)
+    result = job_executor(clock, client).run_job(assignment, may_start=False)
 
     assert (result.exit_code, result.timed_out, result.failure_message) == (0, False, None)
     assert result.stdout == "completed\n"
@@ -286,9 +320,10 @@ def test_exited_container_is_reported_not_restarted_after_lease_expiry() -> None
 
 
 def test_missing_container_is_never_started_twice() -> None:
-    client = JobClient()
+    clock = FakeClock()
+    client = JobClient(clock)
 
-    result = DockerExecutor(client).run_job(job_assignment(), may_start=False)
+    result = job_executor(clock, client).run_job(job_assignment(), may_start=False)
 
     assert result.exit_code == 125
     assert result.failure_message is not None
@@ -297,9 +332,10 @@ def test_missing_container_is_never_started_twice() -> None:
 
 
 def test_expired_lease_does_not_start_a_container() -> None:
-    client = JobClient()
+    clock = FakeClock()
+    client = JobClient(clock)
 
-    result = DockerExecutor(client).run_job(job_assignment(lease=timedelta(seconds=-1)))
+    result = job_executor(clock, client).run_job(job_assignment(lease=timedelta(seconds=-1)))
 
     assert (result.exit_code, result.timed_out) == (124, True)
     assert result.failure_message == "assignment lease expired before execution"
@@ -307,57 +343,117 @@ def test_expired_lease_does_not_start_a_container() -> None:
 
 
 def test_resumed_container_is_stopped_when_its_lease_expires() -> None:
-    existing = JobContainer(started_at=datetime.now(UTC) - timedelta(seconds=10), exits=False)
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=10))
     assignment = job_assignment(lease=timedelta(seconds=20))
 
-    result = DockerExecutor(JobClient(existing)).run_job(assignment, may_start=False)
+    result = job_executor(clock, JobClient(clock, existing)).run_job(assignment, may_start=False)
 
-    assert existing.wait_timeouts == [20]
+    assert clock.now == T0 + timedelta(seconds=20)
     assert existing.stopped is True
     assert (result.exit_code, result.timed_out) == (124, True)
     assert result.failure_message == "assignment lease expired during execution"
 
 
 def test_resumed_container_keeps_its_original_runtime_bound() -> None:
-    existing = JobContainer(started_at=datetime.now(UTC) - timedelta(seconds=100), exits=False)
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0 - timedelta(seconds=100))
 
-    result = DockerExecutor(JobClient(existing)).run_job(job_assignment(), may_start=False)
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
 
-    assert existing.wait_timeouts == [20]
+    assert clock.now == T0 + timedelta(seconds=20)
     assert existing.stopped is True
     assert result.failure_message == "execution exceeded 120 seconds"
 
 
 def test_unsupervised_overrun_is_not_reported_as_success() -> None:
-    now = datetime.now(UTC)
+    clock = FakeClock()
     existing = JobContainer(
+        clock,
         status="exited",
-        started_at=now - timedelta(minutes=30),
-        finished_at=now - timedelta(minutes=1),
+        started_at=T0 - timedelta(minutes=30),
+        exits_at=T0 - timedelta(minutes=1),
     )
 
-    result = DockerExecutor(JobClient(existing)).run_job(job_assignment(), may_start=False)
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
 
     assert (result.exit_code, result.timed_out) == (124, True)
     assert result.failure_message == "execution continued beyond its authority while unsupervised"
 
 
 def test_container_that_never_started_is_a_failure() -> None:
-    existing = JobContainer(status="created")
+    clock = FakeClock()
+    existing = JobContainer(clock, status="created")
 
-    result = DockerExecutor(JobClient(existing)).run_job(job_assignment(), may_start=False)
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False
+    )
 
     assert result.exit_code == 125
     assert result.failure_message == "job container was created but never started"
-    assert existing.wait_timeouts == []
+    assert clock.slept == []
 
 
 def test_container_start_failure_is_reported() -> None:
-    client = JobClient()
+    clock = FakeClock()
+    client = JobClient(clock)
     client.containers.start_error = docker.errors.APIError("could not select device driver")
 
-    result = DockerExecutor(client).run_job(job_assignment())
+    result = job_executor(clock, client).run_job(job_assignment())
 
     assert result.exit_code == 125
     assert result.failure_message is not None
     assert result.failure_message.startswith("job container could not be started")
+
+
+def test_heartbeats_continue_while_the_container_runs() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0, exits_at=T0 + timedelta(seconds=100))
+    ticks: list[datetime] = []
+
+    def on_tick() -> bool:
+        ticks.append(clock.now)
+        return True
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False, on_tick=on_tick, tick_seconds=30
+    )
+
+    assert ticks == [T0 + timedelta(seconds=seconds) for seconds in (30, 60, 90)]
+    assert (result.exit_code, result.timed_out, result.failure_message) == (0, False, None)
+    assert existing.stopped is False
+
+
+def test_container_is_stopped_when_the_control_plane_closes_its_attempt() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0)
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False, on_tick=lambda: False, tick_seconds=30
+    )
+
+    assert clock.now == T0 + timedelta(seconds=30)
+    assert existing.stopped is True
+    assert (result.exit_code, result.timed_out) == (125, False)
+    assert result.failure_message == "control plane no longer holds this attempt"
+
+
+def test_slow_heartbeat_does_not_extend_the_runtime_bound() -> None:
+    clock = FakeClock()
+    existing = JobContainer(clock, started_at=T0)
+
+    def slow_tick() -> bool:
+        clock.now += timedelta(seconds=15)
+        return True
+
+    result = job_executor(clock, JobClient(clock, existing)).run_job(
+        job_assignment(), may_start=False, on_tick=slow_tick, tick_seconds=30
+    )
+
+    assert existing.stopped is True
+    assert result.failure_message == "execution exceeded 120 seconds"
+    assert clock.now <= T0 + timedelta(seconds=120 + 15)

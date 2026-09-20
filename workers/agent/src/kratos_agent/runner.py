@@ -16,7 +16,7 @@ from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import JobAssignment, WorkerCapabilities
+from kratos_agent.models import HeartbeatResponse, JobAssignment, WorkerCapabilities
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 
@@ -152,7 +152,7 @@ class AgentRunner:
         save_state(self._state_path, state)
         return state
 
-    def heartbeat_once(self, state: AgentState) -> AgentState:
+    def _exchange_heartbeat(self, state: AgentState) -> tuple[AgentState, HeartbeatResponse]:
         if state.worker_id is None or state.worker_credential is None:
             raise ValueError("worker is not enrolled")
         capabilities = self._collect()
@@ -175,6 +175,10 @@ class AgentRunner:
             heartbeat_interval_seconds=response.next_heartbeat_seconds,
         )
         save_state(self._state_path, updated)
+        return updated, response
+
+    def heartbeat_once(self, state: AgentState) -> AgentState:
+        updated, response = self._exchange_heartbeat(state)
         assignment = response.assignment
         stale_attempt_id = updated.started_attempt_id
         if (
@@ -204,8 +208,26 @@ class AgentRunner:
             if result is None:
                 state = replace(state, started_attempt_id=assignment.attempt_id)
                 save_state(self._state_path, state)
+
+        def still_authorised() -> bool:
+            """Heartbeat while the container runs; an outage never interrupts the workload."""
+            nonlocal state
+            try:
+                state, response = self._exchange_heartbeat(state)
+            except (ControlPlaneError, httpx.TransportError) as error:
+                print(json.dumps({"status": "retrying", "detail": str(error)}), flush=True)
+                state = load_state(self._state_path) or state
+                return not _is_rejection(error)
+            held = response.assignment
+            return held is not None and held.attempt_id == assignment.attempt_id
+
         if result is None:
-            result = self._executor.run_job(assignment, may_start=not resuming)
+            result = self._executor.run_job(
+                assignment,
+                may_start=not resuming,
+                on_tick=still_authorised,
+                tick_seconds=state.heartbeat_interval_seconds,
+            )
         acknowledgement = self._client.report_job_result(
             worker_id, worker_credential, assignment.attempt_id, result
         )
@@ -241,6 +263,15 @@ class AgentRunner:
 
 def _is_transient(error: ControlPlaneError) -> bool:
     return error.status_code == 429 or error.status_code >= 500
+
+
+def _is_rejection(error: Exception) -> bool:
+    """Whether the control plane explicitly refused this worker, rather than being unreachable."""
+    return (
+        isinstance(error, ControlPlaneError)
+        and 400 <= error.status_code < 500
+        and error.status_code != 429
+    )
 
 
 def _encode(value: bytes) -> str:

@@ -185,10 +185,16 @@ rejection, including `401`, remains fatal. When a heartbeat response no longer c
 attempt, the control plane has closed it: the agent SHALL remove that container, running or not,
 and clear its record.
 
+The agent SHALL continue heartbeats at the normal interval while it supervises a container, so a
+busy worker's displayed connectivity reflects its link rather than its workload. A heartbeat that
+fails for a temporary reason SHALL NOT interrupt the workload. A valid heartbeat response that no
+longer carries the attempt, or an explicit `4xx` rejection other than `429`, withdraws the
+attempt's authority: the agent SHALL stop the container and report the failure. A malformed
+response SHALL NOT be treated as a withdrawal.
+
 Known limitations of this slice: the lease deadline is compared with the worker's clock, so worker
-clock error shifts the local bound; and the agent sends no heartbeat while it supervises a
-container, so a busy worker is displayed as `stale` and then `offline` for a job longer than the
-connectivity thresholds even when its link is healthy.
+clock error shifts the local bound; and a heartbeat in progress can delay enforcement of a bound
+by up to the fifteen-second request timeout.
 
 The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
 `PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be
