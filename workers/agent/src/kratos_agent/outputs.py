@@ -4,7 +4,7 @@ import base64
 import hashlib
 import os
 import stat
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,11 +20,24 @@ from kratos_agent.models import (
     valid_logical_path,
 )
 
+# Output collection depends on descriptor-relative access that Windows does not provide. The agent
+# always runs in the Linux execution environment (ADR-007), so these are resolved once here rather
+# than typed for a platform where the collector refuses to run.
+_O_DIRECTORY: int = getattr(os, "O_DIRECTORY", 0)
+_O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK: int = getattr(os, "O_NONBLOCK", 0)
+_O_CLOEXEC: int = getattr(os, "O_CLOEXEC", 0)
+_fchmod: Callable[[int, int], None] | None = getattr(os, "fchmod", None)
+
 MAX_INSPECTED_ENTRIES = 10_000
 READ_CHUNK_BYTES = 1024 * 1024
 SEALED_FILE_MODE = 0o400
 SEALED_DIRECTORY_MODE = 0o500
-DESCRIPTOR_WALK_SUPPORTED = os.open in os.supports_dir_fd and os.scandir in os.supports_fd
+DESCRIPTOR_WALK_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+    and bool(_O_DIRECTORY and _O_NOFOLLOW)
+)
 
 
 class OutputError(RuntimeError):
@@ -77,7 +90,8 @@ def build_manifest(
 ) -> tuple[VerifiedOutput, ...]:
     """Describe every declared output beneath ``outputs_dir``.
 
-    The caller SHALL invoke this only after the job container has stopped. The tree is walked
+    The caller SHALL invoke this only after the job container has stopped, which is what makes
+    the tree quiescent; the agent may not own what a job image wrote. The tree is walked
     through directory descriptors opened without following symbolic links, so replacing an
     inspected directory or file cannot redirect the walk outside the tree. Each visited directory
     and file is made read-only, and a file is rejected if anything about it changes while it is
@@ -115,12 +129,12 @@ def build_manifest(
 def _open_directory(name: str, parent: int | None, shown: str) -> Iterator[int]:
     try:
         descriptor = os.open(
-            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent
+            name, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_CLOEXEC, dir_fd=parent
         )
     except OSError as error:
         raise OutputError(f"{shown} could not be opened as a directory") from error
     try:
-        os.fchmod(descriptor, SEALED_DIRECTORY_MODE)
+        _seal(descriptor, SEALED_DIRECTORY_MODE)
         yield descriptor
     finally:
         os.close(descriptor)
@@ -160,7 +174,7 @@ def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> V
         # O_NONBLOCK keeps a file that was swapped for a named pipe from blocking the open.
         descriptor = os.open(
             name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
             dir_fd=directory,
         )
     except OSError as error:
@@ -168,7 +182,7 @@ def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> V
     with os.fdopen(descriptor, "rb") as stream:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OutputError(f"output {_shown(logical_path)} is not a regular file")
-        os.fchmod(descriptor, SEALED_FILE_MODE)
+        _seal(descriptor, SEALED_FILE_MODE)
         identity = OutputIdentity.of(os.fstat(descriptor))
         if identity.link_count > 1:
             raise OutputError(f"output {_shown(logical_path)} has more than one hard link")
@@ -193,6 +207,22 @@ def _describe(name: str, directory: int, logical_path: str, max_bytes: int) -> V
         ),
         identity=identity,
     )
+
+
+def _seal(descriptor: int, mode: int) -> None:
+    """Make an output read-only while it is inspected, where this agent is allowed to.
+
+    A job image may write its outputs as any user, so the agent often does not own them and cannot
+    change their mode. Sealing is therefore defence in depth, not the guarantee: correctness rests
+    on the container being stopped before collection and on each file's recorded identity being
+    re-checked after it has been read.
+    """
+    if _fchmod is None:
+        return
+    try:
+        _fchmod(descriptor, mode)
+    except OSError:
+        return
 
 
 def _shown(logical_path: str) -> str:

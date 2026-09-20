@@ -157,7 +157,9 @@ tree if it finds a symbolic link, a hard-link alias, a device, socket or named p
 control plane would reject, an undeclared file, a file above its declared size, or a missing
 mandatory output.
 
-Each visited directory and file is made read-only, and a file whose device, inode, size, link count
+Each visited directory and file is made read-only where this agent is permitted to, which it often
+is not, because a job image may write its outputs as any user. Sealing is therefore defence in
+depth rather than the guarantee. A file whose device, inode, size, link count
 or modification or change time differs after hashing is rejected. The builder returns that identity
 with every manifest entry. The uploader SHALL re-check it on the descriptor it sends, or hash again
 immediately before transfer, so the uploaded bytes cannot differ from the manifest.

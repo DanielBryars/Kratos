@@ -10,8 +10,12 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from kratos_agent import outputs
 from kratos_agent.models import JobAssignment, JobOutputRequirement, valid_logical_path
 from kratos_agent.outputs import DESCRIPTOR_WALK_SUPPORTED, OutputError, build_manifest
+
+# os.mkfifo does not exist on Windows, where the collector refuses to run anyway.
+_mkfifo: Callable[[str], None] | None = getattr(os, "mkfifo", None)
 
 needs_descriptor_walk = pytest.mark.skipif(
     not DESCRIPTOR_WALK_SUPPORTED,
@@ -135,9 +139,10 @@ def test_hard_link_alias_is_rejected(tmp_path: Path) -> None:
         build_manifest(outputs, [requirement("model.pt")])
 
 
-@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="named pipes require a POSIX host")
+@pytest.mark.skipif(_mkfifo is None, reason="named pipes require a POSIX host")
 def test_named_pipe_is_rejected_without_being_opened(tmp_path: Path) -> None:
-    os.mkfifo(tmp_path / "model.pt")
+    assert _mkfifo is not None
+    _mkfifo(str(tmp_path / "model.pt"))
 
     with pytest.raises(OutputError, match="'model.pt' is not a regular file"):
         build_manifest(tmp_path, [requirement("model.pt")])
@@ -191,6 +196,24 @@ def test_outputs_are_sealed_and_identified_for_the_uploader(tmp_path: Path) -> N
     assert status.st_mode & 0o777 == 0o400
     assert path.parent.stat().st_mode & 0o777 == 0o500
     path.parent.chmod(0o700)
+
+
+@needs_descriptor_walk
+def test_output_this_agent_may_not_seal_is_still_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A job image may write its outputs as another user, so the agent cannot chmod them.
+    write(tmp_path, "model.pt", b"123456789")
+
+    def refuse(descriptor: int, mode: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(outputs, "_fchmod", refuse)
+
+    (output,) = build_manifest(tmp_path, [requirement("model.pt")])
+
+    assert output.file.crc32c == "4waSgw=="
+    assert output.identity.byte_length == 9
 
 
 @contextmanager
@@ -267,7 +290,8 @@ def test_file_swapped_for_a_named_pipe_neither_blocks_nor_passes(
     def swap() -> None:
         tmp_path.chmod(0o700)  # the walk has already sealed the parent
         (tmp_path / "model.pt").unlink()
-        os.mkfifo(tmp_path / "model.pt")
+        assert _mkfifo is not None
+        _mkfifo(str(tmp_path / "model.pt"))
 
     with (
         swapped_before_open(monkeypatch, "model.pt", swap),
