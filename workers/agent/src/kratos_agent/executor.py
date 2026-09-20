@@ -39,6 +39,27 @@ ATTEMPT_DIRECTORY = "attempts"
 # A little above the classifier's own bound, so a line truncated here is still over that
 # bound once its timestamp prefix is removed and is refused rather than silently shortened.
 LOG_LINE_BOUND_BYTES = MAX_LINE_BYTES + 128
+# ADR-015 requires a bounded, non-blocking local log driver, and both halves matter for a
+# different reason.
+#
+# Bounded, because a workload that prints without restraint would otherwise fill the host disk,
+# and the disk it fills is the one holding the agent's own state and every attempt's outputs. Two
+# files of 10 MiB is a cap of 20 MiB per container, which is generous for text and small enough
+# that a runaway job cannot take the worker down with it.
+#
+# Non-blocking, because the default driver applies back pressure: when the logging pipe is full
+# the container's write blocks, so a slow or stuck reader would stall the workload itself. That
+# would make telemetry able to halt execution, which is the one thing ADR-015 forbids outright. A
+# full buffer drops lines instead, and a dropped line is a diagnostic gap rather than a hung job.
+JOB_LOG_CONFIG = {
+    "type": "json-file",
+    "config": {
+        "max-size": "10m",
+        "max-file": "3",
+        "mode": "non-blocking",
+        "max-buffer-size": "4m",
+    },
+}
 # Volume subpath mounts require Docker Engine 26 or later.
 MINIMUM_SUBPATH_ENGINE_MAJOR = 26
 # Cleanup runs a known image, not the workload's: an arbitrary image need not contain a
@@ -258,6 +279,7 @@ class DockerExecutor:
                     nano_cpus=4_000_000_000,
                     pids_limit=512,
                     tmpfs={"/tmp": "rw,noexec,nosuid,size=1g"},
+                    log_config=JOB_LOG_CONFIG,
                     mounts=self._output_mounts(assignment),
                     environment={
                         "KRATOS_JOB_ID": job_id,

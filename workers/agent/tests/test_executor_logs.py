@@ -195,3 +195,34 @@ def test_no_observer_means_no_log_stream_at_all() -> None:
     )
     executor.run_job(assignment(), tick_seconds=1)
     assert container.streamed is False
+
+
+# --- The log driver -------------------------------------------------------------------------
+
+
+def test_a_job_container_gets_a_bounded_non_blocking_log_driver() -> None:
+    """Both halves of this matter, and for different reasons.
+
+    Bounded, so a workload printing without restraint cannot fill the disk holding the agent's
+    own state and every attempt's outputs. Non-blocking, because the default driver applies back
+    pressure: a full logging pipe blocks the container's write, so a slow reader would stall the
+    workload. That would let telemetry halt execution, which ADR-015 forbids outright.
+    """
+    clock = Clock()
+    container = Container(clock, [])
+    containers = Containers(container, existing=False)
+    captured: dict[str, Any] = {}
+
+    def run(_: str, **options: Any) -> Container:
+        captured.update(options)
+        return container
+
+    containers.run = run  # type: ignore[method-assign]
+    executor = DockerExecutor(Client(containers), clock=clock, sleep=clock.sleep)
+    executor.run_job(assignment(), tick_seconds=1)
+
+    config = captured["log_config"]
+    assert config["type"] == "json-file"
+    assert config["config"]["mode"] == "non-blocking"
+    assert config["config"]["max-size"] == "10m"
+    assert config["config"]["max-file"] == "3"
