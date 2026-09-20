@@ -16,6 +16,7 @@ Status distinguishes a selected direction from a recommendation still under disc
 | PostgreSQL-backed first job queue | Accepted | [ADR-013](decisions/013-postgresql-first-job-queue.md) |
 | Cloud Storage job artefacts and scoped resumable upload | Accepted for R0.2 | [ADR-014](decisions/014-gcs-job-artefact-transfer.md) |
 | Self-hosted Grafana stack, OpenTelemetry and MLflow | Accepted | [ADR-009](decisions/009-observability-and-mlflow.md) |
+| Job telemetry and MLflow records without job networking | Proposed | [ADR-015](decisions/015-job-telemetry-without-job-network.md) |
 | SkyPilot as a later cloud-capacity provider | Accepted | [ADR-010](decisions/010-skypilot-boundary.md) |
 | Cloud SQL metadata and Identity Platform human login | Accepted | [ADR-011](decisions/011-metadata-and-human-identity.md) |
 | Frontend component and data-fetching details | Open | [Technology options](technology-options.md) |
