@@ -3,6 +3,7 @@
 import contextlib
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,10 @@ ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 
 class ExecutorError(RuntimeError):
     """The local container executor could not produce trustworthy evidence."""
+
+
+class AuthorityLost(ExecutorError):
+    """The control plane stopped holding this attempt before its container was created."""
 
 
 class CleanupError(ExecutorError):
@@ -131,18 +136,51 @@ class DockerExecutor:
         finally:
             container.remove(force=True)
 
-    def prepare_job(self, assignment: JobAssignment) -> JobExecutionResult | None:
+    def prepare_job(
+        self,
+        assignment: JobAssignment,
+        still_authorised: Callable[[], bool] | None = None,
+        tick_seconds: float = 30,
+    ) -> JobExecutionResult | None:
         """Fetch the job image without creating a container.
 
         A registry that reports the image as absent is a terminal failure. Any other error
         propagates so the caller can retry while the lease remains valid.
+
+        The pull runs on its own thread so ``still_authorised`` can be called about every
+        ``tick_seconds`` while it proceeds. A multi-gigabyte image on a home link takes minutes,
+        and without this the worker sends no heartbeat for all of it: it reads stale and then
+        offline exactly as a job begins, and cannot observe a cancellation until the pull ends.
+        Losing authority stops this before any container is created.
         """
         if not IMMUTABLE_IMAGE.fullmatch(assignment.image_reference):
             raise ExecutorError("job image must use an immutable sha256 reference")
-        try:
-            self._client.images.pull(assignment.image_reference)
-        except docker.errors.NotFound:
-            return _failure(125, "job image was not found in its registry")
+        failure: list[BaseException] = []
+
+        def pull() -> None:
+            try:
+                self._client.images.pull(assignment.image_reference)
+            except BaseException as error:  # re-raised on the calling thread below
+                failure.append(error)
+
+        thread = threading.Thread(target=pull, name="kratos-image-pull", daemon=True)
+        thread.start()
+        next_tick = self._clock() + timedelta(seconds=tick_seconds)
+        while thread.is_alive():
+            if still_authorised is not None and self._clock() >= next_tick:
+                if not still_authorised():
+                    # The pull continues on its daemon thread and is simply abandoned; nothing
+                    # has been created, so there is nothing to clean up.
+                    raise AuthorityLost(
+                        "the control plane stopped holding this attempt during the image pull"
+                    )
+                next_tick = self._clock() + timedelta(seconds=tick_seconds)
+            self._sleep(SUPERVISION_POLL_SECONDS)
+        thread.join()
+        if failure:
+            if isinstance(failure[0], docker.errors.NotFound):
+                return _failure(125, "job image was not found in its registry")
+            raise failure[0]
         return None
 
     def run_job(

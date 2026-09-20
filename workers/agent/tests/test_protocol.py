@@ -216,6 +216,7 @@ WORKER_SECRET = "kwc_identifier_scoped-secret"
 class FakeJobExecutor(DockerExecutor):
     def __init__(self) -> None:
         self.prepared: list[UUID] = []
+        self.pull_ticks: list[bool] = []
         self.runs: list[tuple[UUID, bool]] = []
         self.removed: list[UUID] = []
         self.stopped_unbounded: list[UUID] = []
@@ -223,8 +224,14 @@ class FakeJobExecutor(DockerExecutor):
         self.authorised: list[bool] = []
         self.tick_seconds: float | None = None
 
-    def prepare_job(self, assignment: JobAssignment) -> JobExecutionResult | None:
+    def prepare_job(
+        self,
+        assignment: JobAssignment,
+        still_authorised: Callable[[], bool] | None = None,
+        tick_seconds: float = 30,
+    ) -> JobExecutionResult | None:
         self.prepared.append(assignment.attempt_id)
+        self.pull_ticks = [] if still_authorised is None else [still_authorised()]
         return None
 
     def run_job(

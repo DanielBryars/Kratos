@@ -1,4 +1,5 @@
 import json
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 
 from kratos_agent.executor import (
     CLEANUP_IMAGE,
+    AuthorityLost,
     DockerExecutor,
     EnforcementError,
     ExecutorError,
@@ -766,3 +768,73 @@ def test_an_inverted_interval_is_refused_before_it_is_sent() -> None:
             execution_started_at=T0,
             execution_finished_at=T0 - timedelta(seconds=1),
         )
+
+
+class SlowImages(JobImages):
+    """A registry that takes its time, like a cold multi-gigabyte pull on a home link."""
+
+    def __init__(self, clock: FakeClock, seconds: float = 300) -> None:
+        super().__init__()
+        self.clock = clock
+        self.finish_at = clock.now + timedelta(seconds=seconds)
+
+    def pull(self, image: str) -> None:
+        while self.clock.now < self.finish_at:
+            time.sleep(0.001)
+        self.pulled.append(image)
+
+
+def test_a_long_pull_keeps_the_worker_reporting() -> None:
+    # Without this the worker sends nothing for the whole pull and reads offline as a job starts.
+    clock = FakeClock()
+    client = JobClient(clock)
+    client.images = SlowImages(clock)
+    ticks: list[datetime] = []
+
+    def on_tick() -> bool:
+        ticks.append(clock.now)
+        return True
+
+    result = job_executor(clock, client).prepare_job(
+        job_assignment(), still_authorised=on_tick, tick_seconds=30
+    )
+
+    assert result is None
+    assert client.images.pulled == [JOB_IMAGE]
+    # Roughly one heartbeat per interval across a five minute pull, not silence.
+    assert len(ticks) >= 5
+    spacing = zip(ticks, ticks[1:], strict=False)
+    assert all(later - earlier >= timedelta(seconds=30) for earlier, later in spacing)
+
+
+def test_a_cancellation_during_the_pull_creates_no_container() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+    client.images = SlowImages(clock)
+
+    with pytest.raises(AuthorityLost, match="during the image pull"):
+        job_executor(clock, client).prepare_job(
+            job_assignment(), still_authorised=lambda: False, tick_seconds=30
+        )
+
+    # Nothing was created, so there is nothing to reconcile or clean up.
+    assert client.containers.options is None
+
+
+def test_a_pull_without_an_authority_check_still_works() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+
+    assert job_executor(clock, client).prepare_job(job_assignment()) is None
+    assert client.images.pulled == [JOB_IMAGE]
+
+
+def test_a_pull_of_a_mutable_reference_is_refused_before_any_thread_starts() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+    mutable = job_assignment().model_copy(update={"image_reference": "example.test/work:latest"})
+
+    with pytest.raises(ExecutorError, match="immutable sha256"):
+        job_executor(clock, client).prepare_job(mutable)
+
+    assert client.images.pulled == []
