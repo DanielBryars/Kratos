@@ -1,6 +1,6 @@
 # R0.2 network-loss exercise runbook
 
-**Status:** Draft for Codex review; not yet executable (see prerequisites)
+**Status:** Procedure reviewed; execution waits for the immutable soak workload and upgraded agent
 **Witness:** the user, who physically disconnects and reconnects the selected worker
 
 ## Requirements
@@ -16,10 +16,9 @@
    [worker protocol](../../protocol/worker-v1.md#execution-authority-and-network-loss). Record its
    immutable digest. The image installed for the first scheduled job,
    `kratos-agent@sha256:d7d03326…`, predates it and exits on the first failed request.
-2. **Open:** an operator-approved immutable workload that holds the GPU for about ten minutes. The
-   bundled training example finishes in under a second and job submission accepts no arguments, so
-   no current image leaves time for a physical disconnect. Codex SHALL choose and publish one
-   before this runbook is final; do not substitute a mutable tag.
+2. An operator-approved immutable workload SHALL hold the GPU for about ten minutes. PR #43 is the
+   candidate soak workload but is not accepted or published yet. Record its reviewed digest before
+   starting; do not substitute a mutable tag.
 3. The worker is `ONLINE IDLE` in the `Home` group with a verified healthy GPU, and no other job is
    queued.
 4. A second device, not on the worker's network link, is signed in to the operator console.
@@ -59,9 +58,13 @@ job state, the container listing and the Docker event log.
 
 - A second `start` event, a second attempt, or a job that reaches `SUCCEEDED` twice fails the
   exercise. Preserve `docker logs kratos-agent` and the event output before changing anything.
-- If the job is still `ASSIGNED` five minutes after reconnection, record the agent log and stop. The
-  control plane does not yet expire or reassign a lease, and an operator cannot cancel an assigned
-  job, so Codex must resolve the attempt; do not recreate the agent container or its state volume.
+- If the job is still `ASSIGNED` five minutes after reconnection, record the agent log and stop.
+  The deployed control plane reconciles expired leases and permits active cancellation, so an
+  attempt remaining assigned indicates a reconciliation or heartbeat failure. Preserve the job,
+  attempt and audit evidence; do not recreate the agent container or its state volume.
+- If the lease expires and the job is requeued or a second attempt starts, stop the exercise. That
+  is bounded recovery, but it fails this exercise's single-execution replay path. Record both
+  attempts and the `job.attempt.lease_expired` audit event before cancelling the job.
 - If the workload is still running when its runtime bound passes, the agent stops it locally and the
   job is reported `FAILED` with a timeout after reconnection. That is correct lease behaviour but
   not the replay path this exercise targets; repeat with a shorter outage.
