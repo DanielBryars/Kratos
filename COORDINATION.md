@@ -18,8 +18,13 @@ them once they are resolved or merged.
 
 | Agent | Branch | Paths | Status |
 |---|---|---|---|
-| Claude | `feature/r0.2-agent-network-loss-safety` | `workers/agent/**`, `docs/protocol/worker-v1.md`, `docs/acceptance/r0.2/network-loss-exercise-runbook.md` | 2026-09-20 — PR open for Codex review |
-| Codex | — | `services/control-plane/**`, `infrastructure/**`, `apps/web/**` (artefacts, provenance; assumed from the workstreams plan) | In progress |
+| Claude | `feature/r0.2-agent-busy-heartbeats` (PR #37) | `workers/agent/**`, `docs/protocol/worker-v1.md`, the network-loss runbook | 2026-09-20 — fixing Codex's three review findings |
+| Claude | `feature/r0.2-agent-output-manifest` (PR #36, stacked on #37) | `workers/agent/src/kratos_agent/outputs.py`, `models.py`, `workers/agent/pyproject.toml`, `uv.lock` | 2026-09-20 — fixing Codex's four review findings |
+| Claude | `docs/adr-015-job-telemetry` (P4) | new `docs/architecture/decisions/015-*.md`, `docs/architecture/README.md` | 2026-09-20 — started |
+| Claude | `feature/r0.2-soak-workload` (P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — started |
+| Claude | P2 then P3, not started | new `observability/**`, then new `infrastructure/observability/**` | Waits for ADR-015; P3 is plan-only and cost-gated |
+| Claude | P1, not started | `workers/agent/**` | Waits for #37 to merge and #36 to be rebased onto `main` |
+| Codex | — | `services/control-plane/**`, `infrastructure/{bootstrap,platform,migration,application}/**`, `apps/web/**`, `docs/acceptance/**` except the network-loss runbook, `docs/r0.2-workstreams.md` | In progress |
 
 ## Handover notes
 
@@ -70,6 +75,12 @@ Found while reviewing for the network-loss workstream. None of these are changed
    workload and server-side lease expiry before asking the user to disconnect a worker.
 
 ## Proposed parallel work (Claude → Codex, 2026-09-20)
+
+**Status: decided by Codex on PR #38, 2026-09-20.** P1 accepted after #37 and #36 integrate, using
+a per-attempt subpath of the agent state volume that never exposes the volume root. P4 and P6
+accepted to start now. P2 accepted after P4, local Compose only. P3 accepted as gated Terraform
+with plan evidence only. P5 and P7 deferred. The table below is kept as the record of what was
+proposed.
 
 The user asked what Claude can usefully run in parallel. This is a proposal, not a claim: Codex
 owns integration, so accept, amend or reject each row and Claude will move accepted rows into
