@@ -59,7 +59,7 @@ The control plane SHALL mint a **telemetry token**: a JWT signed with a Kratos-o
 | `sub` | the worker identifier |
 | `exp` | at most **15 minutes** after issue |
 | `kratos.project` | the owning identity |
-| `kratos.stream` | the observation stream this token may write to |
+| `kratos.streams` | the observation streams this token may write to |
 
 It SHALL be returned on the heartbeat the worker already sends, not from a new endpoint. The
 heartbeat is authenticated, rate-limited and happens every thirty seconds, so a token issued on it
@@ -67,12 +67,31 @@ is refreshed roughly thirty times within its own lifetime and costs no additiona
 A worker that cannot heartbeat stops receiving tokens, which is the same condition under which it
 stops receiving work.
 
-`kratos.stream` is what makes the token *scoped* rather than merely *identified*. The control plane
-allocates an observation stream with each attempt, so it SHALL issue a token naming the stream of
-the attempt that worker currently holds, and SHALL NOT issue one when the worker holds no
-attempt. A worker therefore cannot write to a stream it was never assigned, which a token carrying
-only worker and project identity would have permitted: those say who is speaking, not what they may
-say it about.
+`kratos.streams` is what makes the token *scoped* rather than merely *identified*. A token carrying
+only worker and project identity says who is speaking, not what they may speak about, and would
+authorise writing to any stream including another attempt's.
+
+**It names a set, not one stream, and that is a correction rather than a convenience.** The first
+version of this decision scoped a token to the single attempt a worker currently held. That is
+unimplementable against ADR-015's durable collector queue, and the failure is worse than the gap it
+was closing. The queue outlives the attempt that filled it: telemetry for attempt A can still be
+waiting when attempt B begins, at which point the only token available names B, so A's records are
+either misattributed to B or refused. Once A has ended, no token naming A is ever issued again, so
+that queue can never drain. It would have worked on an idle worker and failed on a busy one.
+
+The control plane SHALL therefore include every stream the worker currently holds **and** every
+stream whose attempt ended within a bounded recent window, which SHALL be at least as long as the
+collector's queue can plausibly hold data. The set SHALL be bounded, and a worker with no current
+attempt and nothing recent SHALL receive no telemetry token at all.
+
+This has a property worth stating plainly: **no old token ever needs to be retained.** Whatever
+token is current authorises the whole of what the queue may still hold, so a retry after a restart
+works with the token the agent has now rather than one it had to keep. That is what lets the
+loopback proxy hold no state.
+
+Records still queued after their stream leaves the window are refused and lost. That is bounded,
+visible in the collector's own telemetry, and better than the alternatives: a window without a
+limit, or credentials retained for work that finished.
 
 The token SHALL authorise **ingestion only**. There is no telemetry read path for a worker, and the
 gateway SHALL NOT accept a telemetry token on any route but OTLP ingestion.
@@ -102,9 +121,16 @@ disabled. That trades an endpoint for a distribution and rotation procedure, and
 does not choose it by default because a rotation that has to reach a file on a VM is a rotation
 that will one day not reach it.
 
+**A batch SHALL carry records for exactly one stream.** One authorisation decision covers one
+request, so a request mixing streams could be neither accepted nor refused as a whole. The
+collector's batching SHALL be keyed so that this holds, and the gateway SHALL refuse a request
+whose records do not agree on their stream.
+
 **Identity SHALL be derived from the validated claims, never from what the worker sent.** The
-gateway SHALL overwrite the worker, project and stream resource attributes on every accepted
-request from `auth.claims.*`, using the Collector's `from_context` attribute source. A resource
+gateway SHALL overwrite the worker and project resource attributes on every accepted request
+from `auth.claims.*`, using the Collector's `from_context` attribute source, and SHALL accept the
+request's stream only if it is one of `kratos.streams`. A stream cannot simply be assigned from the
+claims now that they name a set, so it is checked against them instead. A resource
 attribute a worker supplies is an assertion by the sender and SHALL NOT establish authorisation or
 attribution; only a claim the gateway verified may do that.
 
@@ -210,6 +236,8 @@ storing it.
 | `bearertokenauth` reading the token file directly | What an earlier draft assumed. The extension is documented as static token authentication and does not promise to re-read the file, so the stack would work until the first token expired. Rejected on the documentation rather than on taste. |
 | Restarting the collector on each rotation | Removes the proxy, but discards the durable queue every fifteen minutes, which is the one thing ADR-015 made the acknowledgement boundary. |
 | A token scoped only to the worker | Simpler to mint, but it authorises writing to any stream, including another attempt's. Identity is not scope. |
+| A token scoped to one stream | What the first version decided. Unimplementable against a durable queue that outlives its attempt: telemetry for a finished attempt is either misattributed to the current one or refused, and once that attempt ends no token naming it is issued again, so the queue can never drain. Found in review. |
+| Retaining each stream's token until its queue drains | Removes the set, but the agent cannot know when the collector's queue has drained — that is the collector's business by ADR-015 — so it would hold credentials indefinitely for work that finished. |
 | A revocation list the gateway polls | Gains faster revocation than expiry alone, but it is still a cache with a staleness window, and it adds an endpoint, a poller and a failure mode for a token that grants only ingestion. |
 
 ## Consequences
@@ -230,6 +258,8 @@ storing it.
   what makes the scope enforceable, so it is not optional.
 - ADR-015's OTLP sink becomes implementable, and its second cursor stops being theoretical.
 - A revoked worker retains ingestion for up to fifteen minutes, as set out above.
+- A worker may write to a recently finished attempt's stream as well as its current one. That is
+  the cost of a queue that outlives the work, and it is bounded by the window rather than open.
 - The worker-local collector becomes a component the agent must configure and supervise, which is
   not yet built and is the next thing ADR-015's OTLP half needs.
 
