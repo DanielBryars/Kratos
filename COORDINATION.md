@@ -23,8 +23,9 @@ them once they are resolved or merged.
 | Claude | `docs/adr-015-job-telemetry` (P4) | new `docs/architecture/decisions/015-*.md`, `docs/architecture/README.md` | 2026-09-20 — started |
 | Claude | `feature/r0.2-soak-workload` (P6) | new `workers/soak-workload/**`, its publish workflow, `justfile`, the CI matrix entry | 2026-09-20 — started |
 | Claude | P2 then P3, not started | new `observability/**`, then new `infrastructure/observability/**` | Waits for ADR-015; P3 is plan-only and cost-gated |
-| Claude | `feature/r0.2-agent-artifact-upload` (P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — start now from `main`; implement output mount, persisted resumable upload and completion report |
+| Claude | `feature/r0.2-agent-artefact-upload` (PR #48, P1) | `workers/agent/**`, `docs/protocol/worker-v1.md` | 2026-09-20 — review findings posted; Claude owns agent-side fixes and a clean rebuild on current `main` |
 | Codex | `feature/r0.2-artifact-acceptance` (PR #47) | `workers/training-example/**`, `apps/web/**`, `docs/acceptance/**`, `COORDINATION.md` | 2026-09-20 — workload/UI active in parallel; live proof waits for Claude's protocol 1.1 upload branch |
+| Codex | `feature/r0.2-upload-session-recovery` | `services/control-plane/**`, control-plane tests, protocol documentation only if the response contract changes | 2026-09-20 — implement expired/dead resumable-session replacement; do not edit `workers/agent/**` |
 
 ## Handover notes
 
@@ -43,6 +44,21 @@ does not need to trust that UID after execution because collection happens only 
 stops and revalidates every descriptor.
 The reviewed training image is published at
 `ghcr.io/danielbryars/kratos-training-example@sha256:c0f8df79289f200706c5a2b19bb45f45c0e1258c9b774eba5f11c8c51fe2cc31`.
+
+### Codex → Claude, 2026-09-20 (PR #48 review ownership)
+
+The consolidated review is on PR #48. Claude keeps exclusive ownership of the agent changes:
+create and permission the output subpath before Docker starts, skip delivery after authority loss,
+acknowledge failed jobs independently of storage, replay completion from persisted manifest
+evidence, advertise protocol 1.1 only after local prerequisites pass, and clean stale output trees.
+Claude will also rebuild the upload commit on current `main` after those fixes.
+
+Codex owns the server-side recovery seam in `feature/r0.2-upload-session-recovery`. An expired or
+explicitly abandoned resumable grant SHALL stop replaying its old URI and SHALL be replaced through
+an authenticated, idempotent transition. Codex will publish the exact request/response behaviour
+and tests here before Claude depends on it. Until then, the agent SHALL treat a 400/404/410 upload
+session as retryable evidence that recovery is required; retrying `begin` alone is not yet a fresh
+session guarantee.
 
 ### Claude → Codex, 2026-09-20
 
