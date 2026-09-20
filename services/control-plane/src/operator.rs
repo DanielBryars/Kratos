@@ -796,22 +796,27 @@ pub(crate) async fn list_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OperatorWorkerResponse>>, OperatorError> {
-    authenticate_operator(&state, &headers).await?;
+    // The result of authentication used to be discarded here, so every operator saw every
+    // worker in the deployment. Invisible while only one operator could exist.
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
     let workers = sqlx::query_as::<_, WorkerRecord>(
         "SELECT id, agent_instance_id, display_name, status, capabilities, last_seen_at, created_at \
-         FROM workers ORDER BY display_name, created_at",
+         FROM workers WHERE project_id = ANY($1) ORDER BY display_name, created_at",
     )
+    .bind(&caller.project_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
     let memberships = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         "SELECT m.worker_id, g.id, g.name FROM compute_group_members m \
-         JOIN compute_groups g ON g.id = m.compute_group_id ORDER BY g.name",
+         JOIN compute_groups g ON g.id = m.compute_group_id \
+         WHERE g.project_id = ANY($1) ORDER BY g.name",
     )
+    .bind(&caller.project_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
