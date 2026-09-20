@@ -167,6 +167,8 @@ jobs:
       - run: terraform -chdir=infrastructure/migration validate
       - run: terraform -chdir=infrastructure/application init -backend=false -input=false
       - run: terraform -chdir=infrastructure/application validate
+      - run: terraform -chdir=infrastructure/observability init -backend=false -input=false
+      - run: terraform -chdir=infrastructure/observability validate
 
   container:
     runs-on: ubuntu-latest

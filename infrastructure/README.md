@@ -6,6 +6,7 @@ Terraform is separated into three independently applied roots:
 - `platform`: project APIs, Artifact Registry and the runtime identity.
 - `migration`: the separately deployed and executed schema migration job.
 - `application`: the Cloud Run service for one immutable image.
+- `observability`: the ADR-009 telemetry stack, gated off by default.
 
 This separation lets CI create the image repository before an application image exists. It also prevents routine application releases from refreshing bootstrap identity resources.
 
@@ -106,3 +107,50 @@ absent.
 
 The web console supports 15, 30 and 60 minute enrolments. It displays the credential once and keeps
 it only in browser memory; reloading the page requires the operator to issue a replacement.
+
+## Observability cost gate
+
+The `observability` root builds the [ADR-009](../docs/architecture/decisions/009-observability-and-mlflow.md)
+stack — Grafana, Prometheus, Loki, Tempo, an OpenTelemetry Collector gateway and MLflow — on one
+Compute Engine instance. Its configuration is the bundle proven locally in
+[`observability/`](../observability/README.md); this root only provides the machine, storage,
+network and authenticated entry points.
+
+`enable_observability` defaults to `false`, and with the gate closed the root plans to **no
+resources at all**. This is deliberate: unlike Cloud Run, an instance and a persistent disk bill
+continuously whether or not anyone opens a dashboard. Enabling it is the user's decision, not a
+side effect of a merge, so no deployment workflow sets it.
+
+Before the first enabled apply:
+
+1. Decide the spend. One `e2-standard-2` with a 50 GB balanced disk, a load balancer, NAT and
+   modest egress is the recurring cost; confirm the current figure from GCP's price list for the
+   chosen region rather than from this file, and set a budget alert.
+2. Create an OAuth client for Identity-Aware Proxy and pass `oauth_client_id` and
+   `oauth_client_secret`. Terraform does not create the client. Without it the backend services
+   would be published unauthenticated, so do not apply until it exists.
+3. Set `iap_member` to the one principal allowed in, such as `user:someone@example.com`.
+4. Decide whether MLflow metadata goes on the existing Cloud SQL instance. `enable_mlflow_database`
+   is a separate gate and requires the platform database to be enabled first.
+
+After the first apply, copy the three `required_dns_records` addresses to the DNS provider.
+Certificate issuance begins once those names resolve. Then upload the observability bundle to the
+`config_bucket` as `bundles/observability-current.tar.gz`; the instance unpacks and starts it, and
+replacing that object updates the stack without recreating the instance.
+
+What the root commits to:
+
+- The instance has **no public address**. Egress uses Cloud NAT, and the only ingress rule admits
+  Google's load-balancer ranges to the service ports; a default deny covers everything else. So
+  Prometheus, Loki and Tempo have no route from outside the VPC.
+- Grafana and MLflow are behind IAP, so an unauthenticated request never reaches the service.
+- The instance runs Container-Optimized OS with Secure Boot, vTPM, integrity monitoring and OS
+  Login, as a dedicated service account that can read its configuration bucket and write telemetry
+  objects, and can deploy nothing.
+- Loki chunks and Tempo blocks expire by object lifecycle at 30 and 14 days, alongside the
+  in-service retention the bundle configures.
+
+Known gap: the OTLP endpoint is **not** behind IAP, because workers are not humans and present a
+Kratos credential instead. ADR-009 requires that credential to be scoped and revocable, and the
+decision is still open (recorded in ADR-015). Until it lands, treat `otel.` as authenticated by
+nothing and do not enable this root's OTLP path for a fleet outside the home network.
