@@ -213,8 +213,13 @@ The ignored `observability/.env` file is for local development only and SHALL NO
 bundle. The exclusion above is deliberate: the instance writes its own private `.env` from Secret
 Manager after extracting the bundle.
 
-Copy the three `required_dns_records` addresses to the DNS provider. Certificate issuance begins
-once those names resolve.
+Copy every name in `required_dns_records` to the DNS provider. Certificate issuance begins once
+they resolve, and usually completes within the hour.
+
+There are **two** of them unless OTLP ingestion is enabled, because the managed certificate only
+requests `otel.` when that gate is open. Creating an `otel.` record while the gate is shut points
+a name at a load balancer that has no backend for it, which resolves and then fails — a confusing
+symptom for something that is simply not deployed yet.
 
 **The order above is safe.** Terraform is applied before the bundle and the secret exist, so the
 first boot finds neither. The startup script installs a systemd timer, exits cleanly when either
