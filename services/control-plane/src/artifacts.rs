@@ -61,7 +61,9 @@ pub struct BeginArtifactUploadRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AbandonArtifactUploadRequest {
+    /// Worker protocol version. This operation was introduced in protocol 1.1.
     pub protocol_version: String,
+    /// SHA-256 of the exact UTF-8 session URI bytes, encoded as 64 lowercase hexadecimal digits.
     pub session_uri_sha256: String,
 }
 
@@ -588,12 +590,18 @@ pub(crate) async fn begin_upload(
             return upload_session_response(artifact, session);
         }
         if grant_state == "active" {
+            let session_uri_sha256 = session_uri
+                .as_deref()
+                .map(session_uri_fingerprint)
+                .ok_or_else(ApiError::internal)?;
             sqlx::query(
                 "UPDATE artifact_upload_grants SET state = 'cancel_pending', \
-                        cancel_requested_at = now(), cancellation_reason = 'session_expired' \
+                        session_uri_sha256 = $2, cancel_requested_at = now(), \
+                        cancellation_reason = 'session_expired' \
                  WHERE artifact_id = $1 AND state = 'active'",
             )
             .bind(artifact_id)
+            .bind(session_uri_sha256)
             .execute(&mut *transaction)
             .await
             .map_err(|_| ApiError::internal())?;
@@ -633,6 +641,7 @@ pub(crate) async fn begin_upload(
         sqlx::query(
             "UPDATE artifact_upload_grants SET state = 'initiating', initiation_id = $2, \
                     initiation_attempts = initiation_attempts + 1, session_uri = NULL, \
+                    session_uri_sha256 = NULL, \
                     issued_at = $3, expires_at = $4, activated_at = NULL, \
                     cancel_requested_at = NULL, cancelled_at = NULL, cancellation_reason = NULL \
              WHERE artifact_id = $1",
@@ -701,12 +710,13 @@ pub(crate) async fn begin_upload(
     artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
     let activated = sqlx::query(
         "UPDATE artifact_upload_grants SET state = 'active', session_uri = $3, \
-                expires_at = $4, activated_at = now() \
+                session_uri_sha256 = $4, expires_at = $5, activated_at = now() \
          WHERE artifact_id = $1 AND state = 'initiating' AND initiation_id = $2",
     )
     .bind(artifact_id)
     .bind(initiation_id)
     .bind(&session.uri)
+    .bind(session_uri_fingerprint(&session.uri))
     .bind(session.expires_at)
     .execute(&mut *transaction)
     .await
@@ -754,6 +764,7 @@ pub(crate) async fn begin_upload(
         (status = 503, description = "Artifact storage cancellation is pending", body = crate::registry::ErrorResponse)
     )
 )]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn abandon_upload(
     State(state): State<AppState>,
     Path((worker_id, attempt_id, artifact_id)): Path<(Uuid, Uuid, Uuid)>,
@@ -790,8 +801,8 @@ pub(crate) async fn abandon_upload(
             "The artefact no longer accepts an upload.",
         ));
     }
-    let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "SELECT state, session_uri, cancellation_reason FROM artifact_upload_grants \
+    let grant = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+        "SELECT state, session_uri, session_uri_sha256, cancellation_reason FROM artifact_upload_grants \
          WHERE artifact_id = $1 FOR UPDATE",
     )
     .bind(artifact_id)
@@ -805,8 +816,11 @@ pub(crate) async fn abandon_upload(
         )
     })?;
     match grant {
-        (state, Some(session_uri), _) if matches!(state.as_str(), "active" | "cancel_pending") => {
-            let fingerprint = format!("{:x}", Sha256::digest(session_uri.as_bytes()));
+        (state, Some(session_uri), stored_fingerprint, _)
+            if matches!(state.as_str(), "active" | "cancel_pending") =>
+        {
+            let fingerprint =
+                stored_fingerprint.unwrap_or_else(|| session_uri_fingerprint(&session_uri));
             if fingerprint != request.session_uri_sha256 {
                 return Err(ApiError::conflict(
                     "upload_session_changed",
@@ -816,19 +830,22 @@ pub(crate) async fn abandon_upload(
             if state == "active" {
                 sqlx::query(
                     "UPDATE artifact_upload_grants SET state = 'cancel_pending', \
-                            cancel_requested_at = now(), \
+                            session_uri_sha256 = $3, cancel_requested_at = now(), \
                             cancellation_reason = 'worker_reported_session_unusable' \
                      WHERE artifact_id = $1 AND state = 'active' AND session_uri = $2",
                 )
                 .bind(artifact_id)
                 .bind(&session_uri)
+                .bind(&request.session_uri_sha256)
                 .execute(&mut *transaction)
                 .await
                 .map_err(|_| ApiError::internal())?;
             }
         }
-        (state, None, Some(reason))
-            if state == "cancelled" && reason == "worker_reported_session_unusable" => {}
+        (state, None, Some(fingerprint), Some(reason))
+            if state == "cancelled"
+                && reason == "worker_reported_session_unusable"
+                && fingerprint == request.session_uri_sha256 => {}
         _ => {
             return Err(ApiError::conflict(
                 "upload_session_unavailable",
@@ -856,6 +873,10 @@ pub(crate) async fn abandon_upload(
     }
 }
 
+fn session_uri_fingerprint(session_uri: &str) -> String {
+    format!("{:x}", Sha256::digest(session_uri.as_bytes()))
+}
+
 fn upload_session_response(
     artifact: ArtifactRecord,
     session: ResumableUploadSession,
@@ -881,12 +902,14 @@ async fn mark_initiated_session_for_cancellation(
 ) -> Result<(), ApiError> {
     sqlx::query(
         "UPDATE artifact_upload_grants SET state = 'cancel_pending', session_uri = $3, \
-                expires_at = $4, cancel_requested_at = now(), cancellation_reason = $5 \
+                session_uri_sha256 = $4, expires_at = $5, cancel_requested_at = now(), \
+                cancellation_reason = $6 \
          WHERE artifact_id = $1 AND state = 'initiating' AND initiation_id = $2",
     )
     .bind(artifact_id)
     .bind(initiation_id)
     .bind(&session.uri)
+    .bind(session_uri_fingerprint(&session.uri))
     .bind(session.expires_at)
     .bind(reason)
     .execute(&mut **transaction)
@@ -2102,6 +2125,38 @@ mod tests {
             .unwrap();
         assert_eq!(abandoned.status(), StatusCode::NO_CONTENT);
         assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+
+        let replayed_abandon = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(abandon_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replayed_abandon.status(), StatusCode::NO_CONTENT);
+
+        let unrelated_replay = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.1",
+                            "session_uri_sha256": "f".repeat(64)
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unrelated_replay.status(), StatusCode::CONFLICT);
 
         let replacement = router
             .clone()
