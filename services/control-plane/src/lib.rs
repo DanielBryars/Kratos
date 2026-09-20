@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     routing::{get, post, put},
 };
@@ -21,6 +21,7 @@ pub mod credentials;
 pub mod database;
 pub mod human_auth;
 pub mod migration;
+mod observations;
 mod operator;
 mod registry;
 
@@ -96,6 +97,7 @@ pub(crate) struct AppState {
         registry::claim_registration,
         registry::heartbeat,
         registry::report_job_result,
+        observations::submit_batch,
         artifacts::declare_manifest,
         artifacts::begin_upload,
         artifacts::abandon_upload,
@@ -113,6 +115,8 @@ pub(crate) struct AppState {
         OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
         VerifiedArtifactEvidence, JobAssignment,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
+        observations::SubmitObservationBatchRequest, observations::ObservationRecord,
+        observations::ObservationBatchResponse,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, AbandonArtifactUploadRequest,
         CompleteArtifactUploadRequest, ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
         ResumableUploadSession
@@ -255,6 +259,7 @@ pub fn app_with_human_auth(
     app_with_dependencies(web_root, database, human_auth, None)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn app_with_dependencies(
     web_root: Option<PathBuf>,
     database: Option<PgPool>,
@@ -327,6 +332,11 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result",
             put(registry::report_job_result),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/observation-streams/{stream_id}/batches/{batch_id}",
+            put(observations::submit_batch)
+                .layer(DefaultBodyLimit::max(observations::MAX_BATCH_BYTES)),
         )
         .route(
             "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/artifact-manifest",
