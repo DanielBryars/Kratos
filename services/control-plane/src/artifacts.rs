@@ -804,6 +804,9 @@ pub(crate) async fn complete_upload(
             ));
         }
         if artifact.status == "verified" {
+            consume_completed_upload_session(&mut transaction, artifact_id)
+                .await
+                .map_err(|_| ApiError::internal())?;
             transaction
                 .commit()
                 .await
@@ -880,6 +883,9 @@ pub(crate) async fn complete_upload(
         ));
     }
     if artifact.status == "verified" {
+        consume_completed_upload_session(&mut transaction, artifact_id)
+            .await
+            .map_err(|_| ApiError::internal())?;
         transaction
             .commit()
             .await
@@ -975,16 +981,9 @@ pub(crate) async fn complete_upload(
         .execute(&mut *transaction)
         .await
         .map_err(|_| ApiError::internal())?;
-        sqlx::query(
-            "UPDATE artifact_upload_grants SET state = 'cancelled', session_uri = NULL, \
-                    cancel_requested_at = COALESCE(cancel_requested_at, now()), \
-                    cancelled_at = now(), cancellation_reason = 'upload_completed' \
-             WHERE artifact_id = $1 AND state = 'active'",
-        )
-        .bind(artifact_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| ApiError::internal())?;
+        consume_completed_upload_session(&mut transaction, artifact_id)
+            .await
+            .map_err(|_| ApiError::internal())?;
     }
     let verified_artifact =
         artifact_for_worker(&mut transaction, attempt_id, artifact_id, worker_id).await?;
@@ -1022,19 +1021,40 @@ pub(crate) async fn reconcile_pending_protections(
         {
             continue;
         }
-        match sqlx::query(
+        let mut transaction = match pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::warn!(%error, %artifact_id, "could not begin artifact publication");
+                continue;
+            }
+        };
+        let published = match sqlx::query(
             "UPDATE job_artifacts SET status = 'verified', protection_pending = false, \
                     state_reason = NULL WHERE id = $1 AND status = 'uploading' \
                     AND protection_pending = true AND verified_storage_generation = $2",
         )
         .bind(artifact_id)
         .bind(generation)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await
         {
-            Ok(result) => completed += usize::try_from(result.rows_affected()).unwrap_or(0),
+            Ok(result) => result.rows_affected(),
             Err(error) => {
                 tracing::warn!(%error, %artifact_id, "could not publish protected artifact");
+                continue;
+            }
+        };
+        if published == 1
+            && let Err(error) =
+                consume_completed_upload_session(&mut transaction, artifact_id).await
+        {
+            tracing::warn!(%error, %artifact_id, "could not consume completed upload session");
+            continue;
+        }
+        match transaction.commit().await {
+            Ok(()) => completed += usize::try_from(published).unwrap_or(0),
+            Err(error) => {
+                tracing::warn!(%error, %artifact_id, "could not commit artifact publication");
             }
         }
     }
@@ -1069,6 +1089,22 @@ async fn cancel_artifact_upload_session(
     reason: &str,
 ) -> Result<(), sqlx::Error> {
     mark_sessions_for_cancellation(transaction, "g.artifact_id = $1", artifact_id, reason).await
+}
+
+async fn consume_completed_upload_session(
+    transaction: &mut Transaction<'_, Postgres>,
+    artifact_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE artifact_upload_grants SET state = 'cancelled', session_uri = NULL, \
+                cancel_requested_at = COALESCE(cancel_requested_at, now()), \
+                cancelled_at = now(), cancellation_reason = 'upload_completed' \
+         WHERE artifact_id = $1 AND state = 'active'",
+    )
+    .bind(artifact_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn cancel_worker_upload_sessions(
@@ -1687,15 +1723,28 @@ mod tests {
             }
         }
 
-        // A crash after durable verification but before publishing the row leaves recoverable work.
+        // A crash after durable verification but before publishing the row leaves recoverable work,
+        // including the still-reachable upload session.
+        let mut recovery = pool.begin().await.unwrap();
         sqlx::query(
             "UPDATE job_artifacts SET status = 'uploading', protection_pending = true, \
                     state_reason = 'gcs_protection_pending' WHERE id = $1",
         )
         .bind(artifact_id)
-        .execute(&pool)
+        .execute(&mut *recovery)
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'active', session_uri = $2, \
+                    activated_at = now(), cancel_requested_at = NULL, cancelled_at = NULL, \
+                    cancellation_reason = NULL WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind("https://storage.googleapis.com/upload/session/protection-recovery")
+        .execute(&mut *recovery)
+        .await
+        .unwrap();
+        recovery.commit().await.unwrap();
         let recovery_storage = ArtifactStorageClient::new(FakeArtifactStorage {
             crc32c: "ImIEBA==",
             bucket: "test-artifacts".to_owned(),
@@ -1704,6 +1753,19 @@ mod tests {
         assert_eq!(
             reconcile_pending_protections(&pool, &recovery_storage).await,
             1
+        );
+        let recovered: (String, bool, String, Option<String>) = sqlx::query_as(
+            "SELECT a.status, a.protection_pending, g.state, g.session_uri \
+             FROM job_artifacts a JOIN artifact_upload_grants g ON g.artifact_id = a.id \
+             WHERE a.id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered,
+            ("verified".to_owned(), false, "cancelled".to_owned(), None)
         );
 
         let mut conflicting = completion.clone();
@@ -1747,6 +1809,18 @@ mod tests {
         let accepted = response_json(accepted).await;
         assert_eq!(accepted["status"], "succeeded");
 
+        // A replay also repairs a legacy/partial verified row with a reachable session.
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'active', session_uri = $2, \
+                    activated_at = now(), cancel_requested_at = NULL, cancelled_at = NULL, \
+                    cancellation_reason = NULL WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .bind("https://storage.googleapis.com/upload/session/replay-recovery")
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let replayed_after_terminal = router
             .oneshot(
                 Request::put(&completion_uri)
@@ -1760,6 +1834,14 @@ mod tests {
         assert_eq!(replayed_after_terminal.status(), StatusCode::OK);
         let replayed_after_terminal = response_json(replayed_after_terminal).await;
         assert_eq!(replayed_after_terminal["status"], "verified");
+        let replay_grant: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, session_uri FROM artifact_upload_grants WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(replay_grant, ("cancelled".to_owned(), None));
         assert_eq!(storage_calls.protected.load(Ordering::SeqCst), 2);
         assert_eq!(storage_calls.deleted.load(Ordering::SeqCst), 0);
     }
