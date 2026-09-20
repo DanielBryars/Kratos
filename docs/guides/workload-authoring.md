@@ -29,8 +29,9 @@ control-plane contracts before they can be used safely.
 ## Adapt the starter
 
 Copy `workers/workload-template` to a new directory. Change the project name and
-`WORKLOAD_VERSION`, then replace `run_user_workload` in `workload.py`. Add pinned framework
-dependencies to `pyproject.toml` and regenerate `uv.lock`:
+`WORKLOAD_VERSION`, update both `COPY workers/workload-template/...` source paths in the
+`Dockerfile`, then replace `run_user_workload` in `workload.py`. Add pinned framework dependencies
+to `pyproject.toml` and regenerate `uv.lock`:
 
 ```shell
 cd workers/my-workload

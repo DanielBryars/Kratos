@@ -13,6 +13,7 @@ The starter already handles the parts every Kratos workload needs:
 - writes `result.json` atomically beneath `/kratos/outputs`;
 - emits one bounded JSON result line to standard output.
 
+After copying the directory, update its source paths in the two `Dockerfile` `COPY` instructions.
 Replace `WORKLOAD_VERSION` and the body of `run_user_workload`. Add code, fixed configuration and
 any data needed at runtime to the image in the `Dockerfile`. Never put credentials in the image.
 The scheduled job must request `result.json` with role `result`, media type `application/json`, and
