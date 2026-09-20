@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions},
+    artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions, delivery_window},
     credentials::{self, CredentialKind, IssuedCredential},
 };
 
@@ -447,6 +447,18 @@ struct ExpiredAttemptRecord {
     job_status: String,
     max_attempts: i32,
     lease_expires_at: DateTime<Utc>,
+    artifact_delivery_expires_at: Option<DateTime<Utc>>,
+}
+
+impl ExpiredAttemptRecord {
+    fn authority_expires_at(&self) -> DateTime<Utc> {
+        if self.job_status == "cancelling" {
+            self.lease_expires_at
+        } else {
+            self.artifact_delivery_expires_at
+                .unwrap_or(self.lease_expires_at)
+        }
+    }
 }
 
 struct LeaseExpiryOutcome {
@@ -1194,6 +1206,7 @@ async fn close_expired_attempt(
     attempt: &ExpiredAttemptRecord,
 ) -> Result<LeaseExpiryOutcome, ApiError> {
     let cancellation = attempt.job_status == "cancelling";
+    let delivery = !cancellation && attempt.artifact_delivery_expires_at.is_some();
     let retry_queued = !cancellation && attempt.attempt_number < attempt.max_attempts;
     let attempt_status = if cancellation { "cancelled" } else { "failed" };
     let job_status = if cancellation {
@@ -1203,12 +1216,16 @@ async fn close_expired_attempt(
     } else {
         "failed"
     };
-    let reason = if cancellation {
-        "Cancellation completed when the execution lease expired."
-    } else if retry_queued {
-        "Execution lease expired; one bounded retry was queued."
-    } else {
-        "Execution lease expired and the bounded attempt limit was reached."
+    let reason = match (cancellation, delivery, retry_queued) {
+        (true, _, _) => "Cancellation completed when the execution lease expired.",
+        (false, true, true) => "Artifact delivery deadline expired; one bounded retry was queued.",
+        (false, true, false) => {
+            "Artifact delivery deadline expired and the bounded attempt limit was reached."
+        }
+        (false, false, true) => "Execution lease expired; one bounded retry was queued.",
+        (false, false, false) => {
+            "Execution lease expired and the bounded attempt limit was reached."
+        }
     };
     cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_lease_expired")
         .await
@@ -1276,6 +1293,7 @@ async fn close_expired_attempt(
         "worker_id": attempt.worker_id,
         "attempt_number": attempt.attempt_number,
         "attempt_status_before": attempt.attempt_status,
+        "authority_phase": if delivery { "artifact_delivery" } else { "execution" },
         "job_status": job_status,
         "retry_queued": retry_queued
     }))
@@ -1352,9 +1370,11 @@ pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, A
         let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
             "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                     a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                    a.lease_expires_at \
+                    a.lease_expires_at, a.artifact_delivery_expires_at \
              FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
-             WHERE a.status IN ('assigned', 'running') AND a.lease_expires_at <= now() \
+             WHERE a.status IN ('assigned', 'running') \
+               AND CASE WHEN j.status = 'cancelling' THEN a.lease_expires_at \
+                        ELSE COALESCE(a.artifact_delivery_expires_at, a.lease_expires_at) END <= now() \
                AND j.status IN ('assigned', 'running', 'cancelling') \
              ORDER BY a.lease_expires_at, a.id FOR UPDATE OF a, j SKIP LOCKED LIMIT 1",
         )
@@ -1414,7 +1434,8 @@ async fn current_or_assign_job(
                 j.timeout_seconds, a.lease_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.worker_id = $1 AND a.status IN ('assigned', 'running') \
-           AND a.lease_expires_at > now() \
+           AND j.status IN ('assigned', 'running') \
+           AND COALESCE(a.artifact_delivery_expires_at, a.lease_expires_at) > now() \
          ORDER BY a.assigned_at LIMIT 1",
     )
     .bind(worker_id)
@@ -1476,15 +1497,35 @@ async fn current_or_assign_job(
     let lease_expires_at = Utc::now()
         .checked_add_signed(TimeDelta::seconds(i64::from(timeout_seconds) + 120))
         .ok_or_else(ApiError::internal)?;
+    let declared_output_limit = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(sum(max_bytes), 0)::bigint FROM job_output_requirements WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| database_error(&error, "calculate artifact delivery allowance"))?;
+    let artifact_delivery_expires_at = if declared_output_limit > 0 {
+        let output_bytes =
+            u64::try_from(declared_output_limit).map_err(|_| ApiError::internal())?;
+        Some(
+            lease_expires_at
+                .checked_add_signed(delivery_window(output_bytes))
+                .ok_or_else(ApiError::internal)?,
+        )
+    } else {
+        None
+    };
     sqlx::query(
         "INSERT INTO job_attempts \
-         (id, job_id, attempt_number, worker_id, lease_expires_at) VALUES ($1, $2, $3, $4, $5)",
+         (id, job_id, attempt_number, worker_id, lease_expires_at, artifact_delivery_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(attempt_id)
     .bind(job_id)
     .bind(attempt_number)
     .bind(worker_id)
     .bind(lease_expires_at)
+    .bind(artifact_delivery_expires_at)
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "create job attempt"))?;
@@ -1809,7 +1850,7 @@ pub(crate) async fn report_job_result(
     let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
         "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                 a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                a.lease_expires_at \
+                a.lease_expires_at, a.artifact_delivery_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
@@ -1837,7 +1878,7 @@ pub(crate) async fn report_job_result(
     // attempt and job locks have been acquired and uses the wall clock so lock wait time counts
     // against execution authority.
     let lease_expired: bool = sqlx::query_scalar("SELECT clock_timestamp() >= $1")
-        .bind(attempt.lease_expires_at)
+        .bind(attempt.authority_expires_at())
         .fetch_one(&mut *transaction)
         .await
         .map_err(|error| database_error(&error, "check job attempt lease after locking"))?;
@@ -1956,7 +1997,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header::AUTHORIZATION},
     };
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use serde_json::{Value, json};
     use sqlx::PgPool;
     use tower::ServiceExt;
@@ -2746,5 +2787,14 @@ mod tests {
         assert_eq!(assignment.job_id, job_id);
         assert_eq!(assignment.output_requirements.len(), 1);
         assert_eq!(assignment.output_requirements[0].logical_path, "model.pt");
+        let (lease, delivery): (DateTime<Utc>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT lease_expires_at, artifact_delivery_expires_at \
+             FROM job_attempts WHERE id = $1",
+        )
+        .bind(assignment.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(delivery.is_some_and(|deadline| deadline > lease));
     }
 }

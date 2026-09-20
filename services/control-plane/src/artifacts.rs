@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, header},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Transaction};
@@ -24,6 +24,10 @@ use crate::{
 const MAX_FILES: usize = 100;
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const MIN_DELIVERY_SECONDS: i64 = 15 * 60;
+const MAX_DELIVERY_SECONDS: i64 = 24 * 60 * 60;
+const ASSUMED_MIN_UPLOAD_BYTES_PER_SECOND: u64 = 128 * 1024;
+const VERIFICATION_ALLOWANCE_SECONDS: u64 = 5 * 60;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +118,8 @@ struct AttemptRecord {
     owner_identity_id: Uuid,
     status: String,
     job_status: String,
+    lease_expires_at: DateTime<Utc>,
+    artifact_delivery_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow)]
@@ -274,7 +280,8 @@ async fn attempt_for_worker(
     worker_id: Uuid,
 ) -> Result<AttemptRecord, ApiError> {
     let record = sqlx::query_as::<_, AttemptRecord>(
-        "SELECT a.job_id, j.owner_identity_id, a.status, j.status AS job_status \
+        "SELECT a.job_id, j.owner_identity_id, a.status, j.status AS job_status, \
+                a.lease_expires_at, a.artifact_delivery_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
@@ -286,6 +293,10 @@ async fn attempt_for_worker(
     .ok_or_else(|| ApiError::conflict("attempt_unavailable", "The job attempt is unavailable."))?;
     if !matches!(record.status.as_str(), "assigned" | "running")
         || !matches!(record.job_status.as_str(), "assigned" | "running")
+        || record
+            .artifact_delivery_expires_at
+            .unwrap_or(record.lease_expires_at)
+            <= Utc::now()
     {
         return Err(ApiError::conflict(
             "attempt_not_active",
@@ -293,6 +304,15 @@ async fn attempt_for_worker(
         ));
     }
     Ok(record)
+}
+
+pub(crate) fn delivery_window(total_bytes: u64) -> TimeDelta {
+    let transfer_seconds =
+        total_bytes.div_ceil(ASSUMED_MIN_UPLOAD_BYTES_PER_SECOND) + VERIFICATION_ALLOWANCE_SECONDS;
+    let seconds = i64::try_from(transfer_seconds)
+        .unwrap_or(MAX_DELIVERY_SECONDS)
+        .clamp(MIN_DELIVERY_SECONDS, MAX_DELIVERY_SECONDS);
+    TimeDelta::seconds(seconds)
 }
 
 async fn load_artifacts(
@@ -383,6 +403,19 @@ pub(crate) async fn declare_manifest(
     let pool = database(&state)?;
     let mut transaction = pool.begin().await.map_err(|_| ApiError::internal())?;
     let attempt = attempt_for_worker(&mut transaction, attempt_id, worker_id).await?;
+    let proposed_delivery_deadline = Utc::now()
+        .checked_add_signed(delivery_window(total))
+        .ok_or_else(ApiError::internal)?;
+    let delivery_deadline = proposed_delivery_deadline.max(attempt.lease_expires_at);
+    sqlx::query(
+        "UPDATE job_attempts SET artifact_delivery_expires_at = $2 \
+         WHERE id = $1 AND artifact_delivery_expires_at IS NULL",
+    )
+    .bind(attempt_id)
+    .bind(delivery_deadline)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| ApiError::internal())?;
     let existing_manifest =
         sqlx::query_as::<_, (Uuid,)>("SELECT id FROM job_artifact_manifests WHERE attempt_id = $1")
             .bind(attempt_id)
@@ -1369,7 +1402,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header::AUTHORIZATION},
     };
-    use chrono::{TimeDelta, Utc};
+    use chrono::{DateTime, TimeDelta, Utc};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use sqlx::PgPool;
@@ -1387,10 +1420,10 @@ mod tests {
     };
 
     use super::{
-        JobOutputRequirement, cancel_attempt_upload_sessions, cancel_job_upload_sessions,
-        cancel_worker_upload_sessions, reconcile_pending_protections,
-        reconcile_pending_session_cancellations, session_uri_fingerprint, valid_crc32c,
-        valid_logical_path, validate_output_requirements,
+        JobOutputRequirement, MAX_TOTAL_BYTES, cancel_attempt_upload_sessions,
+        cancel_job_upload_sessions, cancel_worker_upload_sessions, delivery_window,
+        reconcile_pending_protections, reconcile_pending_session_cancellations,
+        session_uri_fingerprint, valid_crc32c, valid_logical_path, validate_output_requirements,
     };
 
     struct Fixture {
@@ -1641,6 +1674,13 @@ mod tests {
         assert!(validate_output_requirements(&[output.clone(), output]).is_err());
     }
 
+    #[test]
+    fn delivery_window_is_bounded_and_scales_with_bytes() {
+        assert_eq!(delivery_window(512), TimeDelta::minutes(15));
+        assert!(delivery_window(MAX_TOTAL_BYTES) > TimeDelta::hours(22));
+        assert!(delivery_window(MAX_TOTAL_BYTES) <= TimeDelta::hours(24));
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn manifest_declaration_is_immutable_and_idempotent(pool: PgPool) {
         let fixture = fixture(&pool).await;
@@ -1651,6 +1691,7 @@ mod tests {
             fixture.worker_id, fixture.attempt_id
         );
         let mut first_body = None;
+        let mut first_deadline = None;
         for _ in 0..2 {
             let response = router
                 .clone()
@@ -1670,11 +1711,30 @@ mod tests {
             } else {
                 first_body = Some(body);
             }
+            let (lease, delivery): (DateTime<Utc>, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT lease_expires_at, artifact_delivery_expires_at \
+                 FROM job_attempts WHERE id = $1",
+            )
+            .bind(fixture.attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let delivery = delivery.expect("manifest must create a delivery deadline");
+            assert!(delivery > lease);
+            if let Some(first) = first_deadline {
+                assert_eq!(
+                    delivery, first,
+                    "manifest replay must not slide the deadline"
+                );
+            } else {
+                first_deadline = Some(delivery);
+            }
         }
 
         let mut changed = manifest_body(manifest_id);
         changed["files"][0]["sha256"] = Value::String("c".repeat(64));
         let response = router
+            .clone()
             .oneshot(
                 Request::put(&uri)
                     .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
@@ -1690,6 +1750,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+
+        sqlx::query(
+            "UPDATE job_attempts SET lease_expires_at = now() - interval '1 second' \
+             WHERE id = $1",
+        )
+        .bind(fixture.attempt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let result = router
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{}/job-attempts/{}/result",
+                    fixture.worker_id, fixture.attempt_id
+                ))
+                .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 125,
+                        "timed_out": false,
+                        "stdout": "",
+                        "stderr": "",
+                        "failure_message": "output delivery failed"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        assert_eq!(response_json(result).await["status"], "failed");
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM job_attempts WHERE job_id = $1")
+                .bind(fixture.job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "delivery failure must not become an execution retry"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
