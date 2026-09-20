@@ -7,7 +7,7 @@ export type OutputRequirement = {
 };
 
 export type VerifiedArtifactEvidence = {
-  storage_generation: number;
+  storage_generation: string;
   byte_length: number;
   sha256: string;
   crc32c: string;

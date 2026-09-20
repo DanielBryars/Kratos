@@ -40,7 +40,7 @@ describe("artifactRows", () => {
           status: "verified",
           declared_at: "2026-09-20T12:00:00Z",
           verified: {
-            storage_generation: 42,
+            storage_generation: "9007199254740993",
             byte_length: 512,
             sha256: "b".repeat(64),
             crc32c: "ImIEBA==",
@@ -69,7 +69,7 @@ describe("artifactRows", () => {
 
     const rows = artifactRows(requirements, response);
     assert.equal(rows[0].artifact?.artifact_id, "new");
-    assert.equal(rows[0].artifact?.verified?.storage_generation, 42);
+    assert.equal(rows[0].artifact?.verified?.storage_generation, "9007199254740993");
     assert.equal(rows[1].availability, "not_declared");
     assert.equal(rows[1].artifact, null);
   });

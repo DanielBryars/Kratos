@@ -128,11 +128,15 @@ pub struct OperatorJobResponse {
     pub stderr: Option<String>,
     pub failure_message: Option<String>,
     pub output_requirements: Vec<JobOutputRequirement>,
+    pub current_attempt: Option<OperatorAttemptIdentity>,
+    pub artifacts: Vec<OperatorArtifactResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct VerifiedArtifactEvidence {
-    pub storage_generation: i64,
+    /// Decimal Cloud Storage generation. Encoded as a string because generations exceed JSON's
+    /// exact integer range.
+    pub storage_generation: String,
     pub byte_length: u64,
     pub sha256: String,
     pub crc32c: String,
@@ -171,7 +175,14 @@ pub struct OperatorArtifactResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct OperatorArtifactListResponse {
     pub job_id: Uuid,
+    pub current_attempt: Option<OperatorAttemptIdentity>,
     pub artifacts: Vec<OperatorArtifactResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct OperatorAttemptIdentity {
+    pub attempt_id: Uuid,
+    pub attempt_number: i32,
 }
 
 #[derive(FromRow)]
@@ -223,6 +234,7 @@ struct JobRecord {
 
 #[derive(FromRow)]
 struct OperatorArtifactRecord {
+    job_id: Uuid,
     artifact_id: Uuid,
     attempt_id: Uuid,
     attempt_number: i32,
@@ -258,7 +270,7 @@ impl TryFrom<OperatorArtifactRecord> for OperatorArtifactResponse {
         ) {
             (Some(generation), Some(bytes), Some(sha256), Some(crc32c), Some(source), Some(at)) => {
                 Some(VerifiedArtifactEvidence {
-                    storage_generation: generation,
+                    storage_generation: generation.to_string(),
                     byte_length: u64::try_from(bytes).map_err(|_| OperatorError::internal())?,
                     sha256,
                     crc32c,
@@ -297,7 +309,11 @@ impl TryFrom<OperatorArtifactRecord> for OperatorArtifactResponse {
 }
 
 impl JobRecord {
-    fn into_response(self, output_requirements: Vec<JobOutputRequirement>) -> OperatorJobResponse {
+    fn into_response(
+        self,
+        output_requirements: Vec<JobOutputRequirement>,
+        visibility: OperatorArtifactListResponse,
+    ) -> OperatorJobResponse {
         let record = self;
         OperatorJobResponse {
             job_id: record.id,
@@ -315,6 +331,8 @@ impl JobRecord {
             stderr: record.stderr,
             failure_message: record.failure_message,
             output_requirements,
+            current_attempt: visibility.current_attempt,
+            artifacts: visibility.artifacts,
         }
     }
 }
@@ -1038,6 +1056,76 @@ async fn job_output_requirements(
     Ok(by_job)
 }
 
+async fn job_artifact_visibility(
+    database: &sqlx::PgPool,
+    job_ids: &[Uuid],
+) -> Result<HashMap<Uuid, OperatorArtifactListResponse>, OperatorError> {
+    let mut by_job: HashMap<Uuid, OperatorArtifactListResponse> = job_ids
+        .iter()
+        .copied()
+        .map(|job_id| {
+            (
+                job_id,
+                OperatorArtifactListResponse {
+                    job_id,
+                    current_attempt: None,
+                    artifacts: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    let attempts = sqlx::query_as::<_, (Uuid, Uuid, i32)>(
+        "SELECT DISTINCT ON (job_id) job_id, id, attempt_number FROM job_attempts \
+         WHERE job_id = ANY($1) ORDER BY job_id, attempt_number DESC",
+    )
+    .bind(job_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    let attempt_ids: Vec<Uuid> = attempts.iter().map(|(_, id, _)| *id).collect();
+    for (job_id, attempt_id, attempt_number) in attempts {
+        if let Some(visibility) = by_job.get_mut(&job_id) {
+            visibility.current_attempt = Some(OperatorAttemptIdentity {
+                attempt_id,
+                attempt_number,
+            });
+        }
+    }
+    let records = sqlx::query_as::<_, OperatorArtifactRecord>(
+        "SELECT a.job_id, a.id AS artifact_id, a.attempt_id, ja.attempt_number, a.logical_path, \
+                a.role, a.media_type, a.mandatory, r.max_bytes, a.byte_length, a.sha256, a.crc32c, \
+                CASE WHEN a.status = 'uploading' AND \
+                          (a.upload_completed_at IS NOT NULL OR a.protection_pending) \
+                     THEN 'verifying' ELSE a.status END AS visibility_status, a.declared_at, \
+                CASE WHEN a.status = 'verified' THEN a.verified_storage_generation END \
+                    AS verified_storage_generation, \
+                CASE WHEN a.status = 'verified' THEN a.verified_byte_length END \
+                    AS verified_byte_length, \
+                CASE WHEN a.status = 'verified' THEN a.verified_sha256 END AS verified_sha256, \
+                CASE WHEN a.status = 'verified' THEN a.verified_crc32c END AS verified_crc32c, \
+                CASE WHEN a.status = 'verified' THEN a.verification_source END \
+                    AS verification_source, \
+                CASE WHEN a.status = 'verified' THEN a.verified_at END AS verified_at \
+         FROM job_artifacts a \
+         JOIN job_attempts ja ON ja.id = a.attempt_id AND ja.job_id = a.job_id \
+         JOIN job_output_requirements r ON r.id = a.output_requirement_id AND r.job_id = a.job_id \
+         WHERE a.attempt_id = ANY($1) AND a.status <> 'deleted' \
+         ORDER BY a.job_id, a.logical_path",
+    )
+    .bind(&attempt_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    for record in records {
+        let job_id = record.job_id;
+        let artifact = OperatorArtifactResponse::try_from(record)?;
+        if let Some(visibility) = by_job.get_mut(&job_id) {
+            visibility.artifacts.push(artifact);
+        }
+    }
+    Ok(by_job)
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/jobs",
@@ -1128,7 +1216,14 @@ pub(crate) async fn create_job(
         .map_err(|_| OperatorError::internal())?;
     Ok((
         StatusCode::CREATED,
-        Json(record.into_response(request.output_requirements)),
+        Json(record.into_response(
+            request.output_requirements,
+            OperatorArtifactListResponse {
+                job_id: id,
+                current_attempt: None,
+                artifacts: Vec::new(),
+            },
+        )),
     ))
 }
 
@@ -1161,12 +1256,21 @@ pub(crate) async fn list_jobs(
         .map_err(|_| OperatorError::internal())?;
     let job_ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
     let mut requirements = job_output_requirements(database, &job_ids).await?;
+    let mut visibility = job_artifact_visibility(database, &job_ids).await?;
     Ok(Json(
         records
             .into_iter()
             .map(|record| {
                 let outputs = requirements.remove(&record.id).unwrap_or_default();
-                record.into_response(outputs)
+                let artifacts =
+                    visibility
+                        .remove(&record.id)
+                        .unwrap_or(OperatorArtifactListResponse {
+                            job_id: record.id,
+                            current_attempt: None,
+                            artifacts: Vec::new(),
+                        });
+                record.into_response(outputs, artifacts)
             })
             .collect(),
     ))
@@ -1207,36 +1311,11 @@ pub(crate) async fn list_job_artifacts(
         return Err(OperatorError::job_not_found());
     }
 
-    let records = sqlx::query_as::<_, OperatorArtifactRecord>(
-        "SELECT a.id AS artifact_id, a.attempt_id, ja.attempt_number, a.logical_path, a.role, \
-                a.media_type, a.mandatory, r.max_bytes, a.byte_length, a.sha256, a.crc32c, \
-                CASE WHEN a.status = 'uploading' AND \
-                          (a.upload_completed_at IS NOT NULL OR a.protection_pending) \
-                     THEN 'verifying' ELSE a.status END AS visibility_status, a.declared_at, \
-                CASE WHEN a.status = 'verified' THEN a.verified_storage_generation END \
-                    AS verified_storage_generation, \
-                CASE WHEN a.status = 'verified' THEN a.verified_byte_length END \
-                    AS verified_byte_length, \
-                CASE WHEN a.status = 'verified' THEN a.verified_sha256 END AS verified_sha256, \
-                CASE WHEN a.status = 'verified' THEN a.verified_crc32c END AS verified_crc32c, \
-                CASE WHEN a.status = 'verified' THEN a.verification_source END \
-                    AS verification_source, \
-                CASE WHEN a.status = 'verified' THEN a.verified_at END AS verified_at \
-         FROM job_artifacts a \
-         JOIN job_attempts ja ON ja.id = a.attempt_id AND ja.job_id = a.job_id \
-         JOIN job_output_requirements r ON r.id = a.output_requirement_id AND r.job_id = a.job_id \
-         WHERE a.job_id = $1 AND a.status <> 'deleted' \
-         ORDER BY ja.attempt_number DESC, a.logical_path",
-    )
-    .bind(job_id)
-    .fetch_all(database)
-    .await
-    .map_err(|_| OperatorError::internal())?;
-    let artifacts = records
-        .into_iter()
-        .map(OperatorArtifactResponse::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(OperatorArtifactListResponse { job_id, artifacts }))
+    let response = job_artifact_visibility(database, &[job_id])
+        .await?
+        .remove(&job_id)
+        .ok_or_else(OperatorError::internal)?;
+    Ok(Json(response))
 }
 
 #[utoipa::path(
@@ -1299,7 +1378,11 @@ pub(crate) async fn cancel_job(
         .await?
         .remove(&record.id)
         .unwrap_or_default();
-    Ok(Json(record.into_response(outputs)))
+    let visibility = job_artifact_visibility(database, &[record.id])
+        .await?
+        .remove(&record.id)
+        .ok_or_else(OperatorError::internal)?;
+    Ok(Json(record.into_response(outputs, visibility)))
 }
 
 async fn authorize_operator(
@@ -2181,8 +2264,8 @@ mod tests {
                   verified_byte_length, verified_crc32c, verified_sha256, verification_source, \
                   verified_at, protection_pending, state_reason) \
                  VALUES ($1, $2, $3, $4, $5, $6, 'model', 'application/octet-stream', $7, 512, \
-                         $8, 'ImIEBA==', $9, $10, 'private-artifacts', 42, 512, 'ImIEBA==', \
-                         now(), now(), 42, 512, 'ImIEBA==', $8, 'gcs_metadata', now(), $11, $12)",
+                         $8, 'ImIEBA==', $9, $10, 'private-artifacts', 9007199254740993, 512, 'ImIEBA==', \
+                         now(), now(), 9007199254740993, 512, 'ImIEBA==', $8, 'gcs_metadata', now(), $11, $12)",
             )
             .bind(Uuid::new_v4())
             .bind(manifest_id)
@@ -2203,7 +2286,7 @@ mod tests {
             .unwrap();
         }
 
-        let router = app_with_human_auth(None, Some(pool), Some(auth));
+        let router = app_with_human_auth(None, Some(pool.clone()), Some(auth));
         let response = router
             .clone()
             .oneshot(
@@ -2222,12 +2305,110 @@ mod tests {
         assert!(!body_text.contains("session_uri"));
         let body: Value = serde_json::from_str(&body_text).unwrap();
         assert_eq!(body["job_id"], job_id.to_string());
+        assert_eq!(
+            body["current_attempt"]["attempt_id"],
+            attempt_id.to_string()
+        );
+        assert_eq!(body["current_attempt"]["attempt_number"], 1);
         assert_eq!(body["artifacts"][0]["status"], "verified");
         assert_eq!(body["artifacts"][0]["mandatory"], true);
-        assert_eq!(body["artifacts"][0]["verified"]["storage_generation"], 42);
+        assert_eq!(
+            body["artifacts"][0]["verified"]["storage_generation"],
+            "9007199254740993"
+        );
         assert_eq!(body["artifacts"][0]["verified"]["sha256"], "b".repeat(64));
         assert_eq!(body["artifacts"][1]["status"], "verifying");
         assert_eq!(body["artifacts"][1]["verified"], Value::Null);
+
+        let initial_batch = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/operator/jobs")
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let initial_batch = to_bytes(initial_batch.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let initial_batch_text = String::from_utf8(initial_batch.to_vec()).unwrap();
+        assert!(!initial_batch_text.contains("private-artifacts"));
+        assert!(!initial_batch_text.contains("private-0"));
+        let initial_batch: Value = serde_json::from_str(&initial_batch_text).unwrap();
+        let initial_job = initial_batch
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["job_id"] == job_id.to_string())
+            .unwrap();
+        assert_eq!(
+            initial_job["artifacts"][0]["verified"]["storage_generation"],
+            "9007199254740993"
+        );
+
+        // A retry with no manifest is the current attempt. The older verified output must not be
+        // presented as current in either the batch job view or the per-job endpoint.
+        sqlx::query("UPDATE job_attempts SET status = 'failed', finished_at = now() WHERE id = $1")
+            .bind(attempt_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retry_attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, started_at, lease_expires_at) \
+             VALUES ($1, $2, 2, $3, 'running', now(), now() + interval '5 minutes')",
+        )
+        .bind(retry_attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let listed = router
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/operator/jobs")
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = to_bytes(listed.into_body(), 1024 * 1024).await.unwrap();
+        let listed: Value = serde_json::from_slice(&listed).unwrap();
+        let listed_job = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["job_id"] == job_id.to_string())
+            .unwrap();
+        assert_eq!(
+            listed_job["current_attempt"]["attempt_id"],
+            retry_attempt_id.to_string()
+        );
+        assert_eq!(listed_job["current_attempt"]["attempt_number"], 2);
+        assert_eq!(listed_job["artifacts"], json!([]));
+
+        let retry_visibility = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/operator/jobs/{job_id}/artifacts"))
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let retry_visibility = to_bytes(retry_visibility.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let retry_visibility: Value = serde_json::from_slice(&retry_visibility).unwrap();
+        assert_eq!(retry_visibility["current_attempt"]["attempt_number"], 2);
+        assert_eq!(retry_visibility["artifacts"], json!([]));
 
         let hidden = router
             .oneshot(

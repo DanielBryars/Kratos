@@ -12,7 +12,7 @@ import { useEffect, useState } from "react";
 
 import {
   artifactRows,
-  type ArtifactList,
+  type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
 
@@ -61,8 +61,9 @@ type Job = {
   stderr: string | null;
   failure_message: string | null;
   output_requirements: OutputRequirement[];
+  current_attempt: { attempt_id: string; attempt_number: number } | null;
+  artifacts: Artifact[];
 };
-type ArtifactLoad = { response: ArtifactList | null; failed: boolean };
 type ApiError = { message?: string };
 
 const DEMO_WORKLOAD_IMAGE = "ghcr.io/danielbryars/kratos-gpu-health-check@sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9";
@@ -125,7 +126,7 @@ export function App() {
   const [groupNames, setGroupNames] = useState<Record<string, string>>({});
   const [workerActionId, setWorkerActionId] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [jobArtifacts, setJobArtifacts] = useState<Record<string, ArtifactLoad>>({});
+  const [jobStatusUnavailable, setJobStatusUnavailable] = useState(false);
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
@@ -149,45 +150,52 @@ export function App() {
       setPending([]);
       setWorkers([]);
       setJobs([]);
-      setJobArtifacts({});
+      setJobStatusUnavailable(false);
       return;
     }
-    let cancelled = false;
+    let stopped = false;
+    let controller: AbortController | null = null;
+    let nextRefresh: number | null = null;
     async function refresh() {
-      const idToken = await user!.getIdToken();
-      const headers = { Authorization: `Bearer ${idToken}` };
-      const [pendingResponse, workersResponse, jobsResponse] = await Promise.all([
-        fetch("/api/v1/operator/worker-registration-requests", { headers }),
-        fetch("/api/v1/operator/workers", { headers }),
-        fetch("/api/v1/operator/jobs", { headers }),
-      ]);
-      if (!cancelled) {
-        if (pendingResponse.ok) setPending((await pendingResponse.json()) as PendingRegistration[]);
-        if (workersResponse.ok) setWorkers((await workersResponse.json()) as Worker[]);
-        if (jobsResponse.ok) {
-          const nextJobs = (await jobsResponse.json()) as Job[];
+      controller = new AbortController();
+      try {
+        const idToken = await user!.getIdToken();
+        if (stopped) return;
+        const headers = { Authorization: `Bearer ${idToken}` };
+        const request = { headers, signal: controller.signal };
+        const [pendingResponse, workersResponse, jobsResponse] = await Promise.all([
+          fetch("/api/v1/operator/worker-registration-requests", request),
+          fetch("/api/v1/operator/workers", request),
+          fetch("/api/v1/operator/jobs", request),
+        ]);
+        const [nextPending, nextWorkers, nextJobs] = await Promise.all([
+          pendingResponse.ok ? pendingResponse.json() as Promise<PendingRegistration[]> : null,
+          workersResponse.ok ? workersResponse.json() as Promise<Worker[]> : null,
+          jobsResponse.ok ? jobsResponse.json() as Promise<Job[]> : null,
+        ]);
+        if (stopped) return;
+        if (nextPending) setPending(nextPending);
+        if (nextWorkers) setWorkers(nextWorkers);
+        if (nextJobs) {
           setJobs(nextJobs);
-          const artifactEntries = await Promise.all(nextJobs.map(async (job) => {
-            try {
-              const response = await fetch(`/api/v1/operator/jobs/${job.job_id}/artifacts`, { headers });
-              if (!response.ok) return [job.job_id, { response: null, failed: true }] as const;
-              return [
-                job.job_id,
-                { response: (await response.json()) as ArtifactList, failed: false },
-              ] as const;
-            } catch {
-              return [job.job_id, { response: null, failed: true }] as const;
-            }
-          }));
-          if (!cancelled) setJobArtifacts(Object.fromEntries(artifactEntries));
+          setJobStatusUnavailable(false);
+        } else {
+          setJobStatusUnavailable(true);
         }
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          if (!stopped) setJobStatusUnavailable(true);
+        }
+      } finally {
+        controller = null;
+        if (!stopped) nextRefresh = window.setTimeout(() => void refresh(), 5000);
       }
     }
     void refresh();
-    const interval = window.setInterval(() => void refresh(), 5000);
     return () => {
-      cancelled = true;
-      window.clearInterval(interval);
+      stopped = true;
+      controller?.abort();
+      if (nextRefresh !== null) window.clearTimeout(nextRefresh);
     };
   }, [user]);
 
@@ -432,6 +440,7 @@ export function App() {
                   <button type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim()} onClick={() => void submitJob()}>{jobAction ? "Updating…" : "Queue job"}</button>
                 </div>
                 {jobs.length === 0 && <p className="muted compact">No jobs have been submitted.</p>}
+                {jobStatusUnavailable && <p className="notice notice--error" role="status">Live job and output status is temporarily unavailable. Showing the last complete snapshot.</p>}
                 <div className="job-list">
                   {jobs.map((job) => (
                     <div className="job" key={job.job_id}>
@@ -446,11 +455,9 @@ export function App() {
                       <div className="artifact-list" aria-label={`Outputs for ${job.name}`}>
                         <div className="artifact-list-heading"><strong>Outputs</strong><span>{job.output_requirements.length} requested</span></div>
                         {job.output_requirements.length === 0 && <p className="artifact-unavailable">No durable outputs were requested for this job.</p>}
-                        {job.output_requirements.length > 0 && !jobArtifacts[job.job_id] && <p className="artifact-unavailable">Loading output status…</p>}
-                        {job.output_requirements.length > 0 && jobArtifacts[job.job_id] && artifactRows(
+                        {job.output_requirements.length > 0 && artifactRows(
                           job.output_requirements,
-                          jobArtifacts[job.job_id].response,
-                          jobArtifacts[job.job_id].failed,
+                          { job_id: job.job_id, artifacts: job.artifacts },
                         ).map((row) => (
                           <div className="artifact" key={row.logical_path}>
                             <div className="artifact-heading">
@@ -459,7 +466,7 @@ export function App() {
                                 {row.artifact?.status ?? "unavailable"}
                               </span>
                             </div>
-                            {!row.artifact && <p className="artifact-unavailable">{row.availability === "request_failed" ? "Output status is currently unavailable." : "The worker has not declared this output."}</p>}
+                            {!row.artifact && <p className="artifact-unavailable">{job.current_attempt ? `Attempt ${job.current_attempt.attempt_number} has not declared this output.` : "No attempt has started, so this output is not declared."}</p>}
                             {row.artifact && (
                               <div className="artifact-evidence">
                                 <p>Attempt {row.artifact.attempt_number} · {formatArtifactBytes(row.artifact.byte_length)} of {formatArtifactBytes(row.max_bytes)}</p>

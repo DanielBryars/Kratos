@@ -166,6 +166,12 @@ verification and rejection state and SHALL expose both the worker-declared size/
 authoritative storage evidence only after verification succeeds. A protection-pending artefact SHALL
 be presented as `verifying`, never as verified.
 
+The normal operator job list SHALL include the same visibility data in one owner-scoped batch. It
+SHALL identify the latest attempt even when that attempt has not declared a manifest, and SHALL show
+only that attempt's artefacts as current. Outputs from an older retry SHALL NOT be promoted as the
+current attempt's output. Cloud Storage generations SHALL cross the JSON boundary as decimal strings
+because their valid range exceeds JavaScript's exact integer range.
+
 The operator response SHALL NOT include a bucket, object key, resumable session URI or read
 credential. An absent declaration, a failed status request and an artefact without verified evidence
 SHALL remain visibly distinct in the web interface. Direct download authority remains deferred.
