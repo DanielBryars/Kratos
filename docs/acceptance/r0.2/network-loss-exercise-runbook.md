@@ -1,6 +1,6 @@
 # R0.2 network-loss exercise runbook
 
-**Status:** Procedure reviewed; execution waits for the immutable soak workload and upgraded agent
+**Status:** Ready to execute once the two digests below are recorded
 **Witness:** the user, who physically disconnects and reconnects the selected worker
 
 ## Requirements
@@ -12,13 +12,15 @@
 
 ## Prerequisites
 
-1. The worker runs an agent image that contains the execution-authority behaviour in the
-   [worker protocol](../../protocol/worker-v1.md#execution-authority-and-network-loss). Record its
-   immutable digest. The image installed for the first scheduled job,
-   `kratos-agent@sha256:d7d03326…`, predates it and exits on the first failed request.
-2. An operator-approved immutable workload SHALL hold the GPU for about ten minutes. PR #43 is the
-   candidate soak workload but is not accepted or published yet. Record its reviewed digest before
-   starting; do not substitute a mutable tag.
+1. The worker runs an agent image built from `main` at or after the execution-authority behaviour
+   in the [worker protocol](../../protocol/worker-v1.md#execution-authority-and-network-loss).
+   Record its immutable digest. The image installed for the first scheduled job,
+   `kratos-agent@sha256:d7d03326…`, predates it: it exits on the first failed request, which is the
+   behaviour this exercise is meant to disprove, so the exercise cannot run against it. Confirm
+   before starting that the installed digest is **not** that one.
+2. The soak workload is merged and published from `main`. Record the **immutable digest** its
+   publish workflow produced and approve that digest as a job image; do not substitute a mutable
+   tag. It holds the GPU for a fixed 600 seconds, which is the window the disconnect happens in.
 3. The worker is `ONLINE IDLE` in the `Home` group with a verified healthy GPU, and no other job is
    queued.
 4. A second device, not on the worker's network link, is signed in to the operator console.
@@ -33,7 +35,7 @@ Record the wall-clock time of every step.
 | Step | Action | Expected |
 |---|---|---|
 | 1 | On the worker, record `docker inspect kratos-agent --format "{{.RestartCount}} {{.Config.Image}}"`. | The restart count and the agent digest from prerequisite 1. |
-| 2 | From the console, submit the long workload with a 900-second maximum runtime. Record the job identifier. | `QUEUED`, then `ASSIGNED` to this worker within one heartbeat, about 30 seconds. |
+| 2 | From the console, submit the soak workload with a 900-second maximum runtime, comfortably above its fixed 600-second duration. Record the job identifier. | `QUEUED`, then `ASSIGNED` to this worker within one heartbeat, about 30 seconds. |
 | 3 | On the worker, run `docker ps --filter label=com.kratos.role=job`. | Exactly one running `kratos-job-<attempt>` container. Record its name. |
 | 4 | When prompted, **disconnect the worker's network**: unplug Ethernet or disable its adapter. Leave the machine running. | — |
 | 5 | Wait until `docker ps -a --filter label=com.kratos.role=job` shows the container as `Exited (0)`, then at least one further minute. | The workload finishes without a network. `docker logs kratos-agent --since 5m` shows `{"status": "retrying", …}` lines and no credential. The console still shows the job as `ASSIGNED`. |
