@@ -227,10 +227,14 @@ def test_the_agent_can_only_emit_counters_the_control_plane_accepts() -> None:
     `OBSERVATION_COUNTERS` in the control plane first, and only then here.
     """
     from kratos_agent.observations import Drop
-    from kratos_agent.pump import ABANDONED_COUNTER, FAILURE_COUNTER
+    from kratos_agent.pump import ABANDONED_COUNTER, FAILURE_COUNTER, WRITE_FAILURE_COUNTER
 
-    emittable = {reason.value for reason in Drop} | {FAILURE_COUNTER, ABANDONED_COUNTER}
-    accepted_by_the_control_plane = {
+    emittable = {reason.value for reason in Drop} | {
+        FAILURE_COUNTER,
+        ABANDONED_COUNTER,
+        WRITE_FAILURE_COUNTER,
+    }
+    known_to_the_control_plane = {
         "dropped.oversize",
         "dropped.malformed",
         "dropped.rate",
@@ -241,7 +245,16 @@ def test_the_agent_can_only_emit_counters_the_control_plane_accepts() -> None:
         "not_exported.otlp_unconfigured",
         "delivery.failures",
     }
-    assert emittable == accepted_by_the_control_plane
+    # `dropped.spool_write_failed` is new on this branch and not in the merged allowlist. That is
+    # safe only because PR #72 makes an unfamiliar name in an approved namespace evidence rather
+    # than grounds for rejecting the result. Before #72 this would have failed a job result the
+    # first time the state volume refused a write.
+    new_since_the_merged_allowlist = {WRITE_FAILURE_COUNTER}
+    assert emittable == known_to_the_control_plane | new_since_the_merged_allowlist
+    assert all(
+        name.startswith(("dropped.", "not_exported.", "delivery."))
+        for name in new_since_the_merged_allowlist
+    )
 
 
 def test_every_accepted_counter_name_passes_the_models_own_rule() -> None:

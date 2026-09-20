@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
+from kratos_agent.courier import ObservationCourier
 from kratos_agent.executor import (
     ATTEMPT_DIRECTORY,
     AuthorityLost,
@@ -39,7 +40,7 @@ from kratos_agent.outputs import (
     discard_tree,
 )
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
-from kratos_agent.pump import CONTROL_PLANE_SINK, DeliveryThread, ObservationPump, batch_records
+from kratos_agent.pump import CONTROL_PLANE_SINK, ObservationPump, batch_records
 from kratos_agent.spool import Batch, ObservationSpool
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 from kratos_agent.uploads import UploadConflict, UploadError, upload_object
@@ -77,6 +78,8 @@ class AgentRunner:
         self._enrolment_credential_path = enrolment_credential_path
         self._collect = capability_collector
         self._executor = executor
+        # One courier for the agent, not one per assignment. Created on first use.
+        self._courier: ObservationCourier | None = None
         self._clock = clock
 
     def ensure_enrolled(self) -> AgentState:
@@ -245,31 +248,40 @@ class AgentRunner:
             updated = self._run_assignment(updated, assignment)
         return updated
 
+    def _observations_root(self) -> Path:
+        return self._state_path.parent / "observations"
+
     def _observation_directory(self, attempt_id: UUID) -> Path:
-        return self._state_path.parent / "observations" / str(attempt_id)
+        return self._observations_root() / str(attempt_id)
 
-    def _build_pump(
-        self, state: AgentState, assignment: JobAssignment
-    ) -> tuple[ObservationPump | None, DeliveryThread | None]:
-        """Create the pump for this attempt, or decline when there is nowhere to send.
+    def _courier_for(self, state: AgentState) -> ObservationCourier | None:
+        """The agent's one courier, created on first use and never stopped for a job.
 
-        No stream means the control plane did not allocate one, which is how it addresses an
-        agent below protocol 1.2 and how it behaves before its own side is deployed. Collecting
-        observations with nowhere to put them would fill the state volume for nothing.
+        Delivery deliberately does not belong to the assignment. The first version of this gave
+        each attempt its own thread and stopped it on the result path, so a control plane that was
+        briefly unreachable could let the job report its result, watch the attempt disappear from
+        polling, and leave records nothing would ever send.
         """
-        stream_id = assignment.observation_stream_id
         worker_id, credential = state.worker_id, state.worker_credential
-        if stream_id is None or worker_id is None or credential is None:
-            return None, None
-        try:
-            spool = ObservationSpool(
-                self._observation_directory(assignment.attempt_id), (CONTROL_PLANE_SINK,)
+        if worker_id is None or credential is None:
+            return None
+        if self._courier is None:
+            self._courier = ObservationCourier(
+                self._observations_root(), self._submit_batch(worker_id, credential)
             )
-        except Exception as error:  # noqa: BLE001 - telemetry never stops a job starting
-            print(json.dumps({"status": "observations_unavailable", "detail": str(error)}))
-            return None, None
+            # Anything an earlier process left behind is picked up here, before any job runs.
+            self._courier.discover()
+            self._courier.start()
+        return self._courier
 
-        def send(batch: Batch) -> int:
+    def _submit_batch(self, worker_id: UUID, credential: str) -> Callable[[UUID, Batch], int]:
+        """Address a batch by the stream the spool recorded, not by an assignment.
+
+        The courier delivers spools whose attempt finished long ago, possibly in another process,
+        so the stream identifier comes from the spool rather than from anything still in memory.
+        """
+
+        def submit(stream_id: UUID, batch: Batch) -> int:
             response = self._client.submit_observation_batch(
                 worker_id,
                 credential,
@@ -284,15 +296,35 @@ class AgentRunner:
                 )
             return response.accepted_through_sequence
 
-        pump = ObservationPump(
+        return submit
+
+    def _build_pump(self, state: AgentState, assignment: JobAssignment) -> ObservationPump | None:
+        """Create the pump for this attempt, or decline when there is nowhere to send.
+
+        No stream means the control plane did not allocate one, which is how it addresses an
+        agent below protocol 1.2 and how it behaves before its own side is deployed. Collecting
+        observations with nowhere to put them would fill the state volume for nothing.
+        """
+        stream_id = assignment.observation_stream_id
+        courier = self._courier_for(state)
+        if stream_id is None or courier is None:
+            return None
+        directory = self._observation_directory(assignment.attempt_id)
+        try:
+            spool = ObservationSpool(directory, (CONTROL_PLANE_SINK,))
+            # Recorded before a single line is collected. A spool that cannot say where it is
+            # addressed can never be delivered by a later process.
+            spool.record_stream(stream_id)
+        except Exception as error:  # noqa: BLE001 - telemetry never stops a job starting
+            print(json.dumps({"status": "observations_unavailable", "detail": str(error)}))
+            return None
+
+        courier.adopt(spool, directory)
+        return ObservationPump(
             spool=spool,
             collector=ObservationCollector(clock=time.monotonic),
-            send=send,
             clock=time.monotonic,
         )
-        delivery = DeliveryThread(pump)
-        delivery.start()
-        return pump, delivery
 
     def _attempt_directory_for(self, attempt_id: UUID) -> Path:
         return self._state_path.parent / ATTEMPT_DIRECTORY / str(attempt_id)
@@ -498,7 +530,7 @@ class AgentRunner:
             )
         result = None
         authorised = True
-        pump, delivery = self._build_pump(state, assignment)
+        pump = self._build_pump(state, assignment)
         if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
             # The pull can take minutes for a multi-gigabyte image, so it heartbeats too.
             pull_state = [state]
@@ -520,10 +552,9 @@ class AgentRunner:
             state, result, authorised = self._supervise(
                 state, assignment, may_start=not resuming, pump=pump
             )
+        # A snapshot, taken now. Delivery is the courier's business and carries on without this
+        # result, past it, and if necessary into another process.
         result = _with_observations(result, pump)
-        if delivery is not None:
-            # Signalled, not waited on. Anything unsent stays in the spool.
-            delivery.stop()
         succeeded = result.exit_code == 0 and not result.timed_out and not result.failure_message
         if assignment.output_requirements and authorised and succeeded:
             # Only a successful result is gated on verified outputs. A failed or timed-out

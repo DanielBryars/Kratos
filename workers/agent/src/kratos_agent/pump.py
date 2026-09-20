@@ -10,18 +10,12 @@ So every public method here swallows its own failures and records them. The wors
 malformed line or a broken spool can do is lose diagnostic data and leave a number saying how much.
 """
 
-import json
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from kratos_agent.models import (
-    MAX_OBSERVATION_BATCH_BYTES,
-    MAX_OBSERVATION_BATCH_RECORDS,
-    ObservationRecord,
-)
+from kratos_agent.models import ObservationRecord
 from kratos_agent.observations import Drop, Kind, Observation, ObservationCollector, Stream
 from kratos_agent.spool import Batch, ObservationSpool
 
@@ -34,8 +28,10 @@ DEFAULT_BATCH_INTERVAL_SECONDS = 2.0
 # What goes to the control plane, and so to MLflow. Log lines belong to the OTLP path.
 _DELIVERED_TO_CONTROL_PLANE = (Kind.PARAM, Kind.METRIC, Kind.PROGRESS)
 
-# Attempts that failed, in their own namespace: a retryable exception is not a lost record.
+# A send that failed and will be retried. Reported by the courier, which is what sends.
 FAILURE_COUNTER = "delivery.failures"
+# A line the agent could not write down. Unlike a failed send, this record is gone.
+WRITE_FAILURE_COUNTER = "dropped.spool_write_failed"
 # Records the agent accepted and then gave up on, counted as records rather than as events.
 ABANDONED_COUNTER = "dropped.delivery_abandoned"
 
@@ -50,33 +46,30 @@ class Delivery:
 
 
 class ObservationPump:
-    """Classifies lines, spools what a sink wants, and drains the spool on an interval.
+    """Classifies an attempt's lines and stores what a sink will want.
 
-    One pump belongs to one attempt, and **it is called from more than one thread**. The log
-    reader calls `ingest` while a delivery thread calls `deliver`, and the runner calls `counters`
-    at the moment it reports a result -- which, because a result never waits for telemetry, can
-    happen while the reader is still delivering its last few lines. The classifier and the spool
-    are single-threaded by design, so this class holds the lock that makes them safe rather than
-    pushing that requirement onto them.
+    It does not deliver. Sending belongs to the agent-level courier, because a spool outlives the
+    attempt that filled it and often the process as well; a pump that also delivered would tie
+    delivery to an assignment, which is exactly the fault this design was corrected for.
+
+    One pump belongs to one attempt and is called from more than one thread: the log reader calls
+    `ingest` while the runner calls `counters` at the moment it reports a result, which can happen
+    while the reader is still handing over its last few lines. The classifier is single-threaded
+    by design, so this class holds the lock for it. The spool holds its own.
     """
 
     def __init__(
         self,
         spool: ObservationSpool,
         collector: ObservationCollector,
-        send: Callable[[Batch], int],
         *,
         clock: Callable[[], float],
         otlp_configured: bool = False,
-        batch_interval_seconds: float = DEFAULT_BATCH_INTERVAL_SECONDS,
     ) -> None:
         self._spool = spool
         self._collector = collector
-        self._send = send
         self._clock = clock
         self._otlp_configured = otlp_configured
-        self._interval = batch_interval_seconds
-        self._last_send = float("-inf")
         self._lock = threading.Lock()
         self._result: dict[str, object] | None = None
         self._failures = 0
@@ -115,62 +108,14 @@ class ObservationPump:
             return
         self._spool.append({"record": "log", "at": None})
 
-    # --- Sending them on ------------------------------------------------------------------------
-
-    def deliver(self, *, force: bool = False) -> Delivery:
-        """Send at most one batch, if the interval has elapsed. Never raises.
-
-        Called from the supervision tick, so it does one bounded unit of work and returns. A batch
-        that fails is left in the spool: the next call resends the same one, which is safe because
-        the control plane is idempotent on stream and sequence.
-        """
-        try:
-            with self._lock:
-                return self._deliver(force=force)
-        except Exception as error:  # noqa: BLE001 - an outage is not a supervision failure
-            self._failures += 1
-            self._last_send = self._clock()
-            return Delivery(sent=False, detail=str(error))
-
-    def _deliver(self, *, force: bool) -> Delivery:
-        now = self._clock()
-        if not force and now - self._last_send < self._interval:
-            return Delivery(sent=False)
-        batch = self._spool.next_batch(
-            CONTROL_PLANE_SINK,
-            limit=MAX_OBSERVATION_BATCH_RECORDS,
-            max_bytes=MAX_OBSERVATION_BATCH_BYTES,
-        )
-        if batch is None:
-            self._last_send = now
-            return Delivery(sent=False)
-        accepted = self._send(batch)
-        self._last_send = self._clock()
-        self._spool.acknowledge(CONTROL_PLANE_SINK, accepted)
-        return Delivery(sent=True, accepted_through_sequence=accepted)
-
-    def refuse_current_batch(self) -> None:
-        """Forget the in-flight batch after the control plane rejects it outright.
-
-        A 409 means this identifier now names different content, so resending it cannot succeed.
-        The records stay in the spool and the next batch is assembled fresh.
-        """
-        try:
-            with self._lock:
-                self._spool.abandon_inflight()
-        except Exception:  # noqa: BLE001
-            self._failures += 1
-
     def pending(self) -> bool:
-        """Whether anything is still waiting for the control plane.
+        """Whether anything is still owed to the control plane.
 
-        Read by the agent-level pump that keeps delivering after an attempt is terminal. It is
-        never a reason to delay a result: the control plane accepts late batches for a stream that
-        already exists, so undelivered telemetry outlives the attempt rather than holding it open.
+        Never a reason to delay a result. The courier keeps sending after the attempt is terminal,
+        and the control plane accepts late batches for a stream that already exists.
         """
         try:
-            with self._lock:
-                return self._spool.pending(CONTROL_PLANE_SINK)
+            return self._spool.pending(CONTROL_PLANE_SINK)
         except Exception:  # noqa: BLE001
             return False
 
@@ -205,53 +150,12 @@ class ObservationPump:
         if abandoned:
             counters[ABANDONED_COUNTER] = counters.get(ABANDONED_COUNTER, 0) + abandoned
         if self._failures:
-            # Attempts that failed, not records that were lost. A retryable exception says
-            # nothing about whether the record eventually arrived, so it must not be counted in
-            # the `dropped.` namespace where it would read as loss.
-            counters[FAILURE_COUNTER] = self._failures
+            # A line the agent could not store at all, usually because the state volume refused
+            # the write. That is a lost record, so it belongs in `dropped.`; it is deliberately
+            # not `delivery.failures`, which means a send that failed and will be retried and
+            # says nothing about whether the record survived.
+            counters[WRITE_FAILURE_COUNTER] = self._failures
         return counters
-
-
-class DeliveryThread:
-    """Runs a pump's deliveries on its own thread.
-
-    Delivery is not called from the supervision tick on purpose. A batch request has a
-    fifteen-second timeout and the tick is what drives heartbeats, so a slow control plane would
-    delay a heartbeat by up to that much and could cost the worker its lease. The same rule that
-    keeps a result from waiting on telemetry applies one layer down.
-    """
-
-    def __init__(
-        self,
-        pump: ObservationPump,
-        *,
-        poll_seconds: float = 0.5,
-        sleep: Callable[[float], None] = time.sleep,
-    ) -> None:
-        self._pump = pump
-        self._poll = poll_seconds
-        self._sleep = sleep
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = threading.Thread(target=self._run, name="kratos-observations", daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            self._pump.deliver()
-            self._sleep(self._poll)
-
-    def stop(self) -> None:
-        """Ask the thread to finish, and do not wait for it.
-
-        Nothing about a result waits on telemetry, including this. The thread is a daemon, and
-        anything still unsent stays in the spool for the agent to deliver later.
-        """
-        self._stop.set()
 
 
 def _wire_record(observation: Observation) -> dict[str, object]:
@@ -280,7 +184,3 @@ def batch_records(batch: Batch) -> tuple[ObservationRecord, ...]:
     into the wire model here is what stops a malformed spool entry becoming a malformed request.
     """
     return tuple(ObservationRecord.model_validate(record) for record in batch.records)
-
-
-def encoded_size(records: tuple[ObservationRecord, ...]) -> int:
-    return len(json.dumps([record.model_dump(mode="json") for record in records]).encode("utf-8"))

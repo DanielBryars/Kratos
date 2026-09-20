@@ -29,6 +29,7 @@ above a cursor to be reported explicitly rather than inferred from a hole in the
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ MAX_SPOOL_BYTES = 32 * 1024 * 1024
 COMPACT_THRESHOLD_BYTES = 4 * 1024 * 1024
 
 RECORDS_NAME = "records.jsonl"
+STREAM_NAME = "stream.json"
 CURSORS_NAME = "cursors.json"
 INFLIGHT_NAME = "inflight.json"
 
@@ -111,6 +113,10 @@ class ObservationSpool:
     """
 
     def __init__(self, root: Path, sinks: Iterable[str]) -> None:
+        # Held by every public method. The spool outlives the attempt that created it: an
+        # attempt's log reader may still be appending while the agent-level courier is reading
+        # and acknowledging, and after the attempt ends the courier is the only caller left.
+        self._lock = threading.RLock()
         self._sinks = tuple(dict.fromkeys(sinks))
         if not self._sinks:
             raise SpoolError("a spool needs at least one sink to retain records for")
@@ -118,6 +124,7 @@ class ObservationSpool:
         self._records_path = root / RECORDS_NAME
         self._cursors_path = root / CURSORS_NAME
         self._inflight_path = root / INFLIGHT_NAME
+        self._stream_path = root / STREAM_NAME
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         self._cursors: dict[str, int] = dict.fromkeys(self._sinks, 0)
@@ -125,6 +132,29 @@ class ObservationSpool:
         self._last_sequence = 0
         self._bytes = 0
         self._load()
+
+    # --- Stream identity -------------------------------------------------------------------------
+
+    def record_stream(self, stream_id: UUID) -> None:
+        """Write down which control-plane stream these records belong to.
+
+        The courier that delivers a spool after a restart has no assignment to read this from:
+        the attempt is gone, and with it the only thing that knew where its observations were
+        addressed. Without this on disk, a spool that survived a crash could never be sent.
+        """
+        with self._lock:
+            _atomic_write(self._stream_path, {"schema_version": 1, "stream_id": str(stream_id)})
+
+    @property
+    def stream_id(self) -> UUID | None:
+        with self._lock:
+            if not self._stream_path.exists():
+                return None
+            try:
+                stored = json.loads(self._stream_path.read_text(encoding="utf-8"))
+                return UUID(str(stored["stream_id"]))
+            except (OSError, ValueError, KeyError):
+                return None
 
     # --- Recovery ------------------------------------------------------------------------------
 
@@ -175,6 +205,10 @@ class ObservationSpool:
 
     def append(self, record: dict[str, Any]) -> int:
         """Store one record and return the sequence it was given."""
+        with self._lock:
+            return self._append(record)
+
+    def _append(self, record: dict[str, Any]) -> int:
         sequence = self._last_sequence + 1
         stored = {**record, "sequence": sequence}
         line = json.dumps(stored, separators=(",", ":")) + "\n"
@@ -264,6 +298,10 @@ class ObservationSpool:
     # --- Reading -------------------------------------------------------------------------------
 
     def next_batch(self, sink: str, limit: int, max_bytes: int) -> Batch | None:
+        with self._lock:
+            return self._next_batch(sink, limit, max_bytes)
+
+    def _next_batch(self, sink: str, limit: int, max_bytes: int) -> Batch | None:
         """The next contiguous run for this sink, or None when it has taken everything.
 
         A batch already in flight is returned unchanged, with the identity it was first given, so
@@ -339,6 +377,10 @@ class ObservationSpool:
     # --- Acknowledgement -----------------------------------------------------------------------
 
     def acknowledge(self, sink: str, through_sequence: int) -> None:
+        with self._lock:
+            self._acknowledge(sink, through_sequence)
+
+    def _acknowledge(self, sink: str, through_sequence: int) -> None:
         """Record that this sink holds everything up to and including `through_sequence`."""
         if sink not in self._cursors:
             raise SpoolError("unknown sink")
@@ -350,6 +392,10 @@ class ObservationSpool:
         self._compact_if_worthwhile()
 
     def abandon_inflight(self) -> None:
+        with self._lock:
+            self._abandon_inflight()
+
+    def _abandon_inflight(self) -> None:
         """Forget the in-flight batch without advancing anything.
 
         Used when the control plane refuses a batch outright, so the next attempt builds a fresh
@@ -376,9 +422,19 @@ class ObservationSpool:
     # --- Reporting -----------------------------------------------------------------------------
 
     def gaps(self, sink: str) -> tuple[Gap, ...]:
+        # Named apart from the `_gaps` mapping it reads, which a private twin would
+        # shadow: the attribute wins, and the call becomes a dict lookup.
+        with self._lock:
+            return self._gaps_for(sink)
+
+    def _gaps_for(self, sink: str) -> tuple[Gap, ...]:
         return tuple(self._gaps.get(sink, ()))
 
     def cursor(self, sink: str) -> int:
+        with self._lock:
+            return self._cursor(sink)
+
+    def _cursor(self, sink: str) -> int:
         return self._cursors[sink]
 
     @property
@@ -386,11 +442,30 @@ class ObservationSpool:
         return self._last_sequence
 
     def pending(self, sink: str) -> bool:
+        with self._lock:
+            return self._pending(sink)
+
+    def _pending(self, sink: str) -> bool:
         return self._cursors[sink] < self._last_sequence
 
     def discard(self) -> None:
-        """Remove everything for this attempt, once every sink has been satisfied or given up."""
-        for path in (self._records_path, self._cursors_path, self._inflight_path):
+        with self._lock:
+            self._discard()
+
+    def _discard(self) -> None:
+        """Remove everything for this attempt, once every sink has been satisfied or given up.
+
+        Every file this class writes has to be listed here. The directory is removed only when it
+        is empty, so one forgotten file leaves it behind for ever, and the failure is silent: the
+        records are gone, the cursor is gone, and all that remains is a directory the courier
+        will pick up and find nothing in.
+        """
+        for path in (
+            self._records_path,
+            self._cursors_path,
+            self._inflight_path,
+            self._stream_path,
+        ):
             path.unlink(missing_ok=True)
         with os.scandir(self._root) as entries:
             if not any(entries):
