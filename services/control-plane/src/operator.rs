@@ -526,6 +526,10 @@ pub(crate) async fn create_worker_enrolment(
         .map_err(|_| OperatorError::internal())?;
     let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
     let owner_identity_id = caller.identity_id;
+    // The enrolment carries the project forward to the worker that consumes it, which is
+    // the only place that path can learn it: the agent presenting the credential has no
+    // identity of its own to resolve one from.
+    let project_id = caller.sole_project()?;
     let credential =
         credentials::issue(CredentialKind::Enrolment).map_err(|_| OperatorError::internal())?;
     let expires_at = Utc::now()
@@ -533,11 +537,13 @@ pub(crate) async fn create_worker_enrolment(
         .ok_or_else(OperatorError::invalid_request)?;
 
     sqlx::query(
-        "INSERT INTO worker_enrolments (id, owner_identity_id, token_verifier, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO worker_enrolments \
+         (id, owner_identity_id, project_id, token_verifier, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(credential.id)
     .bind(owner_identity_id)
+    .bind(project_id)
     .bind(&credential.verifier)
     .bind(expires_at)
     .execute(&mut *transaction)

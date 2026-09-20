@@ -489,6 +489,7 @@ impl IntoResponse for ApiError {
 #[derive(FromRow)]
 struct EnrolmentRecord {
     owner_identity_id: Uuid,
+    project_id: Uuid,
     token_verifier: String,
     expires_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
@@ -876,7 +877,7 @@ pub(crate) async fn enrol_worker(
     }
 
     let record = sqlx::query_as::<_, EnrolmentRecord>(
-        "SELECT owner_identity_id, token_verifier, expires_at, consumed_at, revoked_at \
+        "SELECT owner_identity_id, project_id, token_verifier, expires_at, consumed_at, revoked_at \
          FROM worker_enrolments WHERE id = $1",
     )
     .bind(credential_id)
@@ -911,7 +912,7 @@ pub(crate) async fn enrol_worker(
         .await
         .map_err(|error| database_error(&error, "begin enrolment"))?;
     let locked = sqlx::query_as::<_, EnrolmentRecord>(
-        "SELECT owner_identity_id, token_verifier, expires_at, consumed_at, revoked_at \
+        "SELECT owner_identity_id, project_id, token_verifier, expires_at, consumed_at, revoked_at \
          FROM worker_enrolments WHERE id = $1 FOR UPDATE",
     )
     .bind(credential_id)
@@ -930,11 +931,14 @@ pub(crate) async fn enrol_worker(
 
     sqlx::query(
         "INSERT INTO workers \
-         (id, owner_identity_id, agent_instance_id, display_name, protocol_version, capabilities) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (id, owner_identity_id, project_id, agent_instance_id, display_name, protocol_version, capabilities) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(worker_id)
     .bind(record.owner_identity_id)
+    // Taken from the locked row rather than the unlocked read above: they agree today, and
+    // a worker landing in the wrong project is not a failure anyone would notice quickly.
+    .bind(locked.project_id)
     .bind(request.agent_instance_id)
     .bind(request.display_name.trim())
     .bind(&request.protocol_version)
