@@ -48,10 +48,12 @@ attempt belongs to this worker, and that one `job.assigned` and one `job.finishe
 
 ## Interpreting the console during the exercise
 
-The agent sends no heartbeat while it supervises a container. The console therefore shows a busy
-worker as `STALE` after 90 seconds and `OFFLINE` after five minutes whether or not its link is
-healthy. Worker connectivity is **not** evidence in this exercise; the job state, the container
-listing and the Docker event log are.
+The agent heartbeats while it supervises a container, so the worker SHALL read `ONLINE BUSY` from
+assignment until step 4. After the disconnect it SHALL read `STALE` within 90 seconds and `OFFLINE`
+after five minutes, and return to `ONLINE` after step 7. Record those times. A worker that shows
+`STALE` before step 4 is running an agent image that predates in-job heartbeats; stop and correct
+prerequisite 1. Connectivity shows that the outage was real; the no-duplicate evidence remains the
+job state, the container listing and the Docker event log.
 
 ## Failure handling
 
