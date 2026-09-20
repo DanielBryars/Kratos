@@ -112,45 +112,95 @@ it only in browser memory; reloading the page requires the operator to issue a r
 
 The `observability` root builds the [ADR-009](../docs/architecture/decisions/009-observability-and-mlflow.md)
 stack — Grafana, Prometheus, Loki, Tempo, an OpenTelemetry Collector gateway and MLflow — on one
-Compute Engine instance. Its configuration is the bundle proven locally in
-[`observability/`](../observability/README.md); this root only provides the machine, storage,
-network and authenticated entry points.
+Compute Engine instance. Its configuration is the bundle in
+[`observability/`](../observability/README.md), applied with `compose.cloud.yaml`, which is the
+overlay that makes that bundle serve a load balancer and keep its data off the boot disk.
 
-`enable_observability` defaults to `false`, and with the gate closed the root plans to **no
-resources at all**. This is deliberate: unlike Cloud Run, an instance and a persistent disk bill
-continuously whether or not anyone opens a dashboard. Enabling it is the user's decision, not a
-side effect of a merge, so no deployment workflow sets it.
+`enable_observability` defaults to `false`, and with the gate closed the root plans **no resources
+at all**. Unlike Cloud Run, an instance and a persistent disk bill continuously whether or not
+anyone opens a dashboard, so enabling it is the user's decision and no workflow sets it. CI only
+formats and validates.
 
-Before the first enabled apply:
+### Who applies this
 
-1. Decide the spend. One `e2-standard-2` with a 50 GB balanced disk, a load balancer, NAT and
-   modest egress is the recurring cost; confirm the current figure from GCP's price list for the
-   chosen region rather than from this file, and set a budget alert.
-2. Create an OAuth client for Identity-Aware Proxy and pass `oauth_client_id` and
-   `oauth_client_secret`. Terraform does not create the client. Without it the backend services
-   would be published unauthenticated, so do not apply until it exists.
-3. Set `iap_member` to the one principal allowed in, such as `user:someone@example.com`.
-4. Decide whether MLflow metadata goes on the existing Cloud SQL instance. `enable_mlflow_database`
-   is a separate gate and requires the platform database to be enabled first.
+A human operator applies this root with their own credentials. The federated deployment identity
+used by CI is deliberately **not** granted the Compute, Secret Manager, IAP and Storage roles this
+root needs: an automated pipeline that could create billable infrastructure or alter an
+authentication boundary is a larger blast radius than the convenience is worth.
 
-After the first apply, copy the three `required_dns_records` addresses to the DNS provider.
-Certificate issuance begins once those names resolve. Then upload the observability bundle to the
-`config_bucket` as `bundles/observability-current.tar.gz`; the instance unpacks and starts it, and
-replacing that object updates the stack without recreating the instance.
+### Before the first enabled apply
 
-What the root commits to:
+1. **Decide the spend.** One `e2-standard-2`, a 50 GB balanced disk, a load balancer, NAT and
+   egress bill continuously. Take the current figures from GCP's price list for your region rather
+   than from this file, and set a budget alert first.
+2. **Create the IAP OAuth client** in the console and keep its identifier and secret. Terraform does
+   not create it, and an enabled plan **fails** without it rather than creating backend services
+   with IAP disabled, which would publish Grafana and MLflow unauthenticated.
+3. **Decide where the OAuth secret lives.** Terraform holds `oauth_client_secret` in state, so the
+   state bucket is exactly as sensitive as the secret. It is the bucket created by the bootstrap
+   root, which is private and versioned; treat access to it accordingly.
+4. **Decide about MLflow metadata.** `enable_mlflow_database` is a separate gate and needs the
+   platform database enabled first.
+
+### Applying
+
+Run from the repository root. The backend prefix keeps this root's state beside the others and must
+be unique to it:
+
+```shell
+terraform -chdir=infrastructure/observability init \
+  -backend-config="bucket=YOUR_STATE_BUCKET" \
+  -backend-config="prefix=observability"
+
+terraform -chdir=infrastructure/observability apply \
+  -var project_id=YOUR_PROJECT \
+  -var domain_name=kratos.bryars.com \
+  -var 'iap_member=user:you@example.com' \
+  -var enable_observability=true \
+  -var oauth_client_id=YOUR_CLIENT_ID
+```
+
+Leave `oauth_client_secret` off the command line: Terraform prompts for it, so it does not reach
+the shell history or the process list. In PowerShell the same commands work with the quoting
+reversed — use `--%` or double quotes around `iap_member`, for example
+`terraform -chdir=infrastructure/observability apply -var "iap_member=user:you@example.com"`.
+
+Then, once:
+
+```shell
+# The password Terraform never sees.
+"YOUR_PASSWORD" | gcloud secrets versions add kratos-observability-grafana-admin --data-file=-
+
+# The bundle the instance runs. Re-upload this to update the stack.
+tar -czf observability.tar.gz observability
+gcloud storage cp observability.tar.gz \
+  "gs://$(terraform -chdir=infrastructure/observability output -raw config_bucket)/bundles/observability-current.tar.gz"
+```
+
+Copy the three `required_dns_records` addresses to the DNS provider. Certificate issuance begins
+once those names resolve. The instance re-reads the bundle object every few minutes and restarts
+the stack when its generation changes, so replacing that object is how the configuration is
+updated; the instance is not recreated.
+
+### What this root commits to
 
 - The instance has **no public address**. Egress uses Cloud NAT, and the only ingress rule admits
-  Google's load-balancer ranges to the service ports; a default deny covers everything else. So
+  Google's load-balancer ranges to the published service ports, with a default deny behind it. So
   Prometheus, Loki and Tempo have no route from outside the VPC.
-- Grafana and MLflow are behind IAP, so an unauthenticated request never reaches the service.
+- **Containers cannot reach the instance metadata server.** The startup script rejects traffic to
+  `169.254.169.254` from the Docker bridges, so a compromised service cannot mint the instance's
+  token. The Cloud SQL Auth Proxy uses the host network namespace instead.
+- Grafana and MLflow sit behind IAP, restricted to `iap_member`. **OTLP ingestion is a separate
+  gate, `enable_otlp_ingress`, and is off**: nothing authenticates a worker sending telemetry yet,
+  so publishing it would expose unauthenticated ingestion. Until ADR-009's scoped worker credential
+  is decided, leave it off and send telemetry from inside the VPC.
 - The instance runs Container-Optimized OS with Secure Boot, vTPM, integrity monitoring and OS
-  Login, as a dedicated service account that can read its configuration bucket and write telemetry
-  objects, and can deploy nothing.
-- Loki chunks and Tempo blocks expire by object lifecycle at 30 and 14 days, alongside the
-  in-service retention the bundle configures.
-
-Known gap: the OTLP endpoint is **not** behind IAP, because workers are not humans and present a
-Kratos credential instead. ADR-009 requires that credential to be scoped and revocable, and the
-decision is still open (recorded in ADR-015). Until it lands, treat `otel.` as authenticated by
-nothing and do not enable this root's OTLP path for a fleet outside the home network.
+  Login, as a service account that can read its configuration bucket, write telemetry objects and
+  log in to Cloud SQL, and deploy nothing.
+- Its data disk is only formatted when it carries **no filesystem signature**. `fsck` exiting
+  non-zero because it corrected errors never triggers a reformat.
+- Compose is fetched as a pinned binary and verified against a recorded SHA-256 before it runs,
+  because Container-Optimized OS ships no Compose plugin.
+- Prometheus, Loki, Tempo and Grafana keep their state on the persistent disk; Loki chunks, Tempo
+  blocks and MLflow artefacts go to Cloud Storage; MLflow metadata goes to Cloud SQL over the Auth
+  Proxy with IAM authentication, so no database password exists.

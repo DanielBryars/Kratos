@@ -8,14 +8,46 @@
 # service itself. Prometheus, Loki and Tempo have no route from outside the VPC, which is what
 # ADR-009 requires of the backends.
 
+# Fail the plan, before anything billable exists, rather than creating backend services with IAP
+# disabled and publishing Grafana and MLflow unauthenticated.
+resource "terraform_data" "iap_client_required" {
+  count = local.enabled
+
+  lifecycle {
+    precondition {
+      condition = !var.require_iap_client || (
+        var.oauth_client_id != "" && var.oauth_client_secret != ""
+      )
+      error_message = join(" ", [
+        "enable_observability is true but no IAP OAuth client was supplied.",
+        "Create the client, then pass oauth_client_id and oauth_client_secret.",
+        "Grafana and MLflow would otherwise be published without authentication.",
+      ])
+    }
+  }
+}
+
 locals {
-  enabled        = var.enable_observability ? 1 : 0
-  mlflow_db      = var.enable_observability && var.enable_mlflow_database ? 1 : 0
+  enabled   = var.enable_observability ? 1 : 0
+  mlflow_db = var.enable_observability && var.enable_mlflow_database ? 1 : 0
+  # OTLP ingestion is published only when explicitly enabled, because nothing authenticates a
+  # worker yet: ADR-009 requires a scoped revocable credential and that decision is open.
+  otlp           = var.enable_observability && var.enable_otlp_ingress ? 1 : 0
   name           = "kratos-observability"
   grafana_host   = "grafana.${var.domain_name}"
   mlflow_host    = "mlflow.${var.domain_name}"
   otel_host      = "otel.${var.domain_name}"
   human_services = { grafana = 3000, mlflow = 5000 }
+  mlflow_instance = var.enable_mlflow_database ? (
+    "${var.project_id}:${var.region}:${var.mlflow_database_instance}"
+  ) : ""
+  # IAM database authentication: the proxy supplies the credential, so no password exists.
+  mlflow_database_uri = var.enable_mlflow_database ? (
+    "postgresql://${local.mlflow_database_user}@cloud-sql-proxy:5432/mlflow"
+  ) : "sqlite:////var/lib/mlflow/mlflow.db"
+  mlflow_database_user = var.enable_mlflow_database ? (
+    trimsuffix(google_service_account.observability[0].email, ".gserviceaccount.com")
+  ) : ""
 }
 
 resource "google_project_service" "observability" {
@@ -116,10 +148,14 @@ resource "google_sql_user" "mlflow" {
 }
 
 resource "google_project_iam_member" "cloud_sql_client" {
-  count = local.mlflow_db
+  for_each = var.enable_observability && var.enable_mlflow_database ? toset([
+    "roles/cloudsql.client",
+    # Without instanceUser the proxy connects but IAM database login is refused.
+    "roles/cloudsql.instanceUser",
+  ]) : toset([])
 
   project = var.project_id
-  role    = "roles/cloudsql.client"
+  role    = each.value
   member  = google_service_account.observability[0].member
 }
 
@@ -179,7 +215,12 @@ resource "google_compute_firewall" "from_load_balancer" {
 
   allow {
     protocol = "tcp"
-    ports    = ["3000", "5000", "4317", "4318"]
+    # Grafana and MLflow, plus the OTLP ports and the collector health endpoint only when OTLP
+    # ingestion is enabled. Nothing else is reachable, from anywhere.
+    ports = concat(
+      ["3000", "5000"],
+      var.enable_otlp_ingress ? ["4317", "4318", "13133"] : [],
+    )
   }
 }
 
@@ -255,54 +296,40 @@ resource "google_compute_instance" "observability" {
     google-logging-enabled = "TRUE"
     config-bundle          = "gs://${google_storage_bucket.config[0].name}/${var.config_bundle_object}"
     telemetry-bucket       = google_storage_bucket.telemetry[0].name
-    user-data              = local.cloud_init
+    compose-url            = var.compose_url
+    compose-sha256         = var.compose_sha256
+    grafana-secret         = google_secret_manager_secret.grafana_password[0].secret_id
+    grafana-user           = var.grafana_admin_user
+    grafana-host           = local.grafana_host
+    mlflow-host            = local.mlflow_host
+    mlflow-instance        = local.mlflow_instance
+    mlflow-database-uri    = local.mlflow_database_uri
+    startup-script         = file("${path.module}/files/startup.sh")
   }
 
   tags = ["kratos-observability"]
+}
 
-  lifecycle {
-    ignore_changes = [metadata["user-data"]]
+# The password is created empty: Terraform never holds its value, and the user adds a version with
+# `gcloud secrets versions add`. The instance reads the latest version at boot.
+resource "google_secret_manager_secret" "grafana_password" {
+  count = local.enabled
+
+  project   = var.project_id
+  secret_id = "kratos-observability-grafana-admin"
+
+  replication {
+    auto {}
   }
 }
 
-# Mount the data disk, fetch the configuration bundle and start it. The bundle, not this file, holds
-# the service configuration, so replacing it does not recreate the instance.
-locals {
-  cloud_init = <<-EOT
-    #cloud-config
+resource "google_secret_manager_secret_iam_member" "grafana_password" {
+  count = local.enabled
 
-    bootcmd:
-      - fsck.ext4 -tvy /dev/disk/by-id/google-observability-data || mkfs.ext4 -F /dev/disk/by-id/google-observability-data
-      - mkdir -p /mnt/disks/data
-      - mount -o discard,defaults /dev/disk/by-id/google-observability-data /mnt/disks/data
-
-    write_files:
-      - path: /etc/systemd/system/kratos-observability.service
-        content: |
-          [Unit]
-          Description=Kratos observability stack
-          Wants=network-online.target
-          After=network-online.target
-
-          [Service]
-          Type=oneshot
-          RemainAfterExit=true
-          WorkingDirectory=/mnt/disks/data/bundle
-          ExecStartPre=/bin/mkdir -p /mnt/disks/data/bundle
-          ExecStartPre=/bin/sh -c 'docker run --rm -v /mnt/disks/data:/data google/cloud-sdk:slim \
-            gcloud storage cp "$(curl -sf -H Metadata-Flavor:Google \
-            http://metadata.google.internal/computeMetadata/v1/instance/attributes/config-bundle)" \
-            /data/bundle.tar.gz'
-          ExecStartPre=/bin/tar -xzf /mnt/disks/data/bundle.tar.gz -C /mnt/disks/data/bundle --strip-components=1
-          ExecStart=/usr/bin/docker compose up -d --remove-orphans
-
-          [Install]
-          WantedBy=multi-user.target
-
-    runcmd:
-      - systemctl daemon-reload
-      - systemctl enable --now kratos-observability.service
-  EOT
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.grafana_password[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = google_service_account.observability[0].member
 }
 
 resource "google_compute_instance_group" "observability" {
@@ -314,7 +341,10 @@ resource "google_compute_instance_group" "observability" {
   instances = [google_compute_instance.observability[0].id]
 
   dynamic "named_port" {
-    for_each = merge(local.human_services, { otlp = 4318 })
+    for_each = merge(
+      local.human_services,
+      var.enable_otlp_ingress ? { otlp = 4318 } : {},
+    )
     content {
       name = named_port.key
       port = named_port.value
@@ -323,11 +353,14 @@ resource "google_compute_instance_group" "observability" {
 }
 
 resource "google_compute_health_check" "observability" {
-  for_each = var.enable_observability ? {
-    grafana = { port = 3000, path = "/api/health" }
-    mlflow  = { port = 5000, path = "/health" }
-    otlp    = { port = 13133, path = "/" }
-  } : {}
+  for_each = var.enable_observability ? merge(
+    {
+      grafana = { port = 3000, path = "/api/health" }
+      mlflow  = { port = 5000, path = "/health" }
+    },
+    # The collector's health endpoint, which the cloud overlay publishes and the firewall admits.
+    var.enable_otlp_ingress ? { otlp = { port = 13133, path = "/" } } : {},
+  ) : {}
 
   project = var.project_id
   name    = "${local.name}-${each.key}"
@@ -369,7 +402,7 @@ resource "google_compute_backend_service" "human" {
 # Workers post OTLP with a Kratos credential, so this backend is not behind IAP. Until the worker
 # telemetry credential is decided, it is reachable but authenticated by nothing; see the README.
 resource "google_compute_backend_service" "otlp" {
-  count = local.enabled
+  count = local.otlp
 
   project               = var.project_id
   name                  = "${local.name}-otlp"
@@ -402,7 +435,10 @@ resource "google_compute_managed_ssl_certificate" "observability" {
   name    = local.name
 
   managed {
-    domains = [local.grafana_host, local.mlflow_host, local.otel_host]
+    domains = concat(
+      [local.grafana_host, local.mlflow_host],
+      local.otlp == 1 ? [local.otel_host] : [],
+    )
   }
 }
 
@@ -423,9 +459,12 @@ resource "google_compute_url_map" "observability" {
     path_matcher = "mlflow"
   }
 
-  host_rule {
-    hosts        = [local.otel_host]
-    path_matcher = "otlp"
+  dynamic "host_rule" {
+    for_each = local.otlp == 1 ? [local.otel_host] : []
+    content {
+      hosts        = [host_rule.value]
+      path_matcher = "otlp"
+    }
   }
 
   path_matcher {
@@ -438,9 +477,12 @@ resource "google_compute_url_map" "observability" {
     default_service = google_compute_backend_service.human["mlflow"].id
   }
 
-  path_matcher {
-    name            = "otlp"
-    default_service = google_compute_backend_service.otlp[0].id
+  dynamic "path_matcher" {
+    for_each = local.otlp == 1 ? [google_compute_backend_service.otlp[0].id] : []
+    content {
+      name            = "otlp"
+      default_service = path_matcher.value
+    }
   }
 }
 
