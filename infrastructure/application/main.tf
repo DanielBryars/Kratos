@@ -35,6 +35,16 @@ resource "google_cloud_run_v2_service" "control_plane" {
         value = "kratos_control_plane=info"
       }
 
+      env {
+        name  = "KRATOS_ARTIFACT_BUCKET"
+        value = var.artifact_bucket
+      }
+
+      env {
+        name  = "KRATOS_ARTIFACT_SIGNER_SERVICE_ACCOUNT"
+        value = var.artifact_upload_signer_service_account
+      }
+
       dynamic "env" {
         for_each = var.identity_platform_api_key == "" ? {} : {
           KRATOS_IDENTITY_PLATFORM_API_KEY    = var.identity_platform_api_key

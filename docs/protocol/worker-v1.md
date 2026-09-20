@@ -245,23 +245,30 @@ contain every mandatory exact path, MAY contain declared optional paths, and SHA
 undeclared path. Replaying the same UUID and content returns the same artefact identifiers and object
 keys. A changed replay or second manifest conflicts.
 
-The first control-plane slice exposes two replay-safe transfer-state calls:
+The control plane exposes two replay-safe transfer calls:
 
-- `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading`. Its response
-  identifies the opaque object key. A later storage integration will add the short-lived signed
-  resumable-upload authority described by ADR-014.
+- `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading` and returns a
+  ten-minute, per-object GCS V4 signed `POST` plus the exact headers required to initiate a
+  resumable upload. The worker SHALL send those headers unchanged, keep the returned session URI
+  private, and upload only the declared bytes through that session. Replaying the call while the
+  attempt is active MAY issue a fresh initiation grant for the same bucket and object key.
 - `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
-  returned byte length and CRC32C. A matching retry returns the stored response; different evidence
-  conflicts. An authenticated matching retry remains valid after the attempt becomes terminal, but
-  a terminal attempt cannot start or alter an upload.
+  returned byte length and CRC32C, then independently reads that exact object generation from GCS.
+  A matching retry returns the stored verified response; different evidence conflicts. An
+  authenticated matching retry remains valid after the attempt becomes terminal, but a terminal
+  attempt cannot start or alter an upload.
 
-Upload completion SHALL remain visibly `verification_pending` and the artefact SHALL remain in the
-`uploading` state until a control-plane storage adapter reads authoritative Cloud Storage metadata.
-The worker's completion report alone SHALL NOT mark an artefact `verified`. Verification SHALL
-record its server-side source and the observed generation, byte length and CRC32C, all of which
-SHALL match the immutable declaration and completion report. A successful job result SHALL be
-rejected while any mandatory output lacks this evidence. Failed job results do not require
-mandatory outputs, so a workload failure cannot leave the worker permanently occupied.
+The worker's completion report alone SHALL NOT mark an artefact `verified`. The control plane SHALL
+match the configured bucket, opaque object key, immutable generation, byte length, CRC32C and the
+`kratos-sha256` custom metadata against the declaration and completion report. A missing object or
+temporary GCS failure leaves verification retryable. A metadata mismatch marks the artefact
+`rejected`; it SHALL NOT be published as valid output. A successful job result SHALL be rejected
+while any mandatory output lacks verified evidence. Failed job results do not require mandatory
+outputs, so a workload failure cannot leave the worker permanently occupied.
+
+Upload initiation responses SHALL use `Cache-Control: no-store`. Signed URLs and resumable session
+URIs are credentials: agents SHALL redact them from logs and the control plane SHALL persist only
+the recipient, bucket, object key, issue time and expiry of each grant.
 
 The initial limits are 100 files, 5 GiB per file, 10 GiB across the manifest and 240 UTF-8 bytes per
 logical path. Absolute paths, empty segments, `.` and `..` segments, backslashes and control

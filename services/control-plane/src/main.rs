@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use kratos_control_plane::artifact_storage::artifact_storage_from_environment;
 use kratos_control_plane::database::DatabaseSettings;
 use kratos_control_plane::human_auth::human_auth_from_environment;
 
@@ -28,16 +29,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let human_auth = human_auth_from_environment()?;
+    let artifact_storage = artifact_storage_from_environment()?;
 
     info!(
         %address,
         database_enabled = database.is_some(),
         human_auth_enabled = human_auth.is_some(),
+        artifact_storage_enabled = artifact_storage.is_some(),
         "Kratos control plane listening"
     );
     axum::serve(
         listener,
-        kratos_control_plane::app_with_human_auth(web_root, database, human_auth),
+        kratos_control_plane::app_with_dependencies(
+            web_root,
+            database,
+            human_auth,
+            artifact_storage,
+        ),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;

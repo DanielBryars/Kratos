@@ -350,6 +350,14 @@ impl ApiError {
         )
     }
 
+    pub(crate) const fn artifact_storage_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "artifact_storage_unavailable",
+            "Artifact storage is temporarily unavailable.",
+        )
+    }
+
     pub(crate) const fn conflict(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::CONFLICT, code, message)
     }

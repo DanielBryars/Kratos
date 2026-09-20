@@ -9,6 +9,12 @@ Terraform is separated into three independently applied roots:
 
 This separation lets CI create the image repository before an application image exists. It also prevents routine application releases from refreshing bootstrap identity resources.
 
+The platform root also creates the private durable-artifact bucket and a dedicated create-only
+upload signer identity. Cloud Run may invoke IAM Credentials `signBlob` for that identity and may
+read object metadata from the bucket; it cannot use the signer as a general runtime identity. The
+signer has no JSON key. Reapply the bootstrap root once so the federated deployment identity gains
+the Storage administrator role needed to create these resources.
+
 ## Initial bootstrap
 
 Run these commands inside the development container after authenticating with `gcloud auth application-default login`:

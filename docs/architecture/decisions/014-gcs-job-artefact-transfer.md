@@ -3,6 +3,11 @@
 **Status:** Accepted for R0.2
 **Date:** 2026-09-20
 
+Implementation note: the R0.2 control plane now issues keyless, ten-minute GCS V4 resumable-upload
+initiation grants through IAM Credentials `signBlob` and synchronously finalizes worker-reported
+uploads from authoritative object metadata. Automated cleanup, downloads and retention policy
+remain deferred as described below.
+
 ## Context
 
 R0.2 must preserve the outputs of a real training job after its worker is unavailable. Home and

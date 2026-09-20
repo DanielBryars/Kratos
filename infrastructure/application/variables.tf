@@ -19,6 +19,16 @@ variable "runtime_service_account" {
   type        = string
 }
 
+variable "artifact_bucket" {
+  description = "Private GCS bucket used for durable job artifacts."
+  type        = string
+}
+
+variable "artifact_upload_signer_service_account" {
+  description = "Service account whose keyless IAM signBlob authority creates upload URLs."
+  type        = string
+}
+
 variable "domain_name" {
   description = "Public DNS name served by the HTTPS load balancer."
   type        = string

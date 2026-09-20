@@ -1,0 +1,384 @@
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use chrono::{DateTime, TimeDelta, Utc};
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use utoipa::ToSchema;
+
+const AUTHORIZATION_LIFETIME_SECONDS: i64 = 600;
+const METADATA_TOKEN_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct ResumableUploadAuthorization {
+    /// Secret, short-lived URL used only to initiate a resumable upload.
+    pub url: String,
+    pub method: String,
+    pub headers: BTreeMap<String, String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredObjectMetadata {
+    pub bucket: String,
+    pub object_key: String,
+    pub generation: i64,
+    pub byte_length: i64,
+    pub crc32c: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Error)]
+pub enum ArtifactStorageError {
+    #[error("artifact storage is temporarily unavailable")]
+    Unavailable,
+    #[error("artifact object does not exist")]
+    NotFound,
+    #[error("artifact storage returned an invalid response")]
+    InvalidResponse,
+}
+
+#[async_trait]
+pub trait ArtifactStorage: Send + Sync {
+    async fn authorize_resumable_upload(
+        &self,
+        object_key: &str,
+        media_type: &str,
+        sha256: &str,
+        issued_at: DateTime<Utc>,
+    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError>;
+
+    async fn object_metadata(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<StoredObjectMetadata, ArtifactStorageError>;
+
+    fn bucket(&self) -> &str;
+}
+
+#[derive(Clone)]
+pub struct ArtifactStorageClient(Arc<dyn ArtifactStorage>);
+
+impl ArtifactStorageClient {
+    #[must_use]
+    pub fn new(storage: impl ArtifactStorage + 'static) -> Self {
+        Self(Arc::new(storage))
+    }
+
+    /// Creates a short-lived authorization for exactly one object.
+    ///
+    /// # Errors
+    /// Returns an error when the backing signer cannot create the authorization.
+    pub async fn authorize_resumable_upload(
+        &self,
+        object_key: &str,
+        media_type: &str,
+        sha256: &str,
+        issued_at: DateTime<Utc>,
+    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
+        self.0
+            .authorize_resumable_upload(object_key, media_type, sha256, issued_at)
+            .await
+    }
+
+    /// Reads one immutable object generation from the authoritative store.
+    ///
+    /// # Errors
+    /// Returns an error when metadata is unavailable, missing, or malformed.
+    pub async fn object_metadata(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<StoredObjectMetadata, ArtifactStorageError> {
+        self.0.object_metadata(bucket, object_key, generation).await
+    }
+
+    #[must_use]
+    pub fn bucket(&self) -> &str {
+        self.0.bucket()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ArtifactStorageConfigError {
+    #[error(
+        "KRATOS_ARTIFACT_BUCKET and KRATOS_ARTIFACT_SIGNER_SERVICE_ACCOUNT must be set together"
+    )]
+    Incomplete,
+    #[error("artifact storage HTTP client could not be created")]
+    HttpClient,
+}
+
+/// Builds the production storage adapter when both required variables are present.
+///
+/// # Errors
+/// Returns an error for partial configuration or an unusable HTTP client.
+pub fn artifact_storage_from_environment()
+-> Result<Option<ArtifactStorageClient>, ArtifactStorageConfigError> {
+    let bucket = env::var("KRATOS_ARTIFACT_BUCKET").ok();
+    let signer = env::var("KRATOS_ARTIFACT_SIGNER_SERVICE_ACCOUNT").ok();
+    match (bucket, signer) {
+        (None, None) => Ok(None),
+        (Some(bucket), Some(signer)) if !bucket.trim().is_empty() && !signer.trim().is_empty() => {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|_| ArtifactStorageConfigError::HttpClient)?;
+            Ok(Some(ArtifactStorageClient::new(GoogleArtifactStorage {
+                client,
+                bucket,
+                signer_service_account: signer,
+            })))
+        }
+        _ => Err(ArtifactStorageConfigError::Incomplete),
+    }
+}
+
+struct GoogleArtifactStorage {
+    client: Client,
+    bucket: String,
+    signer_service_account: String,
+}
+
+#[derive(Deserialize)]
+struct MetadataTokenResponse {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignBlobResponse {
+    signed_blob: String,
+}
+
+#[derive(Deserialize)]
+struct GcsObjectResponse {
+    bucket: String,
+    name: String,
+    generation: String,
+    size: String,
+    crc32c: String,
+    #[serde(default)]
+    metadata: BTreeMap<String, String>,
+}
+
+impl GoogleArtifactStorage {
+    async fn access_token(&self) -> Result<String, ArtifactStorageError> {
+        let response = self
+            .client
+            .get(METADATA_TOKEN_URL)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(ArtifactStorageError::Unavailable);
+        }
+        response
+            .json::<MetadataTokenResponse>()
+            .await
+            .map(|response| response.access_token)
+            .map_err(|_| ArtifactStorageError::InvalidResponse)
+    }
+
+    async fn sign_blob(&self, payload: &[u8]) -> Result<Vec<u8>, ArtifactStorageError> {
+        let token = self.access_token().await?;
+        let signer = percent_encode(&self.signer_service_account, false);
+        let url = format!(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{signer}:signBlob"
+        );
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "payload": STANDARD.encode(payload) }))
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(ArtifactStorageError::Unavailable);
+        }
+        let response = response
+            .json::<SignBlobResponse>()
+            .await
+            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+        STANDARD
+            .decode(response.signed_blob)
+            .map_err(|_| ArtifactStorageError::InvalidResponse)
+    }
+}
+
+#[async_trait]
+impl ArtifactStorage for GoogleArtifactStorage {
+    async fn authorize_resumable_upload(
+        &self,
+        object_key: &str,
+        media_type: &str,
+        sha256: &str,
+        issued_at: DateTime<Utc>,
+    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
+        let date = issued_at.format("%Y%m%d").to_string();
+        let timestamp = issued_at.format("%Y%m%dT%H%M%SZ").to_string();
+        let scope = format!("{date}/auto/storage/goog4_request");
+        let credential = format!("{}/{scope}", self.signer_service_account);
+        let signed_headers =
+            "content-type;host;x-goog-content-sha256;x-goog-meta-kratos-sha256;x-goog-resumable";
+        let canonical_uri = format!(
+            "/{}/{}",
+            percent_encode(&self.bucket, false),
+            percent_encode(object_key, true)
+        );
+        let mut query = vec![
+            ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_owned()),
+            ("X-Goog-Credential", credential),
+            ("X-Goog-Date", timestamp.clone()),
+            ("X-Goog-Expires", AUTHORIZATION_LIFETIME_SECONDS.to_string()),
+            ("X-Goog-SignedHeaders", signed_headers.to_owned()),
+            ("ifGenerationMatch", "0".to_owned()),
+        ];
+        query.sort_by(|left, right| left.0.cmp(right.0));
+        let canonical_query = query
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    percent_encode(key, false),
+                    percent_encode(value, false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let canonical_headers = format!(
+            "content-type:{media_type}\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-meta-kratos-sha256:{sha256}\nx-goog-resumable:start\n"
+        );
+        let canonical_request = format!(
+            "POST\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD"
+        );
+        let canonical_hash = hex_lower(&Sha256::digest(canonical_request.as_bytes()));
+        let string_to_sign = format!("GOOG4-RSA-SHA256\n{timestamp}\n{scope}\n{canonical_hash}");
+        let signature = hex_lower(&self.sign_blob(string_to_sign.as_bytes()).await?);
+        let url = format!(
+            "https://storage.googleapis.com{canonical_uri}?{canonical_query}&X-Goog-Signature={signature}"
+        );
+        let headers = BTreeMap::from([
+            ("content-type".to_owned(), media_type.to_owned()),
+            (
+                "x-goog-content-sha256".to_owned(),
+                "UNSIGNED-PAYLOAD".to_owned(),
+            ),
+            ("x-goog-meta-kratos-sha256".to_owned(), sha256.to_owned()),
+            ("x-goog-resumable".to_owned(), "start".to_owned()),
+        ]);
+        Ok(ResumableUploadAuthorization {
+            url,
+            method: "POST".to_owned(),
+            headers,
+            expires_at: issued_at + TimeDelta::seconds(AUTHORIZATION_LIFETIME_SECONDS),
+        })
+    }
+
+    async fn object_metadata(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        generation: i64,
+    ) -> Result<StoredObjectMetadata, ArtifactStorageError> {
+        if bucket != self.bucket {
+            return Err(ArtifactStorageError::InvalidResponse);
+        }
+        let token = self.access_token().await?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            percent_encode(bucket, false),
+            percent_encode(object_key, false)
+        );
+        let response = self
+            .client
+            .get(url)
+            .query(&[("generation", generation.to_string())])
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ArtifactStorageError::NotFound);
+        }
+        if !response.status().is_success() {
+            return Err(ArtifactStorageError::Unavailable);
+        }
+        let response = response
+            .json::<GcsObjectResponse>()
+            .await
+            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+        Ok(StoredObjectMetadata {
+            bucket: response.bucket,
+            object_key: response.name,
+            generation: response
+                .generation
+                .parse()
+                .map_err(|_| ArtifactStorageError::InvalidResponse)?,
+            byte_length: response
+                .size
+                .parse()
+                .map_err(|_| ArtifactStorageError::InvalidResponse)?,
+            crc32c: response.crc32c,
+            sha256: response
+                .metadata
+                .get("kratos-sha256")
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    fn bucket(&self) -> &str {
+        &self.bucket
+    }
+}
+
+fn percent_encode(value: &str, preserve_slash: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (preserve_slash && byte == b'/')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            let _ = write!(encoded, "{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_encode;
+
+    #[test]
+    fn encoding_preserves_only_canonical_path_separators() {
+        assert_eq!(
+            percent_encode("v1/owners/a b/+", true),
+            "v1/owners/a%20b/%2B"
+        );
+        assert_eq!(percent_encode("a/b", false), "a%2Fb");
+    }
+}
