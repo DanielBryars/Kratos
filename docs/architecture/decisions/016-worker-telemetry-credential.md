@@ -1,0 +1,168 @@
+# ADR-016 — How a worker authenticates to the telemetry gateway
+
+**Status:** Proposed
+**Date:** 2026-09-20
+
+## Context
+
+[ADR-009](009-observability-and-mlflow.md) requires that "worker telemetry SHALL use a scoped,
+revocable credential and encrypted transport", and names `otel.kratos.bryars.com` as
+*authenticated* OTLP ingestion. It does not say how.
+
+[ADR-015](015-job-telemetry-without-job-network.md) made a worker-local collector with a durable
+queue a prerequisite rather than a refinement, and deferred this decision explicitly: "Because the
+worker-local collector is now a prerequisite, that decision blocks implementation of this one."
+This ADR is that decision.
+
+Nothing authenticates today, and the infrastructure says so rather than pretending otherwise.
+`enable_otlp_ingress` defaults to false, with the reason recorded in
+`infrastructure/observability/variables.tf`: enabling it "would expose an unauthenticated
+ingestion endpoint to the internet". The OTLP backend is deliberately **not** behind Identity-Aware
+Proxy, because IAP authenticates humans and this is a machine-to-machine path.
+
+Four facts about the system as it stands constrain the answer.
+
+**A worker's existing credential is long-lived and expensive to verify.** It is a `kwc_` random
+secret stored as an Argon2id verifier; `worker_credentials.expires_at` is nullable and production
+code never sets it. Verification costs an Argon2 hash (19 MiB, t=2) behind a per-credential rate
+limit, and revocation is immediate because it is a database read on every request.
+
+**The control plane already mints short-lived scoped grants.** ADR-014's upload path is the
+precedent: the control plane authenticates the worker, then hands back a credential scoped to
+exactly one object with an explicit expiry, and the worker never holds the underlying authority.
+
+**Telemetry must not make the control plane a dependency of itself.** ADR-015 requires that a
+telemetry failure never interrupt a run. A gateway that called the control plane to check every
+push would put the control plane on the path of every observation and make its outage a telemetry
+outage, at a request rate far above anything else the worker does.
+
+**The gateway is the OpenTelemetry Collector contrib distribution**
+(`otel/opentelemetry-collector-contrib`, pinned by digest in `observability/compose.yaml`), so its
+authentication extensions are available without changing what is deployed.
+
+## Decision
+
+### A worker never holds a telemetry credential of its own
+
+The gateway SHALL NOT accept the worker credential, and a worker SHALL NOT be issued any
+long-lived secret that authorises telemetry ingestion. A credential that lives on a worker
+indefinitely is one that leaves with the machine, and these machines are in people's homes.
+
+### The control plane issues a short-lived telemetry token
+
+The control plane SHALL mint a **telemetry token**: a JWT signed with a Kratos-owned key, carrying
+
+| Claim | Value |
+|---|---|
+| `iss` | the control plane's public origin |
+| `aud` | the telemetry gateway's origin |
+| `sub` | the worker identifier |
+| `exp` | at most **15 minutes** after issue |
+| `kratos.project` | the owning identity, so the gateway can attribute and limit by tenant |
+
+It SHALL be returned on the heartbeat the worker already sends, not from a new endpoint. The
+heartbeat is authenticated, rate-limited and happens every thirty seconds, so a token issued on it
+is refreshed roughly thirty times within its own lifetime and costs no additional authentication.
+A worker that cannot heartbeat stops receiving tokens, which is the same condition under which it
+stops receiving work.
+
+The token SHALL authorise **ingestion only**. There is no telemetry read path for a worker, and the
+gateway SHALL NOT accept a telemetry token on any route but OTLP ingestion.
+
+### The gateway verifies it offline
+
+The gateway SHALL verify the signature, `iss`, `aud` and `exp` using the `oidc` authenticator
+extension against a JWKS the control plane publishes at a public, cacheable endpoint. Verification
+SHALL NOT call the control plane per request.
+
+This is what keeps the control plane off the telemetry path: the gateway can validate every push
+while the control plane is unavailable, and an observation is never lost because the control plane
+was busy.
+
+### Revocation is by expiry, and that is a deliberate limit
+
+Revoking a worker SHALL stop token issuance immediately, because issuance happens on an
+authenticated heartbeat that already re-reads revocation, expiry and status from the database.
+
+A token already issued SHALL remain valid until it expires. **A revoked worker can therefore
+continue to send telemetry for up to fifteen minutes.** That is accepted, and it is accepted for a
+specific reason rather than for convenience: the token authorises appending observations to that
+worker's own streams and nothing else. It grants no read access, no job assignment, no artefact
+authority and no ability to affect execution. The worst a revoked worker can do with it is write
+misleading telemetry about itself, bounded by the collector's own ingestion limits, for one token
+lifetime.
+
+Immediate revocation would require either a per-request check against the control plane, which this
+decision rejects above, or a revocation list the gateway polls, which is a cache with the same
+staleness problem and more moving parts. Where immediate revocation genuinely matters — job
+assignment, artefact upload, database access — the control plane already provides it.
+
+### The token reaches the collector as a file, not as configuration
+
+The agent SHALL write the current token to a file in its own private state directory, with
+`0600` permissions, replaced atomically. The worker-local collector SHALL read it with the
+`bearertokenauth` extension's `filename` option, which re-reads the file when it changes, and
+SHALL attach it to its OTLP exporter.
+
+A file rather than an environment variable or a configuration field, because the token is refreshed
+every thirty seconds and neither of those can be updated without restarting the collector, which
+would discard the durable queue ADR-015 depends on.
+
+The agent SHALL NOT log the token, and it SHALL NOT be written into the collector's configuration,
+an image, or Terraform state.
+
+### Transport
+
+The collector SHALL reach the gateway over HTTPS through the existing load balancer. The gateway
+SHALL NOT accept unencrypted ingestion from outside the instance's own network.
+
+The agent-to-local-collector hop carries the same token but does not leave the worker; it is a
+loopback or private-bridge connection on a machine the agent already trusts enough to run the
+workload.
+
+### The gate stays shut until this exists
+
+`enable_otlp_ingress` SHALL remain false, and the Terraform root SHALL refuse an enabled plan
+unless the gateway is configured with an authenticator. An unauthenticated ingestion endpoint on
+the public internet is worse than no telemetry, because it accepts anyone's data and bills for
+storing it.
+
+## Alternatives
+
+| Option | Assessment |
+|---|---|
+| A single shared bearer token for all workers | One secret on every machine, revocable only by rotating every worker at once, and it identifies nobody. The gateway could not attribute or limit by tenant. |
+| The worker's existing `kwc_` credential | Puts a long-lived credential into a collector's configuration, and makes the gateway either verify Argon2 per push or call the control plane per push. The first is expensive by design; the second is what this decision rejects. |
+| Mutual TLS with a per-worker client certificate | Genuinely strong and needs no token plumbing, but it adds a certificate authority, issuance and a renewal path to a system whose whole worker-enrolment story is already built around bearer credentials. Worth revisiting if workers ever need to authenticate to something other than Kratos. |
+| Proxy OTLP through the control plane | Reuses the existing authentication exactly, but puts every observation through Cloud Run, which is the argument ADR-014 already made against routing artefact bytes that way. It also makes a control-plane outage a telemetry outage. |
+| An opaque token the gateway introspects | Allows immediate revocation, at the cost of a control-plane call per push — the dependency this decision exists to avoid. |
+| A revocation list the gateway polls | Gains faster revocation than expiry alone, but it is still a cache with a staleness window, and it adds an endpoint, a poller and a failure mode for a token that grants only ingestion. |
+
+## Consequences
+
+- The control plane gains a signing key, a JWKS endpoint and a key-rotation path. The key is
+  Kratos-owned rather than a cloud service-account key, so rotation does not touch IAM.
+- A key rotation must publish the new key in the JWKS **before** signing with it, or tokens minted
+  during the overlap will fail verification at a gateway holding a cached JWKS.
+- The gateway's clock matters. `exp` is checked against it, so an instance with a badly wrong clock
+  rejects every token or accepts expired ones; the observability instance already runs NTP through
+  Container-Optimized OS, and this makes that a dependency rather than a detail.
+- The agent gains one more file in its state directory and one more thing to keep out of logs.
+- ADR-015's OTLP sink becomes implementable, and its second cursor stops being theoretical.
+- A revoked worker retains ingestion for up to fifteen minutes, as set out above.
+- The worker-local collector becomes a component the agent must configure and supervise, which is
+  not yet built and is the next thing ADR-015's OTLP half needs.
+
+## Deliberately deferred
+
+This decision does not define the worker-local collector's own configuration, its queue sizing or
+how the agent supervises it; nor per-tenant ingestion quotas at the gateway, which the
+`kratos.project` claim makes possible but which need their own limits; nor how the gateway's
+authenticator is configured in Terraform, which follows once the shape here is accepted.
+
+## Conditions for reconsideration
+
+Reconsider if telemetry ever needs to carry authority beyond appending a worker's own observations,
+if workers must authenticate to a service outside Kratos, if a fifteen-minute revocation window
+becomes unacceptable for a reason that actually applies to ingestion, or if the control plane's
+heartbeat stops being the natural place to hand a worker something short-lived.
