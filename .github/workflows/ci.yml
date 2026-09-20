@@ -125,6 +125,12 @@ jobs:
       - run: uv run --python 3.12 mypy train.py tests
       - run: uv run --python 3.12 pytest
 
+  observability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh observability/validate.sh
+
   infrastructure:
     runs-on: ubuntu-latest
     steps:

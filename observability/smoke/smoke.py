@@ -190,9 +190,22 @@ def main() -> int:
     call(f"{api}/runs/update", {"run_id": run_id, "status": "FINISHED"})
 
     def metric() -> Any:
-        query = urllib.parse.quote(f'{{kratos_attempt_id="{attempt_id}"}}')
+        """The series itself must stay narrow; a per-run label would be a series per attempt."""
+        query = urllib.parse.quote("kratos_smoke_loss")
         series = call(f"{PROMETHEUS}/api/v1/query?query={query}")["data"]["result"]
-        return series[0]["metric"] if series else None
+        if not series:
+            return None
+        labels = series[0]["metric"]
+        forbidden = {"kratos_job_id", "kratos_attempt_id"} & labels.keys()
+        if forbidden:
+            raise SystemExit(f"FAILED: per-run labels on a metric series: {sorted(forbidden)}")
+        return labels
+
+    def run_association() -> Any:
+        """Job and attempt reach the run through target_info, not through the series labels."""
+        query = urllib.parse.quote(f'target_info{{kratos_attempt_id="{attempt_id}"}}')
+        series = call(f"{PROMETHEUS}/api/v1/query?query={query}")["data"]["result"]
+        return series[0]["metric"]["kratos_job_id"] if series else None
 
     def log_line() -> Any:
         query = urllib.parse.quote(
@@ -240,6 +253,9 @@ def main() -> int:
         "identity": identity,
         "trace_id": trace_id,
         "prometheus_series": eventually("metric did not reach Prometheus", metric),
+        "prometheus_run_association": eventually(
+            "target_info did not associate the run", run_association
+        ),
         "loki_line": eventually("log record did not reach Loki", log_line),
         "tempo_span": eventually("span did not reach Tempo", span),
         "mlflow_run": eventually("run was not found in MLflow by attempt tag", mlflow_run),
