@@ -33,3 +33,7 @@ Inspect the capabilities visible to the Python worker agent with:
 cd workers/agent
 uv run kratos-agent inspect
 ```
+
+To put your own Python code on a GPU worker, follow the
+[workload authoring guide](docs/guides/workload-authoring.md) and start from
+`workers/workload-template`.
