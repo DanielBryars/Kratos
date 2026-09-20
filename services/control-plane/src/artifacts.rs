@@ -846,6 +846,14 @@ pub(crate) async fn abandon_upload(
             if state == "cancelled"
                 && reason == "worker_reported_session_unusable"
                 && fingerprint == request.session_uri_sha256 => {}
+        (state, None, _, Some(reason))
+            if state == "cancelled" && reason == "worker_reported_session_unusable" =>
+        {
+            return Err(ApiError::conflict(
+                "upload_session_changed",
+                "The upload session has already changed.",
+            ));
+        }
         _ => {
             return Err(ApiError::conflict(
                 "upload_session_unavailable",
@@ -1330,11 +1338,13 @@ pub(crate) async fn reconcile_pending_session_cancellations(
         }
         match sqlx::query(
             "UPDATE artifact_upload_grants SET state = 'cancelled', session_uri = NULL, \
+                    session_uri_sha256 = COALESCE(session_uri_sha256, $3), \
                     cancelled_at = now() WHERE id = $1 AND state = 'cancel_pending' \
                     AND session_uri = $2",
         )
         .bind(grant_id)
         .bind(&session_uri)
+        .bind(session_uri_fingerprint(&session_uri))
         .execute(pool)
         .await
         {
@@ -1379,8 +1389,8 @@ mod tests {
     use super::{
         JobOutputRequirement, cancel_attempt_upload_sessions, cancel_job_upload_sessions,
         cancel_worker_upload_sessions, reconcile_pending_protections,
-        reconcile_pending_session_cancellations, valid_crc32c, valid_logical_path,
-        validate_output_requirements,
+        reconcile_pending_session_cancellations, session_uri_fingerprint, valid_crc32c,
+        valid_logical_path, validate_output_requirements,
     };
 
     struct Fixture {
@@ -2157,6 +2167,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unrelated_replay.status(), StatusCode::CONFLICT);
+        let unrelated_replay = response_json(unrelated_replay).await;
+        assert_eq!(unrelated_replay["code"], "upload_session_changed");
 
         let replacement = router
             .clone()
@@ -2175,6 +2187,7 @@ mod tests {
         assert_eq!(calls.initiated.load(Ordering::SeqCst), 2);
 
         let stale_abandon = router
+            .clone()
             .oneshot(
                 Request::put(format!("{base_uri}/abandon-upload"))
                     .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
@@ -2186,6 +2199,58 @@ mod tests {
             .unwrap();
         assert_eq!(stale_abandon.status(), StatusCode::CONFLICT);
         assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+
+        let replacement_uri = replacement["session"]["uri"].as_str().unwrap();
+        let replacement_fingerprint = session_uri_fingerprint(replacement_uri);
+        sqlx::query(
+            "UPDATE artifact_upload_grants SET state = 'cancel_pending', \
+                    session_uri_sha256 = NULL, cancel_requested_at = now(), \
+                    cancellation_reason = 'worker_reported_session_unusable' \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let replacement_abandon_body = json!({
+            "protocol_version": "1.1",
+            "session_uri_sha256": replacement_fingerprint
+        });
+        let legacy_pending = router
+            .clone()
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(replacement_abandon_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_pending.status(), StatusCode::NO_CONTENT);
+        let retained_fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT session_uri_sha256 FROM artifact_upload_grants WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained_fingerprint.as_deref(),
+            Some(replacement_fingerprint.as_str())
+        );
+        let legacy_replay = router
+            .oneshot(
+                Request::put(format!("{base_uri}/abandon-upload"))
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(replacement_abandon_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_replay.status(), StatusCode::NO_CONTENT);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 2);
     }
 
     #[sqlx::test(migrations = "./migrations")]
