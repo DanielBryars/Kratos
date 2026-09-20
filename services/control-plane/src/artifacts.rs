@@ -608,6 +608,11 @@ pub(crate) async fn begin_upload(
             return Err(ApiError::artifact_storage_unavailable());
         }
         if grant_state == "cancel_pending" {
+            transaction
+                .commit()
+                .await
+                .map_err(|_| ApiError::internal())?;
+            let _ = reconcile_pending_session_cancellations(pool, &storage).await;
             return Err(ApiError::artifact_storage_unavailable());
         }
         if grant_state == "cancelled"
@@ -1368,6 +1373,7 @@ mod tests {
         protected: AtomicUsize,
         deleted: AtomicUsize,
         cancelled: AtomicUsize,
+        fail_next_cancellation: AtomicBool,
         block_next_initiation: AtomicBool,
         initiation_started: Notify,
         release_initiation: Notify,
@@ -1453,6 +1459,13 @@ mod tests {
             _session_uri: &str,
         ) -> Result<(), ArtifactStorageError> {
             self.calls.cancelled.fetch_add(1, Ordering::SeqCst);
+            if self
+                .calls
+                .fail_next_cancellation
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(ArtifactStorageError::Unavailable);
+            }
             Ok(())
         }
     }
@@ -2168,6 +2181,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        calls.fail_next_cancellation.store(true, Ordering::SeqCst);
 
         let expired = router
             .clone()
@@ -2182,6 +2196,20 @@ mod tests {
             .unwrap();
         assert_eq!(expired.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(calls.cancelled.load(Ordering::SeqCst), 1);
+
+        let cancellation_retry = router
+            .clone()
+            .oneshot(
+                Request::put(&upload_uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"protocol_version":"1.1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancellation_retry.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.cancelled.load(Ordering::SeqCst), 2);
 
         let replacement = router
             .oneshot(
