@@ -967,7 +967,7 @@ pub(crate) async fn list_jobs(
     security(("human_bearer" = [])),
     params(("job_id" = Uuid, Path, description = "Job identifier")),
     responses(
-        (status = 200, description = "Queued job cancelled", body = OperatorJobResponse),
+        (status = 200, description = "Queued job cancelled idempotently", body = OperatorJobResponse),
         (status = 409, description = "Job has already been assigned", body = ErrorResponse)
     )
 )]
@@ -982,8 +982,9 @@ pub(crate) async fn cancel_job(
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
     let query = format!(
-        "UPDATE jobs SET status = 'cancelled', finished_at = now() \
-         WHERE id = $1 AND owner_identity_id = $2 AND status = 'queued' RETURNING {JOB_COLUMNS}"
+        "UPDATE jobs SET status = 'cancelled', finished_at = COALESCE(finished_at, now()) \
+         WHERE id = $1 AND owner_identity_id = $2 AND status IN ('queued', 'cancelled') \
+         RETURNING {JOB_COLUMNS}"
     );
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(job_id)
@@ -1079,7 +1080,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        app_with_human_auth, credentials,
+        app_with_human_auth,
+        credentials::{self, CredentialKind},
         human_auth::{ClientAuthConfig, HumanAuth, HumanIdentity, IdentityVerifier, VerifyError},
     };
 
@@ -1098,6 +1100,48 @@ mod tests {
                 Err(VerifyError::Rejected)
             }
         }
+    }
+
+    fn healthy_worker_capabilities() -> Value {
+        json!({
+            "protocol_version": "1.0",
+            "collected_at": "2026-09-20T08:00:00Z",
+            "hostname": "eligible-gpu-worker",
+            "operating_system": "linux",
+            "operating_system_version": "6.8",
+            "architecture": "x86_64",
+            "logical_cpu_count": 16,
+            "memory_total_bytes": 34_359_738_368_u64,
+            "storage_available_bytes": 107_374_182_400_u64,
+            "python_version": "3.12.7",
+            "gpus": [{
+                "index": 0,
+                "name": "Test GPU",
+                "memory_total_bytes": 8_589_934_592_u64,
+                "driver_version": "560.35"
+            }],
+            "gpu_health": {
+                "status": "healthy",
+                "detail": "GPU computation passed on Test GPU in 10.000 ms",
+                "evidence": {
+                    "schema_version": "1.0",
+                    "status": "healthy",
+                    "checked_at": "2026-09-20T07:59:59Z",
+                    "image_reference": concat!(
+                        "example.test/health@sha256:",
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    ),
+                    "device_index": 0,
+                    "device_name": "Test GPU",
+                    "operation": "matrix multiplication",
+                    "matrix_size": 512,
+                    "max_absolute_error": 0.0,
+                    "duration_ms": 10.0,
+                    "cuda_driver_api_version": "13.3",
+                    "cuda_runtime_version": "12.9"
+                }
+            }
+        })
     }
 
     #[test]
@@ -1391,5 +1435,149 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((status.as_str(), revoked), ("revoked", true));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cancelled_queued_job_is_idempotent_and_never_assigned(pool: PgPool) {
+        let operator_id = Uuid::new_v4();
+        let auth = HumanAuth::new(
+            Arc::new(FakeVerifier {
+                identity: HumanIdentity {
+                    subject: "job-operator".to_owned(),
+                    email: "operator@example.com".to_owned(),
+                    display_name: "Job Operator".to_owned(),
+                },
+            }),
+            "operator@example.com",
+            ClientAuthConfig {
+                api_key: "test-api-key".to_owned(),
+                auth_domain: "example.test".to_owned(),
+                project_id: "test-project".to_owned(),
+            },
+        );
+        sqlx::query(
+            "INSERT INTO human_identities \
+             (id, provider, provider_subject, display_name, email, role) \
+             VALUES ($1, 'identity-platform', 'job-operator', 'Job Operator', \
+                     'operator@example.com', 'operator')",
+        )
+        .bind(operator_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
+              status, capabilities) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4)",
+        )
+        .bind(worker_id)
+        .bind(operator_id)
+        .bind(Uuid::new_v4())
+        .bind(healthy_worker_capabilities())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let worker_credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(worker_credential.id)
+        .bind(worker_id)
+        .bind(&worker_credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let router = app_with_human_auth(None, Some(pool.clone()), Some(auth));
+        let created = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/operator/jobs")
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Cancelled before assignment",
+                            "image_reference": concat!(
+                                "example.test/work@sha256:",
+                                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            ),
+                            "timeout_seconds": 120
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = to_bytes(created.into_body(), 1024 * 1024).await.unwrap();
+        let created: Value = serde_json::from_slice(&created).unwrap();
+        let job_id = Uuid::parse_str(created["job_id"].as_str().unwrap()).unwrap();
+
+        let mut first_finished_at = None;
+        for _ in 0..2 {
+            let cancelled = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/operator/jobs/{job_id}/cancel"))
+                        .header(AUTHORIZATION, "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancelled.status(), StatusCode::OK);
+            let cancelled = to_bytes(cancelled.into_body(), 1024 * 1024).await.unwrap();
+            let cancelled: Value = serde_json::from_slice(&cancelled).unwrap();
+            assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["assigned_worker_id"], Value::Null);
+            let finished_at = cancelled["finished_at"].as_str().unwrap().to_owned();
+            if let Some(first) = &first_finished_at {
+                assert_eq!(&finished_at, first);
+            } else {
+                first_finished_at = Some(finished_at);
+            }
+        }
+
+        let heartbeat = router
+            .oneshot(
+                Request::put(format!("/api/v1/workers/{worker_id}/heartbeat"))
+                    .header(
+                        AUTHORIZATION,
+                        format!("Bearer {}", worker_credential.plaintext.expose()),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.0",
+                            "sequence": 1,
+                            "observed_at": Utc::now(),
+                            "capabilities": healthy_worker_capabilities()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+        let heartbeat = to_bytes(heartbeat.into_body(), 1024 * 1024).await.unwrap();
+        let heartbeat: Value = serde_json::from_slice(&heartbeat).unwrap();
+        assert_eq!(heartbeat["state"], "idle");
+        assert_eq!(heartbeat["assignment"], Value::Null);
+
+        let persisted: (String, bool, i64) = sqlx::query_as(
+            "SELECT j.status, j.finished_at IS NOT NULL, count(a.id) \
+             FROM jobs j LEFT JOIN job_attempts a ON a.job_id = j.id WHERE j.id = $1 \
+             GROUP BY j.status, j.finished_at",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, ("cancelled".to_owned(), true, 0));
     }
 }
