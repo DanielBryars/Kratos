@@ -76,6 +76,7 @@ type Job = {
       mlflow_last_error: string | null;
     } | null;
     observation_counters: Record<string, number> | null;
+    structured_result: Record<string, unknown> | null;
   } | null;
   artifacts: Artifact[];
 };
@@ -601,6 +602,9 @@ export function App() {
                             <details><summary>View delivery evidence</summary><dl className="observation-counters">
                               {Object.entries(job.current_attempt.observation_counters).map(([name, count]) => <div key={name}><dt>{name}</dt><dd>{count}</dd></div>)}
                             </dl></details>
+                          )}
+                          {job.current_attempt.structured_result && (
+                            <details className="run-output"><summary>View workload result</summary><pre>{JSON.stringify(job.current_attempt.structured_result, null, 2)}</pre></details>
                           )}
                         </div>
                       )}
