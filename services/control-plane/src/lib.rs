@@ -351,7 +351,9 @@ pub async fn reconcile_artifact_protections(
     pool: &PgPool,
     storage: &ArtifactStorageClient,
 ) -> usize {
-    artifacts::reconcile_pending_protections(pool, storage).await
+    let protected = artifacts::reconcile_pending_protections(pool, storage).await;
+    let cancelled = artifacts::reconcile_pending_session_cancellations(pool, storage).await;
+    protected + cancelled
 }
 
 #[cfg(test)]

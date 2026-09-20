@@ -45,19 +45,29 @@ object. It SHALL construct an HTTPS V4 signed initiation request which:
 - sign `x-upload-content-length` with the exact declared byte length.
 
 The control plane SHALL send that signed request itself so a worker cannot replay it to create parallel
-sessions. It SHALL persist and return only the resulting Cloud Storage resumable-session URI;
-concurrent or replayed API calls SHALL return the same URI. That URI is a bearer credential scoped to
+sessions. Before contacting GCS it SHALL commit an `initiating` record with a unique initiation ID.
+While that record is fresh, concurrent or replayed calls SHALL NOT contact GCS. After GCS responds,
+the control plane SHALL persist and return only the resulting Cloud Storage resumable-session URI;
+later replays SHALL return the same URI. That URI is a bearer credential scoped to
 the one object. The agent SHALL store it only in its protected state directory, redact it from logs
 and status messages, and remove it after acknowledgement or permanent failure.
 It SHALL cancel the session when abandoning a transfer while it can still reach Cloud Storage. A
 session can remain usable for up to one week if a disconnected worker cannot cancel it; it cannot
 read, list, delete or write a different object, and an incomplete session does not publish an object.
+If the process stops after GCS creates a session but before PostgreSQL stores its URI, that session is
+unreachable by any worker. The durable `initiating` record suppresses retry fan-out for fifteen
+minutes; a later retry may create one replacement, while the unreachable GCS session expires without
+publishing an object. This cross-system orphan window cannot be made atomic and is an explicit bounded
+cleanup risk.
 
 The control plane SHALL create or return upload authority only for the authenticated worker that owns
 the attempt, while the attempt is in an authorised output-transfer state. Revoking the worker or
 cancelling the job SHALL prevent new sessions. Previously returned session URIs remain usable until
 expiry or cancellation, so the deterministic object scope, generation precondition, declared length
 and server-side finalisation check are part of the security boundary.
+Worker or credential revocation, job cancellation, lease abandonment and artefact rejection SHALL
+atomically mark every reachable session `cancel_pending`. A reconciler SHALL cancel each URI at GCS,
+then erase it and record `cancelled`; transient cancellation failure SHALL remain retryable.
 
 ### Container-to-cloud flow
 

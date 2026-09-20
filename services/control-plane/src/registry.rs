@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    artifacts::JobOutputRequirement,
+    artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions},
     credentials::{self, CredentialKind, IssuedCredential},
 };
 
@@ -1210,6 +1210,9 @@ async fn close_expired_attempt(
     } else {
         "Execution lease expired and the bounded attempt limit was reached."
     };
+    cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_lease_expired")
+        .await
+        .map_err(|error| database_error(&error, "cancel expired attempt upload sessions"))?;
 
     sqlx::query(
         "UPDATE job_attempts SET status = $2, finished_at = now(), terminal_reason = $3 \
@@ -1288,6 +1291,9 @@ async fn acknowledge_cancelled_attempt(
     attempt: &ExpiredAttemptRecord,
 ) -> Result<(), ApiError> {
     let reason = "Cancellation completed when the worker acknowledged execution had stopped.";
+    cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_cancelled")
+        .await
+        .map_err(|error| database_error(&error, "cancel acknowledged attempt upload sessions"))?;
     sqlx::query(
         "UPDATE job_attempts SET status = 'cancelled', \
                 started_at = COALESCE(started_at, assigned_at), finished_at = now(), \

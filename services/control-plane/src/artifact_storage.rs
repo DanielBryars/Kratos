@@ -74,6 +74,8 @@ pub trait ArtifactStorage: Send + Sync {
         generation: i64,
     ) -> Result<(), ArtifactStorageError>;
 
+    async fn cancel_resumable_upload(&self, session_uri: &str) -> Result<(), ArtifactStorageError>;
+
     fn bucket(&self) -> &str;
 }
 
@@ -142,6 +144,17 @@ impl ArtifactStorageClient {
         generation: i64,
     ) -> Result<(), ArtifactStorageError> {
         self.0.delete_object(bucket, object_key, generation).await
+    }
+
+    /// Cancels a resumable session URI that is no longer authorised.
+    ///
+    /// # Errors
+    /// Returns an error when the session cannot be reached or refuses cancellation.
+    pub async fn cancel_resumable_upload(
+        &self,
+        session_uri: &str,
+    ) -> Result<(), ArtifactStorageError> {
+        self.0.cancel_resumable_upload(session_uri).await
     }
 
     #[must_use]
@@ -525,6 +538,24 @@ impl ArtifactStorage for GoogleArtifactStorage {
             Ok(())
         } else if response.status() == StatusCode::NOT_FOUND {
             Err(ArtifactStorageError::NotFound)
+        } else {
+            Err(ArtifactStorageError::Unavailable)
+        }
+    }
+
+    async fn cancel_resumable_upload(&self, session_uri: &str) -> Result<(), ArtifactStorageError> {
+        if !session_uri.starts_with("https://storage.googleapis.com/") {
+            return Err(ArtifactStorageError::InvalidResponse);
+        }
+        let response = self
+            .client
+            .delete(session_uri)
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if response.status().is_success() || matches!(response.status().as_u16(), 404 | 410 | 499) {
+            Ok(())
         } else {
             Err(ArtifactStorageError::Unavailable)
         }

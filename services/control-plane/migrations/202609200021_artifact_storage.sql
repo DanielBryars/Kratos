@@ -52,15 +52,34 @@ CREATE TABLE artifact_upload_grants (
     worker_id uuid NOT NULL REFERENCES workers(id),
     bucket_name text NOT NULL,
     object_key text NOT NULL,
-    session_uri text NOT NULL,
+    state text NOT NULL CHECK (state IN ('initiating', 'active', 'cancel_pending', 'cancelled')),
+    initiation_id uuid NOT NULL,
+    initiation_attempts integer NOT NULL DEFAULT 1 CHECK (initiation_attempts BETWEEN 1 AND 100),
+    session_uri text,
     issued_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
+    activated_at timestamptz,
+    cancel_requested_at timestamptz,
+    cancelled_at timestamptz,
+    cancellation_reason text CHECK (
+        cancellation_reason IS NULL OR length(cancellation_reason) BETWEEN 1 AND 200
+    ),
     UNIQUE (artifact_id),
-    CHECK (expires_at > issued_at)
+    CHECK (expires_at > issued_at),
+    CHECK (
+        (state = 'initiating' AND session_uri IS NULL AND activated_at IS NULL)
+        OR (state = 'active' AND session_uri IS NOT NULL AND activated_at IS NOT NULL)
+        OR (state = 'cancel_pending' AND session_uri IS NOT NULL AND cancel_requested_at IS NOT NULL)
+        OR (state = 'cancelled' AND session_uri IS NULL AND cancelled_at IS NOT NULL)
+    )
 );
 
+CREATE INDEX artifact_upload_grants_cleanup_idx
+    ON artifact_upload_grants (state, issued_at)
+    WHERE state IN ('initiating', 'cancel_pending');
+
 COMMENT ON TABLE artifact_upload_grants IS
-    'One control-plane-created resumable session per artifact. The bearer session URI is sensitive and returned only to the owning worker.';
+    'Durable initiation and cancellation state for the sole worker-reachable resumable session per artifact. Session URIs are sensitive.';
 COMMENT ON COLUMN job_artifacts.protection_pending IS
     'Authoritative metadata matched, but the exact generation still needs its lifecycle-protection hold before publication.';
 COMMENT ON COLUMN job_artifacts.storage_bucket IS

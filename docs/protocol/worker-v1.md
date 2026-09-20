@@ -250,7 +250,8 @@ The control plane exposes two replay-safe transfer calls:
 - `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading`. The control
   plane signs and performs the XML resumable-initiation `POST`, including generation-match zero and
   the exact declared upload length, then returns only the resulting session URI. Concurrent and
-  replayed calls for the artefact SHALL return that same session and SHALL NOT initiate another.
+  replayed calls SHALL NOT initiate in parallel; a call during the short durable `initiating` window
+  is retryable, and calls after activation return the same session.
   The worker SHALL keep the session URI private and upload only the declared bytes through it.
 - `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
   returned byte length and CRC32C, then independently reads that exact object generation from GCS.
@@ -275,6 +276,9 @@ immediate cleanup.
 Upload initiation responses SHALL use `Cache-Control: no-store`. Resumable session URIs are
 credentials: agents and the control plane SHALL redact them from logs. The control plane MAY retain
 the one URI per artefact in its encrypted database solely for authenticated idempotent replay.
+Revocation, cancellation, lease abandonment and rejection SHALL consume reachable URIs through a
+retryable GCS cancellation reconciler. A session orphaned between GCS creation and database commit is
+never worker-reachable and expires at GCS; the initiating record rate-limits replacement creation.
 
 The initial limits are 100 files, 5 GiB per file, 10 GiB across the manifest and 240 UTF-8 bytes per
 logical path. Absolute paths, empty segments, `.` and `..` segments, backslashes and control
