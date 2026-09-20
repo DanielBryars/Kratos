@@ -264,7 +264,7 @@ def test_distinct_metric_and_parameter_names_are_capped(
         assert emit(collector, line) is not None
     clock.advance(60)
     assert emit(collector, record(record="metric", name="m.overflow", value=1, step=1)) is None
-    assert collector.counters[Drop.METRIC_NAME_LIMIT.value] == 1
+    assert collector.counters[Drop.NAME_LIMIT.value] == 1
 
     # A name already seen is still accepted once the cap is reached.
     assert emit(collector, record(record="metric", name="m.0", value=2, step=2)) is not None
@@ -274,7 +274,8 @@ def test_distinct_metric_and_parameter_names_are_capped(
         assert emit(collector, record(record="param", name=f"p.{index}", value=1)) is not None
     clock.advance(60)
     assert emit(collector, record(record="param", name="p.overflow", value=1)) is None
-    assert collector.counters[Drop.PARAM_NAME_LIMIT.value] == 1
+    # Metric and parameter name caps report under one name, so this is the second refusal.
+    assert collector.counters[Drop.NAME_LIMIT.value] == 2
 
 
 # --- Rate and byte budget ----------------------------------------------------------------------
@@ -287,7 +288,7 @@ def test_records_are_rate_limited_with_a_burst(
     for _ in range(RECORD_BURST):
         assert emit(collector, line) is not None
     assert emit(collector, line) is None
-    assert collector.counters[Drop.RECORD_RATE.value] == 1
+    assert collector.counters[Drop.RATE.value] == 1
 
     # The bucket refills at the sustained rate: half a second buys ten records.
     clock.advance(0.5)
@@ -301,7 +302,8 @@ def test_log_lines_have_their_own_budget(collector: ObservationCollector, clock:
     for _ in range(LOG_BURST):
         assert emit(collector, "noise") is not None
     assert emit(collector, "noise") is None
-    assert collector.counters[Drop.LOG_RATE.value] == 1
+    assert collector.counters[Drop.RATE.value] == 1
+    # Separate buckets, one reported name: a record still passes while logs are refused.
     assert emit(collector, record(record="progress", step=1)) is not None
 
 
@@ -310,7 +312,7 @@ def test_the_byte_budget_is_enforced_and_stops_forwarding(
 ) -> None:
     collector.forwarded_bytes = MAX_FORWARDED_BYTES - 10
     assert emit(collector, "x" * 40) is None
-    assert collector.counters[Drop.BYTE_BUDGET.value] == 1
+    assert collector.counters[Drop.BUDGET.value] == 1
     # Something that still fits is still taken, so the budget bounds bytes rather than ending
     # collection at the first refusal.
     assert emit(collector, "x" * 5) is not None

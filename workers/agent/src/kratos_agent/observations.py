@@ -75,16 +75,28 @@ class Kind(Enum):
 
 
 class Drop(Enum):
-    """Why a line was refused. These are reported with the attempt as execution evidence."""
+    """Why a line was not delivered, in the names the control plane persists unchanged.
+
+    Two namespaces, and the difference is the point. `dropped.` means the agent refused the line
+    and nobody will ever see it. `not_exported.` means the line was kept and delivered, but one
+    sink did not take it, which is not a loss and should not read as one on a run view.
+
+    The names are deliberately coarser than the checks that produce them: an operator asking
+    "what did I lose" is served by `dropped.rate`, and which bucket ran out is a detail of this
+    module rather than execution evidence.
+    """
 
     OVERSIZE = "dropped.oversize"
     MALFORMED = "dropped.malformed"
-    RECORD_RATE = "dropped.record_rate"
-    LOG_RATE = "dropped.log_rate"
-    BYTE_BUDGET = "dropped.byte_budget"
-    METRIC_NAME_LIMIT = "dropped.metric_name_limit"
-    PARAM_NAME_LIMIT = "dropped.param_name_limit"
-    METRIC_NAME_NOT_ALLOWED = "dropped.metric_name_not_allowed"
+    RATE = "dropped.rate"
+    BUDGET = "dropped.budget"
+    NAME_LIMIT = "dropped.name_limit"
+    # Kept and delivered to the control plane, and so to MLflow, but never made an OTLP series.
+    METRIC_NAME_NOT_ALLOWED = "not_exported.metric_name_not_allowed"
+    # A log line with no collector configured for this attempt. ADR-015 would have it wait behind
+    # an OTLP cursor; with no OTLP sink that cursor is fictional, so the line is counted here
+    # instead. It is not a delivery gap, because no sink was ever configured to take it.
+    OTLP_UNCONFIGURED = "not_exported.otlp_unconfigured"
 
 
 @dataclass(frozen=True)
@@ -206,7 +218,7 @@ class ObservationCollector:
         record = self._parse_record(stream, line)
         if record is not None:
             if not self._records.take(self.clock()):
-                self._count(Drop.RECORD_RATE)
+                self._count(Drop.RATE)
                 return None
             built = self._build(record, stream, at, line)
             if isinstance(built, Observation):
@@ -250,7 +262,7 @@ class ObservationCollector:
 
     def _as_log(self, stream: Stream, at: datetime, line: str, size: int) -> Observation | None:
         if not self._logs.take(self.clock()):
-            self._count(Drop.LOG_RATE)
+            self._count(Drop.RATE)
             return None
         if not self._charge(size):
             return None
@@ -258,7 +270,7 @@ class ObservationCollector:
 
     def _charge(self, size: int) -> bool:
         if self.forwarded_bytes + size > MAX_FORWARDED_BYTES:
-            self._count(Drop.BYTE_BUDGET)
+            self._count(Drop.BUDGET)
             return False
         self.forwarded_bytes += size
         return True
@@ -288,7 +300,7 @@ class ObservationCollector:
         if not _valid_param_value(value):
             return Drop.MALFORMED
         if name not in self._param_names and len(self._param_names) >= MAX_PARAM_NAMES:
-            return Drop.PARAM_NAME_LIMIT
+            return Drop.NAME_LIMIT
         self._param_names.add(name)
         return Observation(kind=Kind.PARAM, stream=stream, at=at, text=line, name=name, value=value)
 
@@ -312,7 +324,7 @@ class ObservationCollector:
             # series, and accepting it would make the series unorderable.
             return Drop.MALFORMED
         if name not in self._metric_names and len(self._metric_names) >= MAX_METRIC_NAMES:
-            return Drop.METRIC_NAME_LIMIT
+            return Drop.NAME_LIMIT
         allowed = name in METRIC_NAME_ALLOWLIST
         if not allowed:
             self._count(Drop.METRIC_NAME_NOT_ALLOWED)
