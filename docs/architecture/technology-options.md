@@ -30,7 +30,7 @@ GCP, Terraform, Rust/Axum for the control plane, and the VS Code dev-container w
 | Scheduler runtime | Separate persistent process, initially on Cloud Run worker pools or a small VM; choose based on actual lease and coordination requirements. | R0.2 |
 | Work queue | PostgreSQL-backed queue first versus a separate broker; decide from concurrency and delivery requirements. | R0.2 |
 | Experiment tracking | MLflow is selected by ADR-009; define workload integration, retention and model promotion policy. | R0.2 |
-| Artefacts | Cloud Storage proposed; local caches plus resumable, scoped transfers. | R0.2 |
+| Artefacts — accepted | Cloud Storage with per-object signed resumable uploads and worker-local staging; [ADR-014](decisions/014-gcs-job-artefact-transfer.md). | R0.2 |
 | Pricing/ETA | Transparent rule-based pricing and historical throughput estimates first; keep assumptions visible. | R0.3–R0.4 |
 | Distributed training | PyTorch DDP first; introduce FSDP when workload memory requirements justify it. | R0.6 |
 | Cloud GPU provisioning | Evaluate SkyPilot behind the provider boundary in ADR-010; avoid dual ownership of provisioned workers. | R0.7 |
