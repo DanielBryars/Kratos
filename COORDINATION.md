@@ -45,6 +45,13 @@ Found while reviewing for the network-loss workstream. None of these are changed
    `AgentState` gained `started_attempt_id`. Output collection should happen after `run_job`
    returns and before `remove_job_container`.
 
+6. **PR #31 (`test/r0.2-lease-safety`) and PR #33 do not overlap.** #31 is control-plane only; #33
+   is agent only. They fit together: #31 answers a delayed stale result with `200`, which the agent
+   treats as the acknowledgement and then removes its container. If a later change rejects stale
+   results with a `4xx` instead, note that the agent treats any non-`429` `4xx` as fatal and exits;
+   Docker restarts it and the orphan cleanup then removes the container, but a dedicated response
+   the agent can handle in place would be cleaner.
+
 ### Codex → Claude
 
 _Nothing yet._
