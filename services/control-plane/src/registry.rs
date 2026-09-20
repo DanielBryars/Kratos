@@ -265,6 +265,8 @@ pub struct JobResultRequest {
     pub stdout: String,
     pub stderr: String,
     pub failure_message: Option<String>,
+    pub execution_started_at: Option<DateTime<Utc>>,
+    pub execution_finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -446,8 +448,48 @@ struct ExpiredAttemptRecord {
     attempt_status: String,
     job_status: String,
     max_attempts: i32,
+    assigned_at: DateTime<Utc>,
+    timeout_seconds: i32,
     lease_expires_at: DateTime<Utc>,
     artifact_delivery_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionInterval {
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+}
+
+const WORKER_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+const EXECUTION_ENFORCEMENT_TOLERANCE: chrono::Duration = chrono::Duration::seconds(30);
+
+fn execution_interval(
+    result: &JobResultRequest,
+    attempt: &ExpiredAttemptRecord,
+    received_at: DateTime<Utc>,
+) -> Result<Option<ExecutionInterval>, ApiError> {
+    let (started_at, finished_at) =
+        match (result.execution_started_at, result.execution_finished_at) {
+            (None, None) => return Ok(None),
+            (Some(started_at), Some(finished_at)) => (started_at, finished_at),
+            _ => return Err(ApiError::invalid_request()),
+        };
+    let timeout = chrono::Duration::seconds(i64::from(attempt.timeout_seconds));
+    let claims_success =
+        result.exit_code == 0 && !result.timed_out && result.failure_message.is_none();
+    if finished_at < started_at
+        || started_at < attempt.assigned_at - WORKER_CLOCK_SKEW
+        || started_at > attempt.lease_expires_at + WORKER_CLOCK_SKEW
+        || finished_at > attempt.lease_expires_at + WORKER_CLOCK_SKEW
+        || finished_at > received_at + WORKER_CLOCK_SKEW
+        || (claims_success && finished_at - started_at > timeout + EXECUTION_ENFORCEMENT_TOLERANCE)
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(Some(ExecutionInterval {
+        started_at,
+        finished_at,
+    }))
 }
 
 impl ExpiredAttemptRecord {
@@ -1269,8 +1311,7 @@ async fn close_expired_attempt(
     } else {
         sqlx::query(
             "UPDATE jobs SET status = $2, assigned_worker_id = NULL, \
-                    started_at = COALESCE(started_at, submitted_at), finished_at = now(), \
-                    failure_message = $3 WHERE id = $1 \
+                    finished_at = now(), failure_message = $3 WHERE id = $1 \
              AND status IN ('assigned', 'running', 'cancelling')",
         )
         .bind(attempt.job_id)
@@ -1307,28 +1348,35 @@ async fn close_expired_attempt(
 async fn acknowledge_cancelled_attempt(
     transaction: &mut Transaction<'_, Postgres>,
     attempt: &ExpiredAttemptRecord,
+    execution: Option<ExecutionInterval>,
 ) -> Result<(), ApiError> {
     let reason = "Cancellation completed when the worker acknowledged execution had stopped.";
     cancel_attempt_upload_sessions(transaction, attempt.attempt_id, "attempt_cancelled")
         .await
         .map_err(|error| database_error(&error, "cancel acknowledged attempt upload sessions"))?;
+    let started_at = execution.map(|interval| interval.started_at);
+    let finished_at = execution.map_or_else(Utc::now, |interval| interval.finished_at);
     sqlx::query(
         "UPDATE job_attempts SET status = 'cancelled', \
-                started_at = COALESCE(started_at, assigned_at), finished_at = now(), \
+                started_at = COALESCE(started_at, $3), finished_at = $4, \
                 terminal_reason = $2 WHERE id = $1 AND status IN ('assigned', 'running')",
     )
     .bind(attempt.attempt_id)
     .bind(reason)
+    .bind(started_at)
+    .bind(finished_at)
     .execute(&mut **transaction)
     .await
     .map_err(|error| database_error(&error, "acknowledge cancelled attempt"))?;
     sqlx::query(
         "UPDATE jobs SET status = 'cancelled', assigned_worker_id = NULL, \
-                started_at = COALESCE(started_at, submitted_at), finished_at = now(), \
+                started_at = COALESCE(started_at, $3), finished_at = $4, \
                 failure_message = $2 WHERE id = $1 AND status = 'cancelling'",
     )
     .bind(attempt.job_id)
     .bind(reason)
+    .bind(started_at)
+    .bind(finished_at)
     .execute(&mut **transaction)
     .await
     .map_err(|error| database_error(&error, "finish cancelled job"))?;
@@ -1370,7 +1418,8 @@ pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, A
         let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
             "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                     a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                    a.lease_expires_at, a.artifact_delivery_expires_at \
+                    a.assigned_at, j.timeout_seconds, a.lease_expires_at, \
+                    a.artifact_delivery_expires_at \
              FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
              WHERE a.status IN ('assigned', 'running') \
                AND CASE WHEN j.status = 'cancelling' THEN a.lease_expires_at \
@@ -1850,7 +1899,8 @@ pub(crate) async fn report_job_result(
     let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
         "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                 a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                a.lease_expires_at, a.artifact_delivery_expires_at \
+                a.assigned_at, j.timeout_seconds, a.lease_expires_at, \
+                a.artifact_delivery_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
@@ -1894,8 +1944,10 @@ pub(crate) async fn report_job_result(
             status: outcome.attempt_status.to_owned(),
         }));
     }
+    let received_at = Utc::now();
+    let execution = execution_interval(&result, &attempt, received_at)?;
     if attempt.job_status == "cancelling" {
-        acknowledge_cancelled_attempt(&mut transaction, &attempt).await?;
+        acknowledge_cancelled_attempt(&mut transaction, &attempt, execution).await?;
         transaction
             .commit()
             .await
@@ -1937,18 +1989,22 @@ pub(crate) async fn report_job_result(
         }
     }
     let final_status = if succeeded { "succeeded" } else { "failed" };
+    let started_at = execution.map(|interval| interval.started_at);
+    let finished_at = execution.map_or(received_at, |interval| interval.finished_at);
     sqlx::query(
-        "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, assigned_at), \
-                finished_at = now() WHERE id = $1",
+        "UPDATE job_attempts SET status = $2, started_at = COALESCE(started_at, $3), \
+                finished_at = $4 WHERE id = $1",
     )
     .bind(attempt_id)
     .bind(final_status)
+    .bind(started_at)
+    .bind(finished_at)
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "finish job attempt"))?;
     sqlx::query(
-        "UPDATE jobs SET status = $2, started_at = COALESCE(started_at, submitted_at), \
-                finished_at = now(), exit_code = $3, stdout = $4, stderr = $5, \
+        "UPDATE jobs SET status = $2, started_at = COALESCE(started_at, $7), \
+                finished_at = $8, exit_code = $3, stdout = $4, stderr = $5, \
                 failure_message = $6 WHERE id = $1",
     )
     .bind(attempt.job_id)
@@ -1957,6 +2013,8 @@ pub(crate) async fn report_job_result(
     .bind(&result.stdout)
     .bind(&result.stderr)
     .bind(&result.failure_message)
+    .bind(started_at)
+    .bind(finished_at)
     .execute(&mut *transaction)
     .await
     .map_err(|error| database_error(&error, "finish job"))?;
@@ -2009,9 +2067,112 @@ mod tests {
     };
 
     use super::{
-        ExpectedHeartbeat, GpuHealth, GpuHealthEvidence, GpuHealthStatus, current_or_assign_job,
+        ExecutionInterval, ExpectedHeartbeat, ExpiredAttemptRecord, GpuHealth, GpuHealthEvidence,
+        GpuHealthStatus, JobResultRequest, current_or_assign_job, execution_interval,
         immutable_sha256_reference, valid_gpu_health,
     };
+
+    fn result_with_interval(
+        started_at: Option<DateTime<Utc>>,
+        finished_at: Option<DateTime<Utc>>,
+    ) -> JobResultRequest {
+        JobResultRequest {
+            exit_code: 0,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            failure_message: None,
+            execution_started_at: started_at,
+            execution_finished_at: finished_at,
+        }
+    }
+
+    fn bounded_attempt(assigned_at: DateTime<Utc>) -> ExpiredAttemptRecord {
+        ExpiredAttemptRecord {
+            attempt_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            worker_id: Uuid::new_v4(),
+            attempt_number: 1,
+            attempt_status: "assigned".to_owned(),
+            job_status: "assigned".to_owned(),
+            max_attempts: 2,
+            assigned_at,
+            timeout_seconds: 120,
+            lease_expires_at: assigned_at + Duration::minutes(5),
+            artifact_delivery_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn execution_timing_requires_a_bounded_pair() {
+        let assigned_at = Utc::now();
+        let attempt = bounded_attempt(assigned_at);
+        let started_at = assigned_at + Duration::seconds(10);
+        let finished_at = started_at + Duration::seconds(90);
+        let received_at = finished_at + Duration::seconds(5);
+
+        let accepted = execution_interval(
+            &result_with_interval(Some(started_at), Some(finished_at)),
+            &attempt,
+            received_at,
+        )
+        .unwrap();
+        assert!(matches!(
+            accepted,
+            Some(ExecutionInterval {
+                started_at: start,
+                finished_at: finish
+            }) if start == started_at && finish == finished_at
+        ));
+        assert!(
+            execution_interval(
+                &result_with_interval(Some(started_at), None),
+                &attempt,
+                received_at
+            )
+            .is_err()
+        );
+        assert!(
+            execution_interval(
+                &result_with_interval(Some(finished_at), Some(started_at)),
+                &attempt,
+                received_at
+            )
+            .is_err()
+        );
+        assert!(
+            execution_interval(
+                &result_with_interval(Some(started_at), Some(started_at + Duration::seconds(151))),
+                &attempt,
+                received_at
+            )
+            .is_err()
+        );
+        let mut failed_overrun =
+            result_with_interval(Some(started_at), Some(started_at + Duration::seconds(151)));
+        failed_overrun.exit_code = 125;
+        failed_overrun.failure_message = Some("unsupervised overrun".to_owned());
+        assert!(
+            execution_interval(&failed_overrun, &attempt, received_at)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_result_keeps_execution_start_unknown() {
+        let assigned_at = Utc::now();
+        let attempt = bounded_attempt(assigned_at);
+        assert!(
+            execution_interval(
+                &result_with_interval(None, None),
+                &attempt,
+                assigned_at + Duration::seconds(30)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 
     fn healthy_evidence() -> GpuHealthEvidence {
         GpuHealthEvidence {
@@ -2175,6 +2336,125 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(state, ("assigned".to_owned(), "busy".to_owned(), 1));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn result_records_actual_execution_interval_without_fabricating_legacy_start(
+        pool: PgPool,
+    ) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "idle").await;
+        let credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(credential.id)
+        .bind(worker_id)
+        .bind(&credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let job_id = insert_job(&pool, owner_id).await;
+        let assignment = current_or_assign_job(&pool, worker_id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.job_id, job_id);
+        let assigned_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT assigned_at FROM job_attempts WHERE id = $1")
+                .bind(assignment.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let execution_started_at = assigned_at + Duration::milliseconds(100);
+        let execution_finished_at = execution_started_at + Duration::seconds(1);
+        let response = app(None, Some(pool.clone()))
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{worker_id}/job-attempts/{}/result",
+                    assignment.attempt_id
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 0,
+                        "timed_out": false,
+                        "stdout": "completed",
+                        "stderr": "",
+                        "failure_message": null,
+                        "execution_started_at": execution_started_at,
+                        "execution_finished_at": execution_finished_at
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let recorded_attempt: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT started_at, finished_at FROM job_attempts WHERE id = $1")
+                .bind(assignment.attempt_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let recorded_job: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT started_at, finished_at FROM jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            recorded_attempt,
+            (Some(execution_started_at), Some(execution_finished_at))
+        );
+        assert_eq!(recorded_job, recorded_attempt);
+
+        let legacy_job_id = insert_job(&pool, owner_id).await;
+        let legacy = current_or_assign_job(&pool, worker_id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.job_id, legacy_job_id);
+        let response = app(None, Some(pool.clone()))
+            .oneshot(
+                Request::put(format!(
+                    "/api/v1/workers/{worker_id}/job-attempts/{}/result",
+                    legacy.attempt_id
+                ))
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {}", credential.plaintext.expose()),
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "exit_code": 1,
+                        "timed_out": false,
+                        "stdout": "",
+                        "stderr": "failed",
+                        "failure_message": "legacy worker"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let legacy_times: (Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT started_at, finished_at FROM jobs WHERE id = $1")
+                .bind(legacy_job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(legacy_times.0.is_none());
+        assert!(legacy_times.1.is_some());
     }
 
     #[sqlx::test(migrations = "./migrations")]

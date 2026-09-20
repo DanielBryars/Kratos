@@ -227,10 +227,19 @@ cannot be killed is reported as no result at all: the attempt stays recorded and
 retried, because a result would tell the control plane the attempt had ended while it had not.
 
 The agent SHALL send the bounded exit status, timeout flag, stdout, stderr and failure summary to
-`PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. Result submission SHALL be
-idempotent. The control plane SHALL release the worker only after it has durably recorded a terminal
-job and attempt state. Output fields SHALL be limited to 64 KiB each and SHALL NOT contain granted
-secrets because this initial slice grants none.
+`PUT /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result`. When a container started, the
+agent SHOULD also send `execution_started_at` and `execution_finished_at` as an RFC 3339 pair taken
+from the container runtime. It SHALL send both or neither, SHALL NOT substitute assignment or report
+times, and SHALL omit the pair for a failure before container start. The control plane SHALL reject
+an inverted pair, a successful duration beyond the assigned timeout plus the enforcement tolerance,
+or values outside the assignment, lease and bounded clock-skew window. A failed result MAY carry a
+longer interval as evidence of a previously unsupervised overrun; it cannot turn that result into a
+success. A legacy result without the pair remains valid; its execution start is unknown and SHALL
+remain absent rather than being fabricated from submission or assignment time.
+
+Result submission SHALL be idempotent. The control plane SHALL release the worker only after it has
+durably recorded a terminal job and attempt state. Output fields SHALL be limited to 64 KiB each and
+SHALL NOT contain granted secrets because this initial slice grants none.
 
 ### Training-run correlation environment
 
