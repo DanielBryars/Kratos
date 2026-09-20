@@ -1,6 +1,6 @@
 # R0.2 network-loss exercise runbook
 
-**Status:** Draft for Codex review; not yet executable (see prerequisites)  
+**Status:** Draft for Codex review; not yet executable (see prerequisites)
 **Witness:** the user, who physically disconnects and reconnects the selected worker
 
 ## Requirements
