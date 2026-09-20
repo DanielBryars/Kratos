@@ -1,18 +1,22 @@
 """Worker enrolment and heartbeat lifecycle."""
 
 import base64
+import json
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from docker.errors import DockerException
 
 from kratos_agent.capabilities import collect_capabilities
 from kratos_agent.executor import DockerExecutor, ExecutorError
-from kratos_agent.models import JobExecutionResult, WorkerCapabilities
+from kratos_agent.models import JobAssignment, WorkerCapabilities
 from kratos_agent.protocol import ControlPlaneError, WorkerProtocolClient
 from kratos_agent.state import AgentState, load_state, read_enrolment_credential, save_state
 
@@ -165,47 +169,78 @@ class AgentRunner:
             raise ControlPlaneError(
                 200, "invalid_response", "heartbeat acknowledgement is inconsistent"
             )
-        updated = AgentState(
-            agent_instance_id=state.agent_instance_id,
-            worker_id=state.worker_id,
-            worker_credential=state.worker_credential,
-            private_key=state.private_key,
+        updated = replace(
+            state,
             next_sequence=response.accepted_sequence + 1,
             heartbeat_interval_seconds=response.next_heartbeat_seconds,
         )
         save_state(self._state_path, updated)
-        if response.assignment is not None:
-            if self._executor is None:
-                raise ExecutorError("job assignment received without a configured executor")
-            assignment = response.assignment
-            if datetime.now(UTC) >= assignment.lease_expires_at:
-                result = JobExecutionResult(
-                    exit_code=124,
-                    timed_out=True,
-                    stdout="",
-                    stderr="",
-                    failure_message="assignment lease expired before execution",
-                )
-            else:
-                result = self._executor.run_job(assignment)
-            acknowledgement = self._client.report_job_result(
-                state.worker_id,
-                state.worker_credential,
-                assignment.attempt_id,
-                result,
-            )
-            if acknowledgement.attempt_id != assignment.attempt_id:
-                raise ControlPlaneError(
-                    200, "invalid_response", "job result acknowledgement is inconsistent"
-                )
-            self._executor.remove_job_container(assignment)
+        assignment = response.assignment
+        stale_attempt_id = updated.started_attempt_id
+        if (
+            self._executor is not None
+            and stale_attempt_id is not None
+            and (assignment is None or assignment.attempt_id != stale_attempt_id)
+        ):
+            # The control plane no longer holds this attempt open, so nothing authorises its
+            # container to keep running and its retained evidence is no longer required.
+            self._executor.remove_job_container(stale_attempt_id)
+            updated = replace(updated, started_attempt_id=None)
+            save_state(self._state_path, updated)
+        if assignment is not None:
+            updated = self._run_assignment(updated, assignment)
         return updated
+
+    def _run_assignment(self, state: AgentState, assignment: JobAssignment) -> AgentState:
+        if self._executor is None:
+            raise ExecutorError("job assignment received without a configured executor")
+        worker_id, worker_credential = state.worker_id, state.worker_credential
+        if worker_id is None or worker_credential is None:
+            raise ValueError("worker is not enrolled")
+        resuming = state.started_attempt_id == assignment.attempt_id
+        result = None
+        if not resuming and datetime.now(UTC) < assignment.lease_expires_at:
+            result = self._executor.prepare_job(assignment)
+            if result is None:
+                state = replace(state, started_attempt_id=assignment.attempt_id)
+                save_state(self._state_path, state)
+        if result is None:
+            result = self._executor.run_job(assignment, may_start=not resuming)
+        acknowledgement = self._client.report_job_result(
+            worker_id, worker_credential, assignment.attempt_id, result
+        )
+        if acknowledgement.attempt_id != assignment.attempt_id:
+            raise ControlPlaneError(
+                200, "invalid_response", "job result acknowledgement is inconsistent"
+            )
+        self._executor.remove_job_container(assignment.attempt_id)
+        state = replace(state, started_attempt_id=None)
+        save_state(self._state_path, state)
+        return state
+
+    def step(self, state: AgentState) -> AgentState:
+        """Send one heartbeat, surviving a temporary loss of the control plane or Docker.
+
+        Every state change is persisted before the operation that depends on it, so the saved
+        state is reloaded after a failure and the next heartbeat resumes the same attempt.
+        """
+        try:
+            return self.heartbeat_once(state)
+        except (ControlPlaneError, DockerException, httpx.TransportError) as error:
+            if isinstance(error, ControlPlaneError) and not _is_transient(error):
+                raise
+            print(json.dumps({"status": "retrying", "detail": str(error)}), flush=True)
+            return load_state(self._state_path) or state
 
     def run(self) -> None:
         state = self.ensure_enrolled()
         while True:
-            state = self.heartbeat_once(state)
+            state = self.step(state)
             time.sleep(state.heartbeat_interval_seconds)
+
+
+def _is_transient(error: ControlPlaneError) -> bool:
+    return error.status_code == 429 or error.status_code >= 500
 
 
 def _encode(value: bytes) -> str:

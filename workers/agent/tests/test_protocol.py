@@ -206,76 +206,224 @@ def test_rejects_unsafe_control_plane_urls(url: str) -> None:
         WorkerProtocolClient(url)
 
 
+ATTEMPT_ID = UUID("33333333-3333-4333-8333-333333333333")
+JOB_ID = UUID("44444444-4444-4444-8444-444444444444")
+WORKER_SECRET = "kwc_identifier_scoped-secret"
+
+
 class FakeJobExecutor(DockerExecutor):
     def __init__(self) -> None:
-        self.executed: JobAssignment | None = None
-        self.removed: JobAssignment | None = None
+        self.prepared: list[UUID] = []
+        self.runs: list[tuple[UUID, bool]] = []
+        self.removed: list[UUID] = []
 
-    def run_job(self, assignment: JobAssignment) -> JobExecutionResult:
-        self.executed = assignment
+    def prepare_job(self, assignment: JobAssignment) -> JobExecutionResult | None:
+        self.prepared.append(assignment.attempt_id)
+        return None
+
+    def run_job(self, assignment: JobAssignment, *, may_start: bool = True) -> JobExecutionResult:
+        self.runs.append((assignment.attempt_id, may_start))
         return JobExecutionResult(
             exit_code=0, timed_out=False, stdout="done\n", stderr="", failure_message=None
         )
 
-    def remove_job_container(self, assignment: JobAssignment) -> None:
-        self.removed = assignment
+    def remove_job_container(self, attempt_id: UUID) -> None:
+        self.removed.append(attempt_id)
+
+
+def heartbeat_response(request: httpx.Request, *, assigned: bool) -> httpx.Response:
+    body: dict[str, object] = {
+        "worker_id": str(WORKER_ID),
+        "state": "busy" if assigned else "idle",
+        "accepted_sequence": json.loads(request.content)["sequence"],
+        "next_heartbeat_seconds": 30,
+    }
+    if assigned:
+        body["assignment"] = {
+            "attempt_id": str(ATTEMPT_ID),
+            "job_id": str(JOB_ID),
+            "name": "Matrix check",
+            "image_reference": "example.test/work@sha256:" + ("a" * 64),
+            "gpu_index": 0,
+            "timeout_seconds": 120,
+            "lease_expires_at": "2099-09-19T13:00:00Z",
+        }
+    return httpx.Response(200, json=body)
+
+
+def result_acknowledgement() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"attempt_id": str(ATTEMPT_ID), "job_id": str(JOB_ID), "status": "succeeded"},
+    )
+
+
+def enrolled_state(state_path: Path, *, started_attempt_id: UUID | None = None) -> AgentState:
+    state = AgentState(
+        agent_instance_id=UUID(int=1),
+        worker_id=WORKER_ID,
+        worker_credential=WORKER_SECRET,
+        started_attempt_id=started_attempt_id,
+    )
+    save_state(state_path, state)
+    return state
+
+
+def job_runner(
+    client: WorkerProtocolClient, state_path: Path, executor: DockerExecutor
+) -> AgentRunner:
+    return AgentRunner(
+        client, "GPU host", state_path, None, capability_collector=capabilities, executor=executor
+    )
 
 
 def test_assignment_is_executed_reported_and_removed_after_acknowledgement(tmp_path: Path) -> None:
-    worker_secret = "kwc_identifier_scoped-secret"
-    attempt_id = UUID("33333333-3333-4333-8333-333333333333")
-    job_id = UUID("44444444-4444-4444-8444-444444444444")
     reported: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/heartbeat"):
-            payload = json.loads(request.content)
-            return httpx.Response(
-                200,
-                json={
-                    "worker_id": str(WORKER_ID),
-                    "state": "busy",
-                    "accepted_sequence": payload["sequence"],
-                    "next_heartbeat_seconds": 30,
-                    "assignment": {
-                        "attempt_id": str(attempt_id),
-                        "job_id": str(job_id),
-                        "name": "Matrix check",
-                        "image_reference": "example.test/work@sha256:" + ("a" * 64),
-                        "gpu_index": 0,
-                        "timeout_seconds": 120,
-                        "lease_expires_at": "2099-09-19T13:00:00Z",
-                    },
-                },
-            )
+            return heartbeat_response(request, assigned=True)
         reported.update(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={"attempt_id": str(attempt_id), "job_id": str(job_id), "status": "succeeded"},
-        )
+        return result_acknowledgement()
 
     state_path = tmp_path / "agent.json"
-    state = AgentState(
-        agent_instance_id=UUID(int=1),
-        worker_id=WORKER_ID,
-        worker_credential=worker_secret,
-    )
-    save_state(state_path, state)
+    state = enrolled_state(state_path)
     executor = FakeJobExecutor()
     with WorkerProtocolClient(
         "https://control.example", transport=httpx.MockTransport(handler)
     ) as client:
-        updated = AgentRunner(
-            client,
-            "GPU host",
-            state_path,
-            None,
-            capability_collector=capabilities,
-            executor=executor,
-        ).heartbeat_once(state)
+        updated = job_runner(client, state_path, executor).heartbeat_once(state)
 
     assert updated.next_sequence == 1
-    assert executor.executed is not None and executor.executed.attempt_id == attempt_id
-    assert executor.removed is not None and executor.removed.attempt_id == attempt_id
+    assert updated.started_attempt_id is None
+    assert load_state(state_path) == updated
+    assert executor.prepared == [ATTEMPT_ID]
+    assert executor.runs == [(ATTEMPT_ID, True)]
+    assert executor.removed == [ATTEMPT_ID]
     assert reported["exit_code"] == 0
     assert reported["stdout"] == "done\n"
+
+
+def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    link_up = True
+    delivered: list[dict[str, object]] = []
+
+    class LinkDropsDuringJob(FakeJobExecutor):
+        def run_job(
+            self, assignment: JobAssignment, *, may_start: bool = True
+        ) -> JobExecutionResult:
+            nonlocal link_up
+            if may_start:
+                link_up = False
+            return super().run_job(assignment, may_start=may_start)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not link_up:
+            raise httpx.ConnectError("network is unreachable", request=request)
+        if request.url.path.endswith("/heartbeat"):
+            return heartbeat_response(request, assigned=True)
+        delivered.append(json.loads(request.content))
+        return result_acknowledgement()
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    executor = LinkDropsDuringJob()
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        runner = job_runner(client, state_path, executor)
+
+        # The assignment arrives, the link drops while it runs and the result cannot be delivered.
+        state = runner.step(state)
+        assert state.started_attempt_id == ATTEMPT_ID
+        assert load_state(state_path) == state
+        assert executor.removed == []
+
+        # Heartbeats fail for the rest of the outage without ending the agent.
+        state = runner.step(state)
+        assert delivered == []
+
+        link_up = True
+        state = runner.step(state)
+
+    assert executor.prepared == [ATTEMPT_ID]
+    assert executor.runs == [(ATTEMPT_ID, True), (ATTEMPT_ID, False)]
+    assert len(delivered) == 1
+    assert executor.removed == [ATTEMPT_ID]
+    assert state.started_attempt_id is None
+    assert WORKER_SECRET not in capsys.readouterr().out
+
+
+def test_attempt_no_longer_held_by_the_control_plane_is_removed(tmp_path: Path) -> None:
+    # The result was recorded but its acknowledgement was lost, so the next heartbeat carries
+    # no assignment and the retained container has no remaining purpose or authority.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return heartbeat_response(request, assigned=False)
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path, started_attempt_id=ATTEMPT_ID)
+    executor = FakeJobExecutor()
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        updated = job_runner(client, state_path, executor).step(state)
+
+    assert executor.removed == [ATTEMPT_ID]
+    assert executor.runs == []
+    assert updated.started_attempt_id is None
+    assert load_state(state_path) == updated
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 503])
+def test_temporary_control_plane_failure_does_not_end_the_agent(
+    tmp_path: Path, status_code: int
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"code": "unavailable", "message": "try later"})
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert job_runner(client, state_path, FakeJobExecutor()).step(state) == state
+
+
+def test_rejected_credential_still_ends_the_agent(tmp_path: Path) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"code": "unauthorized", "message": "rejected"})
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    with (
+        WorkerProtocolClient(
+            "https://control.example", transport=httpx.MockTransport(handler)
+        ) as client,
+        pytest.raises(ControlPlaneError),
+    ):
+        job_runner(client, state_path, FakeJobExecutor()).step(state)
+
+
+def test_state_without_an_attempt_journal_remains_readable(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "agent_instance_id": str(UUID(int=1)),
+                "worker_id": str(WORKER_ID),
+                "worker_credential": WORKER_SECRET,
+                "next_sequence": 7,
+                "heartbeat_interval_seconds": 30,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    state = load_state(path)
+
+    assert state is not None
+    assert state.next_sequence == 7
+    assert state.started_attempt_id is None
