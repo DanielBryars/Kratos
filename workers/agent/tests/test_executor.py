@@ -1,13 +1,19 @@
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import docker
 import pytest
 
-from kratos_agent.executor import DockerExecutor, EnforcementError, ExecutorError
+from kratos_agent.executor import (
+    CLEANUP_IMAGE,
+    DockerExecutor,
+    EnforcementError,
+    ExecutorError,
+)
 from kratos_agent.models import GpuHealthStatus, JobAssignment, JobOutputRequirement
 
 IMAGE_ID = "sha256:" + ("a" * 64)
@@ -611,3 +617,74 @@ def test_a_job_with_outputs_refuses_to_start_without_a_known_state_volume() -> N
         DockerExecutor(client, clock=clock, sleep=clock.sleep).run_job(output_assignment())
 
     assert client.containers.options is None
+
+
+class PreflightImages(JobImages):
+    """Local image store with a registry that may be unreachable."""
+
+    def __init__(self, *, local: bool, registry_up: bool = True) -> None:
+        super().__init__()
+        self.local = local
+        self.registry_up = registry_up
+        self.gets = 0
+
+    def get(self, image: str) -> str:
+        self.gets += 1
+        if not self.local:
+            raise docker.errors.ImageNotFound(image)
+        return image
+
+    def pull(self, image: str) -> None:
+        if not self.registry_up:
+            raise docker.errors.APIError("registry unreachable")
+        self.local = True
+        self.pulled.append(image)
+
+
+class PreflightClient(JobClient):
+    def __init__(self, clock: FakeClock, images: PreflightImages) -> None:
+        super().__init__(clock)
+        self.images = images
+        # A cleanup container is waited on after it has finished, unlike a supervised job.
+        self.containers.container.status = "exited"
+        self.volumes = SimpleNamespace(get=lambda name: name)
+        self.version = lambda: {"Version": "27.0.1"}
+
+
+def test_durable_outputs_are_declined_when_the_cleanup_image_cannot_be_fetched() -> None:
+    # Cleanup happens after a job has succeeded, so a registry outage then would strand the
+    # worker. The capability is declined now instead.
+    clock = FakeClock()
+    images = PreflightImages(local=False, registry_up=False)
+    executor = DockerExecutor(
+        PreflightClient(clock, images), clock=clock, sleep=clock.sleep, state_volume="state"
+    )
+
+    reason = executor.durable_output_support()
+
+    assert reason is not None
+    assert "cleanup image could not be prefetched" in reason
+
+
+def test_a_cached_cleanup_image_survives_an_offline_registry() -> None:
+    clock = FakeClock()
+    images = PreflightImages(local=True, registry_up=False)
+    client = PreflightClient(clock, images)
+    executor = DockerExecutor(client, clock=clock, sleep=clock.sleep, state_volume="state")
+
+    assert executor.durable_output_support() is None
+    assert executor.discard_attempt_outputs(job_assignment().attempt_id) is True
+
+    # Nothing was pulled, at preflight or during cleanup.
+    assert images.pulled == []
+
+
+def test_the_cleanup_image_is_prefetched_before_the_capability_is_offered() -> None:
+    clock = FakeClock()
+    images = PreflightImages(local=False, registry_up=True)
+    executor = DockerExecutor(
+        PreflightClient(clock, images), clock=clock, sleep=clock.sleep, state_volume="state"
+    )
+
+    assert executor.durable_output_support() is None
+    assert images.pulled == [CLEANUP_IMAGE]

@@ -301,6 +301,17 @@ class DockerExecutor:
             self._client.volumes.get(self._state_volume)
         except Exception:
             return f"the state volume {self._state_volume!r} does not exist"
+        # Cleanup runs after a job has already succeeded, so it must not depend on a registry
+        # then. The tool image is fetched now, while the worker is still free to decline the
+        # capability, and cleanup only ever uses the local copy.
+        try:
+            self._client.images.get(CLEANUP_IMAGE)
+        except Exception:
+            try:
+                self._client.images.pull(CLEANUP_IMAGE)
+                self._client.images.get(CLEANUP_IMAGE)
+            except Exception as error:
+                return f"the cleanup image could not be prefetched: {type(error).__name__}"
         return None
 
     def _output_mounts(self, assignment: JobAssignment) -> list[Any]:
@@ -336,7 +347,8 @@ class DockerExecutor:
         if self._state_volume is None:
             return False
         try:
-            self._client.images.pull(CLEANUP_IMAGE)
+            # Deliberately no pull: the image was prefetched before 1.1 was advertised, so a
+            # registry outage cannot strand a worker that has just finished a job.
             container = self._client.containers.run(
                 CLEANUP_IMAGE,
                 command=["sh", "-c", "rm -rf /attempt/* /attempt/.[!.]* 2>/dev/null; true"],

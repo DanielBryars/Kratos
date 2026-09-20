@@ -165,13 +165,16 @@ or modification or change time differs after hashing is rejected. The builder re
 with every manifest entry. The uploader SHALL re-check it on the descriptor it sends, or hash again
 immediately before transfer, so the uploaded bytes cannot differ from the manifest.
 
-This is not yet connected to job execution. The agent still advertises protocol `1.0`, so the
-control plane assigns it no job with output requirements until the mount and upload steps exist.
 
 ## Durable outputs
 
-A job may declare output requirements. The agent advertises protocol `1.1`, so the control plane
-may assign it such a job; a `1.0` agent is never given one.
+A job may declare output requirements. The agent advertises protocol `1.1` **only when it could
+actually deliver them**: it needs `--state-volume`, a reachable Docker Engine 26 or later for
+volume subpath support, that volume to exist, and the pinned cleanup image already local. The
+cleanup image is fetched during that check, while the worker is still free to decline the
+capability, because cleanup runs *after* a job has succeeded and must not depend on a registry
+being reachable then. When any of those is missing the agent says so on startup and advertises
+`1.0`, so the scheduler never assigns work the worker would have to reject.
 
 Before the container starts, the agent mounts the subpath `attempts/<attempt-id>/outputs` of its
 own state volume at `/kratos/outputs`, writable. Only that subdirectory is exposed: the volume root
