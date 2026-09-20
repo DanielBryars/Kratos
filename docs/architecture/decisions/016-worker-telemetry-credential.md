@@ -143,12 +143,17 @@ Verification SHALL NOT call the control plane per request: that is what keeps th
 the telemetry path, so a push can be validated while the control plane is unavailable and an
 observation is never lost because it was busy.
 
-**Publishing the keys is a contract, not a URL.** The `oidc` extension performs OpenID Connect
-discovery against `issuer_url` by default; a JWKS address alone does not satisfy it. The control
-plane SHALL therefore serve a discovery document at `{iss}/.well-known/openid-configuration`
-carrying at least `issuer`, `jwks_uri`, `id_token_signing_alg_values_supported` and
-`response_types_supported`, with `issuer` exactly equal to the token's `iss`, and SHALL serve the
-JWK Set at `jwks_uri`. Both SHALL be publicly readable and cacheable; neither carries a secret.
+**Publishing the keys is a contract, not a URL.** The admission service's verifier SHALL resolve
+keys by OpenID Connect discovery, so a JWKS address alone does not satisfy it. The control plane
+SHALL serve a discovery document at `{iss}/.well-known/openid-configuration` carrying at least
+`issuer`, `jwks_uri` and `id_token_signing_alg_values_supported`, with `issuer` exactly equal to
+the token's `iss`, and SHALL serve the JWK Set at `jwks_uri`. Both SHALL be publicly readable and
+cacheable; neither carries a secret.
+
+Discovery is specified rather than a bare key URL because it keeps the issuer, the key location
+and the permitted algorithms in one document that the verifier reads as a unit. A key URL on its
+own leaves the issuer and the algorithm list to be configured separately in the admission service,
+where they would drift from what the control plane is actually signing.
 
 Discovery happens when the extension starts. A gateway that cannot reach the discovery document at
 startup therefore fails to start rather than accepting unverified data, which is the behaviour to
@@ -248,11 +253,11 @@ configuration, an image, or Terraform state.
 ### Signing, keys and rotation
 
 Tokens SHALL be signed with **RS256**, and the header SHALL carry a `kid` matching a key in the
-published JWK Set. RS256 is chosen because it is the algorithm every JWT verifier supports,
-including the one behind the `oidc` extension; a faster curve is not worth a compatibility question
-on a path whose whole purpose is to be verified by someone else's code. The discovery document's
-`id_token_signing_alg_values_supported` SHALL list exactly the algorithms in use, and the gateway
-SHALL reject any token whose `alg` is not among them. `alg: none` SHALL be rejected unconditionally.
+published JWK Set. RS256 is chosen because every JWT library supports it, so the choice does not
+constrain what the admission service is written in or which verifier it uses; a faster curve would
+trade that freedom for a saving on an operation performed once per push. The discovery document's
+`id_token_signing_alg_values_supported` SHALL list exactly the algorithms in use, and the admission
+service SHALL reject any token whose `alg` is not among them. `alg: none` SHALL be rejected unconditionally.
 
 The private key SHALL live in Secret Manager and be read by the control plane at startup. It SHALL
 NOT appear in an image, in Terraform state, in logs, or in any response. The public JWK Set carries
@@ -299,9 +304,13 @@ network, and the collector's own receiver SHALL be reachable only through the ad
 ### The gate stays shut until this exists
 
 `enable_otlp_ingress` SHALL remain false, and the Terraform root SHALL refuse an enabled plan
-unless the gateway is configured with an authenticator. An unauthenticated ingestion endpoint on
-the public internet is worse than no telemetry, because it accepts anyone's data and bills for
-storing it.
+unless **both** hold: the telemetry admission service is deployed and configured with the issuer
+and audience, and the Collector's own OTLP receiver is private, reachable only through that
+service. Either alone is insufficient — an admission service that can be bypassed authorises
+nothing, and a private receiver with nothing in front of it accepts nothing at all.
+
+An unauthenticated ingestion endpoint on the public internet is worse than no telemetry, because
+it accepts anyone's data and bills for storing it.
 
 ## Alternatives
 
@@ -349,11 +358,12 @@ storing it.
 
 ## Deliberately deferred
 
-This decision does not define the worker-local collector's own configuration, the loopback proxy's
-or the admission service's implementation, or how either is supervised. It fixes the queue capacity
-*relative to* the stream count without choosing the absolute numbers, which belong with the
-collector's configuration; nor per-tenant ingestion quotas at the gateway, which the
-`kratos.project` claim makes possible but which need their own limits; nor how the gateway's
+This decision does not define the loopback proxy's or the admission service's implementation, or
+how either is supervised. The queue's shape is **not** deferred: sixteen per-stream partitions,
+64 MiB each and 256 MiB in total are fixed here, because they are what makes the token's guarantee
+hold and a deployment free to raise them could reintroduce the undrainable queue. What remains open
+is the rest of the collector's configuration around them; per-tenant ingestion quotas, which the
+`kratos.project` claim makes possible but which need their own limits; and how the gateway's
 authenticator is configured in Terraform, which follows once the shape here is accepted.
 
 ## Conditions for reconsideration
