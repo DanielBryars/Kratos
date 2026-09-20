@@ -155,16 +155,19 @@ and the permitted algorithms in one document that the verifier reads as a unit. 
 own leaves the issuer and the algorithm list to be configured separately in the admission service,
 where they would drift from what the control plane is actually signing.
 
-Discovery happens when the extension starts. A gateway that cannot reach the discovery document at
-startup therefore fails to start rather than accepting unverified data, which is the behaviour to
-want. The deployment SHALL NOT place the discovery document behind IAP, because the gateway is not
-a human.
+The admission service SHALL resolve discovery at startup and SHALL refuse to start if it cannot,
+rather than starting and accepting data it cannot verify. Since nothing reaches the Collector's
+receiver except through it, a service that will not start is an endpoint that accepts nothing,
+which is the right failure. It SHALL refresh the key set periodically thereafter, so a rotation
+does not wait for a restart.
 
-**Where a public discovery document is unacceptable**, the extension's `public_keys_file` mode
-SHALL be used instead: the JWK Set is distributed to the instance as a file and discovery is
-disabled. That trades an endpoint for a distribution and rotation procedure, and this decision
-does not choose it by default because a rotation that has to reach a file on a VM is a rotation
-that will one day not reach it.
+The deployment SHALL NOT place the discovery document behind IAP: it is read by the admission
+service, not by a human, and it carries no secret.
+
+**Where a public discovery document is unacceptable**, the admission service's verifier MAY instead
+be given the JWK Set as a file. That trades an endpoint for a distribution and rotation procedure,
+and this decision does not choose it by default because a rotation that has to reach a file on a VM
+is a rotation that will one day not reach it.
 
 **A batch SHALL carry records for exactly one stream.** One authorisation decision covers one
 request, so a request mixing streams could be neither accepted nor refused as a whole. The
@@ -363,8 +366,9 @@ how either is supervised. The queue's shape is **not** deferred: sixteen per-str
 64 MiB each and 256 MiB in total are fixed here, because they are what makes the token's guarantee
 hold and a deployment free to raise them could reintroduce the undrainable queue. What remains open
 is the rest of the collector's configuration around them; per-tenant ingestion quotas, which the
-`kratos.project` claim makes possible but which need their own limits; and how the gateway's
-authenticator is configured in Terraform, which follows once the shape here is accepted.
+`kratos.project` claim makes possible but which need their own limits; and how the admission
+service and the private Collector receiver are provisioned in Terraform, which follows once the
+shape here is accepted.
 
 ## Conditions for reconsideration
 
