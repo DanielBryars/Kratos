@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from kratos_agent.executor import (
     CLEANUP_IMAGE,
+    MAX_RESULT_BYTES,
     AuthorityLost,
     DockerExecutor,
     EnforcementError,
@@ -344,6 +345,16 @@ def test_exited_container_is_reported_not_restarted_after_lease_expiry() -> None
     assert result.stdout == "completed\n"
     assert client.containers.options is None
     assert existing.killed is False
+
+
+def test_result_log_stays_within_byte_limit_when_cut_splits_utf8() -> None:
+    payload = (b"x" * (MAX_RESULT_BYTES - 1)) + b"\xe2\x82\xac" + b"ignored"
+    container = SimpleNamespace(logs=lambda **_: payload)
+
+    result = DockerExecutor._bounded_log(container, stdout=False, stderr=True)
+
+    assert len(result.encode("utf-8")) <= MAX_RESULT_BYTES
+    assert result == "x" * (MAX_RESULT_BYTES - 1)
 
 
 def test_missing_container_is_never_started_twice() -> None:
