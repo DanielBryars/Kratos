@@ -247,12 +247,11 @@ keys. A changed replay or second manifest conflicts.
 
 The control plane exposes two replay-safe transfer calls:
 
-- `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading` and returns a
-  ten-minute, per-object GCS V4 signed `POST` plus the exact headers required to initiate a
-  resumable upload. Those headers include the XML API generation-match precondition and the exact
-  declared upload length. The worker SHALL send them unchanged, keep the returned session URI
-  private, and upload only the declared bytes through that session. Replaying the call while the
-  attempt is active MAY issue a fresh initiation grant for the same bucket and object key.
+- `PUT .../artifacts/{artifact_id}/upload` moves a declared artefact to `uploading`. The control
+  plane signs and performs the XML resumable-initiation `POST`, including generation-match zero and
+  the exact declared upload length, then returns only the resulting session URI. Concurrent and
+  replayed calls for the artefact SHALL return that same session and SHALL NOT initiate another.
+  The worker SHALL keep the session URI private and upload only the declared bytes through it.
 - `PUT .../artifacts/{artifact_id}/complete-upload` records the immutable Cloud Storage generation,
   returned byte length and CRC32C, then independently reads that exact object generation from GCS.
   A matching retry returns the stored verified response; different evidence conflicts. An
@@ -267,13 +266,15 @@ temporary GCS failure leaves verification retryable. A metadata mismatch marks t
 while any mandatory output lacks verified evidence. Failed job results do not require mandatory
 outputs, so a workload failure cannot leave the worker permanently occupied.
 
-The control plane SHALL protect verified objects from the seven-day unverified-object lifecycle
-rule. It SHOULD delete a rejected object immediately at its exact generation; lifecycle cleanup is
-the fallback for abandoned uploads and unavailable immediate cleanup.
+The control plane SHALL durably record lifecycle protection as pending after metadata verification,
+then protect the exact generation and publish it as verified. API retries and a background reconciler
+SHALL finish pending protection after interruption. It SHOULD delete a rejected object immediately at
+its exact generation; lifecycle cleanup is the fallback for abandoned uploads and unavailable
+immediate cleanup.
 
-Upload initiation responses SHALL use `Cache-Control: no-store`. Signed URLs and resumable session
-URIs are credentials: agents SHALL redact them from logs and the control plane SHALL persist only
-the recipient, bucket, object key, issue time and expiry of each grant.
+Upload initiation responses SHALL use `Cache-Control: no-store`. Resumable session URIs are
+credentials: agents and the control plane SHALL redact them from logs. The control plane MAY retain
+the one URI per artefact in its encrypted database solely for authenticated idempotent replay.
 
 The initial limits are 100 files, 5 GiB per file, 10 GiB across the manifest and 240 UTF-8 bytes per
 logical path. Absolute paths, empty segments, `.` and `..` segments, backslashes and control

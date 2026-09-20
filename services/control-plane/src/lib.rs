@@ -24,7 +24,7 @@ pub mod migration;
 mod operator;
 mod registry;
 
-use artifact_storage::{ArtifactStorageClient, ResumableUploadAuthorization};
+use artifact_storage::{ArtifactStorageClient, ResumableUploadSession};
 use artifacts::{
     ArtifactManifestFile, ArtifactManifestResponse, ArtifactResponse, BeginArtifactUploadRequest,
     BeginArtifactUploadResponse, CompleteArtifactUploadRequest, DeclareArtifactManifestRequest,
@@ -109,7 +109,7 @@ pub(crate) struct AppState {
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, CompleteArtifactUploadRequest,
         ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
-        ResumableUploadAuthorization
+        ResumableUploadSession
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -344,6 +344,14 @@ pub fn app_with_dependencies(
     } else {
         router
     }
+}
+
+/// Reconciles durable storage-protection work left by interrupted upload finalization.
+pub async fn reconcile_artifact_protections(
+    pool: &PgPool,
+    storage: &ArtifactStorageClient,
+) -> usize {
+    artifacts::reconcile_pending_protections(pool, storage).await
 }
 
 #[cfg(test)]

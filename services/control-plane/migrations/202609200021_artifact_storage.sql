@@ -1,6 +1,7 @@
 ALTER TABLE job_artifacts
     ADD COLUMN storage_bucket text,
-    ADD COLUMN verified_sha256 text CHECK (verified_sha256 ~ '^[0-9a-f]{64}$');
+    ADD COLUMN verified_sha256 text CHECK (verified_sha256 ~ '^[0-9a-f]{64}$'),
+    ADD COLUMN protection_pending boolean NOT NULL DEFAULT false;
 
 -- The preceding release allowed tests or operators to record GCS evidence without the bucket or
 -- object SHA metadata. Those rows cannot satisfy the stronger storage-identity proof. Fail closed
@@ -23,8 +24,27 @@ ALTER TABLE job_artifacts ADD CONSTRAINT job_artifacts_verified_storage_identity
         OR (
             storage_bucket IS NOT NULL
             AND verified_sha256 = sha256
+            AND protection_pending = false
         )
     );
+
+ALTER TABLE job_artifacts ADD CONSTRAINT job_artifacts_protection_pending_evidence
+    CHECK (
+        NOT protection_pending
+        OR (
+            status = 'uploading'
+            AND verified_at IS NOT NULL
+            AND verified_storage_generation IS NOT NULL
+            AND verified_byte_length IS NOT NULL
+            AND verified_crc32c IS NOT NULL
+            AND verified_sha256 = sha256
+            AND verification_source = 'gcs_metadata'
+        )
+    );
+
+CREATE INDEX job_artifacts_protection_pending_idx
+    ON job_artifacts (verified_at)
+    WHERE protection_pending = true;
 
 CREATE TABLE artifact_upload_grants (
     id uuid PRIMARY KEY,
@@ -32,16 +52,17 @@ CREATE TABLE artifact_upload_grants (
     worker_id uuid NOT NULL REFERENCES workers(id),
     bucket_name text NOT NULL,
     object_key text NOT NULL,
+    session_uri text NOT NULL,
     issued_at timestamptz NOT NULL,
     expires_at timestamptz NOT NULL,
+    UNIQUE (artifact_id),
     CHECK (expires_at > issued_at)
 );
 
-CREATE INDEX artifact_upload_grants_artifact_idx
-    ON artifact_upload_grants (artifact_id, issued_at DESC);
-
 COMMENT ON TABLE artifact_upload_grants IS
-    'Audit records for short-lived upload initiation grants. Signed URLs and resumable session URIs are never persisted.';
+    'One control-plane-created resumable session per artifact. The bearer session URI is sensitive and returned only to the owning worker.';
+COMMENT ON COLUMN job_artifacts.protection_pending IS
+    'Authoritative metadata matched, but the exact generation still needs its lifecycle-protection hold before publication.';
 COMMENT ON COLUMN job_artifacts.storage_bucket IS
     'Exact private bucket selected by the control plane when upload authority is issued.';
 COMMENT ON COLUMN job_artifacts.verified_sha256 IS

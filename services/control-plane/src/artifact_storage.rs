@@ -10,15 +10,15 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 const AUTHORIZATION_LIFETIME_SECONDS: i64 = 600;
+const SESSION_LIFETIME_SECONDS: i64 = 7 * 24 * 60 * 60;
 const METADATA_TOKEN_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
-pub struct ResumableUploadAuthorization {
-    /// Secret, short-lived URL used only to initiate a resumable upload.
-    pub url: String,
+pub struct ResumableUploadSession {
+    /// Secret GCS session URI created once by the control plane.
+    pub uri: String,
     pub method: String,
-    pub headers: BTreeMap<String, String>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -44,14 +44,14 @@ pub enum ArtifactStorageError {
 
 #[async_trait]
 pub trait ArtifactStorage: Send + Sync {
-    async fn authorize_resumable_upload(
+    async fn initiate_resumable_upload(
         &self,
         object_key: &str,
         media_type: &str,
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
-    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError>;
+    ) -> Result<ResumableUploadSession, ArtifactStorageError>;
 
     async fn object_metadata(
         &self,
@@ -86,20 +86,20 @@ impl ArtifactStorageClient {
         Self(Arc::new(storage))
     }
 
-    /// Creates a short-lived authorization for exactly one object.
+    /// Creates exactly one resumable session for an object without exposing initiation authority.
     ///
     /// # Errors
     /// Returns an error when the backing signer cannot create the authorization.
-    pub async fn authorize_resumable_upload(
+    pub async fn initiate_resumable_upload(
         &self,
         object_key: &str,
         media_type: &str,
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
-    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
+    ) -> Result<ResumableUploadSession, ArtifactStorageError> {
         self.0
-            .authorize_resumable_upload(object_key, media_type, byte_length, sha256, issued_at)
+            .initiate_resumable_upload(object_key, media_type, byte_length, sha256, issued_at)
             .await
     }
 
@@ -337,14 +337,14 @@ impl GoogleArtifactStorage {
 
 #[async_trait]
 impl ArtifactStorage for GoogleArtifactStorage {
-    async fn authorize_resumable_upload(
+    async fn initiate_resumable_upload(
         &self,
         object_key: &str,
         media_type: &str,
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
-    ) -> Result<ResumableUploadAuthorization, ArtifactStorageError> {
+    ) -> Result<ResumableUploadSession, ArtifactStorageError> {
         let material = upload_signing_material(
             &self.bucket,
             &self.signer_service_account,
@@ -367,15 +367,43 @@ impl ArtifactStorage for GoogleArtifactStorage {
             material.timestamp, material.scope
         );
         let signature = hex_lower(&self.sign_blob(string_to_sign.as_bytes()).await?);
-        let url = format!(
+        let signed_url = format!(
             "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
             material.canonical_uri, material.canonical_query
         );
-        Ok(ResumableUploadAuthorization {
-            url,
-            method: "POST".to_owned(),
-            headers: material.headers,
-            expires_at: issued_at + TimeDelta::seconds(AUTHORIZATION_LIFETIME_SECONDS),
+        let response = self
+            .client
+            .post(signed_url)
+            .headers(
+                material
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+                        let value = reqwest::header::HeaderValue::from_str(value)
+                            .map_err(|_| ArtifactStorageError::InvalidResponse)?;
+                        Ok((name, value))
+                    })
+                    .collect::<Result<reqwest::header::HeaderMap, ArtifactStorageError>>()?,
+            )
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(ArtifactStorageError::Unavailable);
+        }
+        let uri = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.starts_with("https://storage.googleapis.com/"))
+            .ok_or(ArtifactStorageError::InvalidResponse)?
+            .to_owned();
+        Ok(ResumableUploadSession {
+            uri,
+            method: "PUT".to_owned(),
+            expires_at: issued_at + TimeDelta::seconds(SESSION_LIFETIME_SECONDS),
         })
     }
 

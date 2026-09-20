@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
 use tokio::net::TcpListener;
 use tracing::info;
@@ -30,6 +30,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let human_auth = human_auth_from_environment()?;
     let artifact_storage = artifact_storage_from_environment()?;
+    if let (Some(pool), Some(storage)) = (database.clone(), artifact_storage.clone()) {
+        tokio::spawn(async move {
+            loop {
+                kratos_control_plane::reconcile_artifact_protections(&pool, &storage).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
 
     info!(
         %address,
