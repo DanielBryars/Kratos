@@ -404,6 +404,13 @@ impl ArtifactStorage for GoogleArtifactStorage {
             .await
             .map_err(|_| ArtifactStorageError::Unavailable)?;
         if !response.status().is_success() {
+            let status = response.status();
+            let error_body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                %status,
+                gcs_error_code = xml_error_field(&error_body, "Code").unwrap_or("unknown"),
+                "Cloud Storage rejected resumable upload initiation"
+            );
             return Err(ArtifactStorageError::Unavailable);
         }
         let uri = response
@@ -589,11 +596,25 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+fn xml_error_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
+    let start_tag = format!("<{field}>");
+    let end_tag = format!("</{field}>");
+    let value_start = body.find(&start_tag)? + start_tag.len();
+    let value_end = body[value_start..].find(&end_tag)? + value_start;
+    let value = body[value_start..value_end].trim();
+    (!value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        }))
+    .then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::{percent_encode, upload_signing_material};
+    use super::{percent_encode, upload_signing_material, xml_error_field};
 
     #[test]
     fn encoding_preserves_only_canonical_path_separators() {
@@ -639,5 +660,21 @@ mod tests {
             material.signed_headers,
             "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length"
         );
+    }
+
+    #[test]
+    fn extracts_only_bounded_machine_readable_storage_error_codes() {
+        assert_eq!(
+            xml_error_field(
+                "<?xml version='1.0'?><Error><Code>SignatureDoesNotMatch</Code></Error>",
+                "Code"
+            ),
+            Some("SignatureDoesNotMatch")
+        );
+        assert_eq!(
+            xml_error_field("<Error><Code>unsafe value</Code></Error>", "Code"),
+            None
+        );
+        assert_eq!(xml_error_field("<html>gateway error</html>", "Code"), None);
     }
 }
