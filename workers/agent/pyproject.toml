@@ -43,8 +43,3 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
 ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-# google-crc32c ships no type information.
-module = ["kratos_agent.outputs"]
-disallow_untyped_calls = false

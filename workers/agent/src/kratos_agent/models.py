@@ -2,11 +2,16 @@
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 PROTOCOL_VERSION = "1.0"
+MAX_OUTPUT_FILES = 100
+MAX_OUTPUT_FILE_BYTES = 5 * 1024**3
+MAX_OUTPUT_TOTAL_BYTES = 10 * 1024**3
+MAX_LOGICAL_PATH_BYTES = 240
 
 
 class StrictModel(BaseModel):
@@ -144,12 +149,39 @@ class HeartbeatRequest(StrictModel):
     capabilities: WorkerCapabilities
 
 
+def valid_logical_path(path: str) -> bool:
+    """Apply the control plane's logical-path rules, so it never refuses a manifest's paths."""
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return (
+        0 < len(encoded) <= MAX_LOGICAL_PATH_BYTES
+        and not path.startswith("/")
+        and "\\" not in path
+        # The same range as Rust's char::is_control, which the control plane applies.
+        and not any(character < " " or "\x7f" <= character <= "\x9f" for character in path)
+        and all(segment not in ("", ".", "..") for segment in path.split("/"))
+    )
+
+
+def _checked_logical_path(path: str) -> str:
+    if not valid_logical_path(path):
+        raise ValueError("logical path is not permitted")
+    return path
+
+
+LogicalPath = Annotated[str, AfterValidator(_checked_logical_path)]
+
+
 class JobOutputRequirement(StrictModel):
-    logical_path: str = Field(min_length=1, max_length=240)
+    logical_path: LogicalPath
     role: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
-    media_type: str = Field(min_length=3, max_length=127)
+    media_type: str = Field(
+        max_length=127, pattern=r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$"
+    )
     mandatory: bool
-    max_bytes: int = Field(ge=1, le=5 * 1024**3)
+    max_bytes: int = Field(ge=1, le=MAX_OUTPUT_FILE_BYTES)
 
 
 class JobAssignment(StrictModel):
@@ -160,7 +192,19 @@ class JobAssignment(StrictModel):
     gpu_index: int = Field(ge=0)
     timeout_seconds: int = Field(ge=30, le=3600)
     lease_expires_at: datetime
-    output_requirements: tuple[JobOutputRequirement, ...] = Field(default=(), max_length=100)
+    output_requirements: tuple[JobOutputRequirement, ...] = Field(
+        default=(), max_length=MAX_OUTPUT_FILES
+    )
+
+    @model_validator(mode="after")
+    def output_requirements_are_consistent(self) -> "JobAssignment":
+        paths = [requirement.logical_path for requirement in self.output_requirements]
+        if len(set(paths)) != len(paths):
+            raise ValueError("output requirements repeat a logical path")
+        declared = sum(requirement.max_bytes for requirement in self.output_requirements)
+        if declared > MAX_OUTPUT_TOTAL_BYTES:
+            raise ValueError("output requirements exceed the total size limit")
+        return self
 
 
 class HeartbeatResponse(StrictModel):
@@ -186,7 +230,7 @@ class JobResultResponse(StrictModel):
 
 
 class ArtifactManifestFile(StrictModel):
-    logical_path: str = Field(min_length=1, max_length=240)
-    byte_length: int = Field(ge=0, le=5 * 1024**3)
+    logical_path: LogicalPath
+    byte_length: int = Field(ge=0, le=MAX_OUTPUT_FILE_BYTES)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{6}==$")
+    crc32c: str = Field(pattern=r"^[A-Za-z0-9+/]{5}[AQgw]==$")
