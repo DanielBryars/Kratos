@@ -2080,6 +2080,33 @@ mod tests {
             }
         }
 
+        let heartbeat = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/api/v1/workers/{worker_id}/heartbeat"))
+                    .header(
+                        AUTHORIZATION,
+                        format!("Bearer {}", worker_credential.plaintext.expose()),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.0",
+                            "sequence": 1,
+                            "observed_at": Utc::now(),
+                            "capabilities": healthy_worker_capabilities()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+        let heartbeat = to_bytes(heartbeat.into_body(), 1024 * 1024).await.unwrap();
+        let heartbeat: Value = serde_json::from_slice(&heartbeat).unwrap();
+        assert_eq!(heartbeat["assignment"], Value::Null);
+
         sqlx::query(
             "UPDATE job_attempts SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
         )
