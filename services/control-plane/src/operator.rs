@@ -273,7 +273,7 @@ impl OperatorError {
         Self::new(
             StatusCode::CONFLICT,
             "job_state_conflict",
-            "Only a queued job can be cancelled.",
+            "A succeeded or failed job cannot be cancelled.",
         )
     }
 

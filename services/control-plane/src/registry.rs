@@ -438,7 +438,7 @@ struct ExpiredAttemptRecord {
     attempt_status: String,
     job_status: String,
     max_attempts: i32,
-    lease_expired: bool,
+    lease_expires_at: DateTime<Utc>,
 }
 
 struct LeaseExpiryOutcome {
@@ -1307,7 +1307,7 @@ pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, A
         let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
             "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                     a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                    true AS lease_expired \
+                    a.lease_expires_at \
              FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
              WHERE a.status IN ('assigned', 'running') AND a.lease_expires_at <= now() \
                AND j.status IN ('assigned', 'running', 'cancelling') \
@@ -1764,7 +1764,7 @@ pub(crate) async fn report_job_result(
     let attempt = sqlx::query_as::<_, ExpiredAttemptRecord>(
         "SELECT a.id AS attempt_id, a.job_id, a.worker_id, a.attempt_number, \
                 a.status AS attempt_status, j.status AS job_status, j.max_attempts, \
-                a.lease_expires_at <= now() AS lease_expired \
+                a.lease_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
     )
@@ -1788,7 +1788,15 @@ pub(crate) async fn report_job_result(
             status: attempt.attempt_status,
         }));
     }
-    if attempt.lease_expired {
+    // `now()` is fixed at transaction start in PostgreSQL. This query deliberately runs after the
+    // attempt and job locks have been acquired and uses the wall clock so lock wait time counts
+    // against execution authority.
+    let lease_expired: bool = sqlx::query_scalar("SELECT clock_timestamp() >= $1")
+        .bind(attempt.lease_expires_at)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| database_error(&error, "check job attempt lease after locking"))?;
+    if lease_expired {
         let outcome = close_expired_attempt(&mut transaction, &attempt).await?;
         transaction
             .commit()
@@ -2306,6 +2314,143 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(replacement_status, "assigned");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn result_waiting_for_attempt_lock_is_rejected_when_lease_expires(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "busy").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        let attempt_id = Uuid::new_v4();
+        let lease_expires_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT clock_timestamp() + interval '3 seconds'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'running', assigned_worker_id = $2 WHERE id = $1")
+            .bind(job_id)
+            .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO job_attempts \
+             (id, job_id, attempt_number, worker_id, status, started_at, lease_expires_at) \
+             VALUES ($1, $2, 1, $3, 'running', now(), $4)",
+        )
+        .bind(attempt_id)
+        .bind(job_id)
+        .bind(worker_id)
+        .bind(lease_expires_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(credential.id)
+        .bind(worker_id)
+        .bind(&credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM job_attempts WHERE id = $1 FOR UPDATE")
+            .bind(attempt_id)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let request = app(None, Some(pool.clone())).oneshot(
+            Request::put(format!(
+                "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/result"
+            ))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", credential.plaintext.expose()),
+            )
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "exit_code": 0,
+                    "timed_out": false,
+                    "stdout": "completed before the lock was released",
+                    "stderr": "",
+                    "failure_message": null
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+        );
+        let result = tokio::spawn(request);
+
+        let wait_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let result_query_waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM pg_stat_activity \
+                    WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                      AND wait_event_type = 'Lock' \
+                      AND query LIKE '%FROM job_attempts a JOIN jobs j%' \
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if result_query_waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < wait_deadline,
+                "result endpoint did not reach the attempt lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let transaction_started_before_expiry: bool =
+            sqlx::query_scalar("SELECT clock_timestamp() < $1")
+                .bind(lease_expires_at)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(transaction_started_before_expiry);
+
+        loop {
+            let expired: bool = sqlx::query_scalar("SELECT clock_timestamp() >= $1")
+                .bind(lease_expires_at)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if expired {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        blocker.commit().await.unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["status"], "failed");
+
+        let persisted: (String, String, Option<i32>, Option<String>) = sqlx::query_as(
+            "SELECT a.status, j.status, j.exit_code, j.stdout \
+             FROM job_attempts a JOIN jobs j ON j.id = a.job_id WHERE a.id = $1",
+        )
+        .bind(attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted,
+            ("failed".to_owned(), "queued".to_owned(), None, None)
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
