@@ -89,6 +89,9 @@ pub(crate) struct AppState {
         external_links,
         auth_config,
         operator::create_worker_enrolment,
+        operator::create_project_invitation,
+        operator::revoke_project_invitation,
+        operator::revoke_project_membership,
         operator::list_worker_registration_requests,
         operator::approve_worker_registration,
         operator::reject_worker_registration,
@@ -301,6 +304,18 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/worker-enrolments",
             post(operator::create_worker_enrolment),
+        )
+        .route(
+            "/api/v1/operator/project-invitations",
+            post(operator::create_project_invitation),
+        )
+        .route(
+            "/api/v1/operator/project-invitations/{invitation_id}/revoke",
+            post(operator::revoke_project_invitation),
+        )
+        .route(
+            "/api/v1/operator/project-members/{member_identity_id}/revoke",
+            post(operator::revoke_project_membership),
         )
         .route(
             "/api/v1/operator/worker-registration-requests",

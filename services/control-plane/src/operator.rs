@@ -28,6 +28,8 @@ use crate::{
 const DEFAULT_EXPIRY_SECONDS: i64 = 900;
 const MIN_EXPIRY_SECONDS: i64 = 300;
 const MAX_EXPIRY_SECONDS: i64 = 3600;
+/// Bounded so a compromised console session cannot mint an unbounded supply of ways in.
+const MAX_PENDING_INVITATIONS: i64 = 10;
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -408,6 +410,22 @@ impl OperatorError {
             StatusCode::NOT_FOUND,
             "registration_not_found",
             "The pending registration was not found.",
+        )
+    }
+
+    const fn too_many_invitations() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "too_many_invitations",
+            "This project already has the maximum number of unclaimed invitations.",
+        )
+    }
+
+    const fn last_owner() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "A project cannot be left without an owner.",
         )
     }
 
@@ -1521,6 +1539,273 @@ impl Caller {
             _ => Err(OperatorError::project_required()),
         }
     }
+}
+
+// --- Project invitations -------------------------------------------------------------------------
+//
+// ADR-017. The credential is a near-copy of the worker enrolment secret: single use, expiring,
+// revocable, stored only as an Argon2id verifier, with a non-secret UUID inside the token so
+// lookup is an indexed read. The differences are what it grants and who may claim it.
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateInvitationRequest {
+    pub(crate) expires_in_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CreateInvitationResponse {
+    pub(crate) invitation_id: Uuid,
+    pub(crate) project_id: Uuid,
+    /// Returned exactly once. Losing it means issuing another.
+    pub(crate) invitation_credential: String,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+/// Issue an invitation to the caller's project.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-invitations",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    request_body = CreateInvitationRequest,
+    responses(
+        (status = 201, description = "Single-use project invitation created", body = CreateInvitationResponse),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+        (status = 409, description = "Too many unclaimed invitations, or the project is ambiguous", body = ErrorResponse),
+        (status = 422, description = "Invalid expiry", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn create_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitationRequest>,
+) -> Result<(StatusCode, Json<CreateInvitationResponse>), OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let expiry_seconds = request.expires_in_seconds.unwrap_or(DEFAULT_EXPIRY_SECONDS);
+    if !(MIN_EXPIRY_SECONDS..=MAX_EXPIRY_SECONDS).contains(&expiry_seconds) {
+        return Err(OperatorError::invalid_request());
+    }
+
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let project_id = caller.sole_project()?;
+
+    // Bounded, so that a console session which has been taken over cannot mint an unlimited
+    // supply of ways in before anyone notices.
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_invitations \
+         WHERE project_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL \
+           AND expires_at > now()",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    if pending >= MAX_PENDING_INVITATIONS {
+        return Err(OperatorError::too_many_invitations());
+    }
+
+    let credential =
+        credentials::issue(CredentialKind::Invitation).map_err(|_| OperatorError::internal())?;
+    let expires_at = Utc::now()
+        .checked_add_signed(TimeDelta::seconds(expiry_seconds))
+        .ok_or_else(OperatorError::invalid_request)?;
+
+    sqlx::query(
+        "INSERT INTO project_invitations \
+         (id, project_id, created_by_identity_id, token_verifier, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(credential.id)
+    .bind(project_id)
+    .bind(caller.identity_id)
+    .bind(&credential.verifier)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.invitation.created', 'project_invitation', $3, 'succeeded', '{{}}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(credential.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateInvitationResponse {
+            invitation_id: credential.id,
+            project_id,
+            invitation_credential: credential.plaintext.expose().to_owned(),
+            expires_at,
+        }),
+    ))
+}
+
+/// Stop an invitation being claimed. Distinct from removing someone already in the project.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-invitations/{invitation_id}/revoke",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("invitation_id" = Uuid, Path, description = "Invitation to revoke")),
+    responses(
+        (status = 204, description = "Invitation can no longer be claimed"),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 404, description = "No such claimable invitation in the caller's projects", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn revoke_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<StatusCode, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+
+    let affected = sqlx::query(
+        "UPDATE project_invitations SET revoked_at = now(), revoked_by_identity_id = $2 \
+         WHERE id = $1 AND project_id = ANY($3) AND consumed_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(invitation_id)
+    .bind(caller.identity_id)
+    .bind(&caller.project_ids)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .rows_affected();
+    if affected == 0 {
+        // Already claimed, already revoked, or in another project: the same answer for all three,
+        // so this cannot be used to learn which.
+        return Err(OperatorError::not_found());
+    }
+
+    sqlx::query(
+        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.invitation.revoked', 'project_invitation', $3, 'succeeded', '{{}}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(invitation_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove someone from a project, with the rail that a project cannot be left ownerless.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-members/{member_identity_id}/revoke",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("member_identity_id" = Uuid, Path, description = "Member to remove from the project")),
+    responses(
+        (status = 204, description = "Membership revoked"),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 404, description = "No such active membership", body = ErrorResponse),
+        (status = 409, description = "A project cannot be left without an owner", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn revoke_project_membership(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(member_identity_id): Path<Uuid>,
+) -> Result<StatusCode, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let project_id = caller.sole_project()?;
+
+    // Locked before counting, so two owners removing each other at the same instant cannot both
+    // observe a second owner and both proceed. A count taken outside this lock would pass every
+    // test written against it and fail once, in production, leaving nobody able to administer
+    // the project.
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_memberships \
+         WHERE project_id = $1 AND revoked_at IS NULL FOR UPDATE",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    if remaining <= 1 {
+        return Err(OperatorError::last_owner());
+    }
+
+    let affected = sqlx::query(
+        "UPDATE project_memberships \
+         SET revoked_at = now(), revoked_by_identity_id = $3 \
+         WHERE project_id = $1 AND identity_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(member_identity_id)
+    .bind(caller.identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .rows_affected();
+    if affected == 0 {
+        return Err(OperatorError::not_found());
+    }
+
+    sqlx::query(
+        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.membership.revoked', 'human_identity', $3, 'succeeded', '{{}}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(member_identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn authorize_operator(
