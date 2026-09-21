@@ -3,6 +3,8 @@
 **Status:** Accepted  
 **Date:** 2026-09-19
 
+Detailed implementation design: [Queue scheduling and bounded SkyPilot capacity](../queue-and-skypilot-capacity.md).
+
 ## Context
 
 SkyPilot can provision and operate workloads across cloud providers and existing Kubernetes
@@ -44,4 +46,3 @@ scoped and time-bounded.
 - R0.7 cloud GPU expansion begins;
 - an existing Kubernetes fleet becomes an execution requirement; or
 - measured provisioning and recovery work shows that direct provider integration is preferable.
-

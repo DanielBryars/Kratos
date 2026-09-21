@@ -4,6 +4,10 @@ Status distinguishes a selected direction from a recommendation still under disc
 
 The editable [system diagram](kratos-system.drawio) contains the cloud context and the worker execution, observation and durable-model flow.
 
+The proposed [queue and bounded SkyPilot capacity design](queue-and-skypilot-capacity.md) expands
+ADR-010 with the scheduler, budget, lifecycle and recovery gates required before temporary cloud
+GPU provisioning can be enabled.
+
 | Decision | Status | Record |
 |---|---|---|
 | GCP control plane; remote GPU workers | Accepted | [ADR-001](decisions/001-gcp-control-plane.md) |
