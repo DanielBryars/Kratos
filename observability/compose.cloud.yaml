@@ -84,6 +84,7 @@ services:
       - --artifacts-destination=gs://${KRATOS_TELEMETRY_BUCKET:?the telemetry bucket must be named}/mlflow
       - --serve-artifacts
       - --allowed-hosts=${KRATOS_MLFLOW_HOST:?the public MLflow host must be named},mlflow:5000
+      - --cors-allowed-origins=https://${KRATOS_MLFLOW_HOST:?the public MLflow host must be named}
     volumes:
       # Holds the SQLite store when no Cloud SQL database is enabled; unused when one is.
       - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/mlflow:/var/lib/mlflow
