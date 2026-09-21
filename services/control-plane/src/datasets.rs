@@ -1129,3 +1129,6 @@ mod tests {
         assert!(validate_file_declarations(&files).is_ok());
     }
 }
+
+#[cfg(test)]
+mod acceptance;
