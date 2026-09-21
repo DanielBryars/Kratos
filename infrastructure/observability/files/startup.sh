@@ -67,6 +67,12 @@ chmod 0750 "$DATA_ROOT"/{prometheus,loki,tempo,grafana}
 
 # --- Install the reconciliation timer on first boot, so a replaced bundle is picked up without
 # anyone rebooting the instance. The unit runs this same script.
+# Refresh the timer's copy on every boot. Terraform can update the metadata startup script after
+# the timer already exists, and leaving the first installed copy in place would make later fixes
+# take effect only in the one-off boot process rather than in ongoing reconciliation.
+if [ "$(readlink -f "$0")" != /var/lib/kratos/startup.sh ]; then
+  install -m 0755 "$0" /var/lib/kratos/startup.sh
+fi
 if [ ! -f /etc/systemd/system/kratos-observability.timer ]; then
   cat > /etc/systemd/system/kratos-observability.service <<'UNIT'
 [Unit]
@@ -90,7 +96,6 @@ AccuracySec=30s
 [Install]
 WantedBy=timers.target
 UNIT
-  install -m 0755 "$0" /var/lib/kratos/startup.sh
   systemctl daemon-reload
   systemctl enable --now kratos-observability.timer
 fi
@@ -115,13 +120,14 @@ if [ -z "$CURRENT_GENERATION" ]; then
   exit 0
 fi
 RECORDED_GENERATION="$(cat "$DATA_ROOT/bundle.generation" 2>/dev/null || true)"
+BUNDLE_CHANGED=false
 if [ "$CURRENT_GENERATION" != "$RECORDED_GENERATION" ]; then
   docker run --rm --network host -v "$DATA_ROOT:/data" "$CLOUD_CLI" \
     gcloud storage cp "$BUNDLE_OBJECT" /data/bundle.tar.gz
   rm -rf "$BUNDLE_DIR"
   mkdir -p "$BUNDLE_DIR"
   tar -xzf "$DATA_ROOT/bundle.tar.gz" -C "$BUNDLE_DIR" --strip-components=1
-  echo "$CURRENT_GENERATION" > "$DATA_ROOT/bundle.generation"
+  BUNDLE_CHANGED=true
 fi
 
 # --- Read the Grafana administrator password from Secret Manager into a private environment file.
@@ -155,7 +161,20 @@ if [ -n "$MLFLOW_INSTANCE" ]; then
 fi
 
 cd "$BUNDLE_DIR"
-"$COMPOSE" "${OVERLAYS[@]}" up -d --remove-orphans
+COMPOSE_UP_ARGS=(-d --remove-orphans)
+if [ "$BUNDLE_CHANGED" = true ]; then
+  # Replacing BUNDLE_DIR replaces the inodes behind every bind mount. Compose compares mount path
+  # strings, so a plain `up` considers the existing containers current and leaves them attached
+  # to the deleted directory. Recreate them once per new generation so reviewed dashboards and
+  # backend configuration become live while keeping every persistent data mount intact.
+  COMPOSE_UP_ARGS+=(--force-recreate)
+fi
+"$COMPOSE" "${OVERLAYS[@]}" up "${COMPOSE_UP_ARGS[@]}"
+if [ "$BUNDLE_CHANGED" = true ]; then
+  # Record the generation only after Compose accepts it. A failed deployment remains pending and
+  # the timer retries it instead of declaring a bundle live while old containers keep running.
+  echo "$CURRENT_GENERATION" > "$DATA_ROOT/bundle.generation"
+fi
 # Docker can rewrite DOCKER-USER while creating networks. Reconcile the allowlist after Compose so
 # the explicit storage-client exceptions remain ahead of the metadata deny rule.
 configure_metadata_firewall
