@@ -618,13 +618,28 @@ class AgentRunner:
             authorised = held is not None and held.attempt_id == assignment.attempt_id
             return authorised
 
-        result = self._executor.run_job(
-            assignment,
-            may_start=may_start,
-            on_tick=still_authorised,
-            tick_seconds=state.heartbeat_interval_seconds,
-            observe=None if pump is None else pump.ingest,
-        )
+        observations_closed: Callable[[], None] | None = None
+        if pump is not None and self._courier is not None:
+            directory = self._observation_directory(assignment.attempt_id)
+            courier = self._courier
+
+            def release_observations() -> None:
+                courier.release(directory)
+
+            observations_closed = release_observations
+        try:
+            result = self._executor.run_job(
+                assignment,
+                may_start=may_start,
+                on_tick=still_authorised,
+                tick_seconds=state.heartbeat_interval_seconds,
+                observe=None if pump is None else pump.ingest,
+                on_observations_closed=observations_closed,
+            )
+        except Exception:
+            if observations_closed is not None:
+                observations_closed()
+            raise
         return state, result, authorised
 
     def step(self, state: AgentState) -> AgentState:

@@ -129,6 +129,26 @@ def test_a_spool_is_removed_only_once_its_cursor_proves_delivery(
     assert not (tmp_path / "attempt-c").exists()
 
 
+def test_an_active_writer_keeps_an_empty_spool_past_the_retirement_window(
+    tmp_path: Path, link: Link, clock: Clock
+) -> None:
+    spool = make_spool(tmp_path, "attempt-active", records=0)
+    post = courier(tmp_path, link, clock)
+    path = tmp_path / "attempt-active"
+    post.adopt(spool, path)
+
+    post.deliver_once()
+    clock.advance(120)
+    post.deliver_once()
+    assert path.exists(), "Docker may not yield the writer's first chunk for several minutes"
+
+    post.release(path)
+    post.deliver_once()
+    clock.advance(120)
+    post.deliver_once()
+    assert not path.exists()
+
+
 def test_an_undelivered_spool_is_never_removed(tmp_path: Path, link: Link, clock: Clock) -> None:
     """Removing on a timer rather than on an acknowledgement would discard exactly the records a
     failing link had not managed to send."""
