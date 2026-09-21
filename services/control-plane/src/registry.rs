@@ -28,6 +28,9 @@ use crate::{
 };
 
 const HEARTBEAT_INTERVAL_SECONDS: u32 = 30;
+/// The project an interactive registration enters, until a project-scoped pairing
+/// credential exists. Matches the row the projects migration creates.
+const DEFAULT_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_d00f);
 const REGISTRATION_TTL_MINUTES: i64 = 15;
 const REGISTRATION_POLL_SECONDS: u32 = 3;
 const MAX_OPEN_REGISTRATIONS: i64 = 1_000;
@@ -305,6 +308,7 @@ struct RegistrationRecord {
     expires_at: DateTime<Utc>,
     approved_at: Option<DateTime<Utc>>,
     approved_by_identity_id: Option<Uuid>,
+    project_id: Uuid,
     rejected_at: Option<DateTime<Utc>>,
     claimed_at: Option<DateTime<Utc>>,
     worker_id: Option<Uuid>,
@@ -1120,9 +1124,13 @@ pub(crate) async fn request_registration(
     let capabilities =
         serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
     sqlx::query(
+        // The project is fixed here rather than taken from the request. This endpoint is
+        // unauthenticated -- an agent radios in before anyone has approved it -- so a
+        // project it could name would be a project it could choose.
         "INSERT INTO worker_registration_requests \
          (id, agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-          confirmation_code, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          confirmation_code, expires_at, project_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(registration_id)
     .bind(request.agent_instance_id)
@@ -1132,6 +1140,7 @@ pub(crate) async fn request_registration(
     .bind(public_key.as_slice())
     .bind(&code)
     .bind(expires_at)
+    .bind(DEFAULT_PROJECT_ID)
     .execute(pool)
     .await
     .map_err(|error| {
@@ -1242,7 +1251,7 @@ pub(crate) async fn claim_registration(
         .map_err(|error| database_error(&error, "begin registration claim"))?;
     let record = sqlx::query_as::<_, RegistrationRecord>(
         "SELECT agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-                claim_challenge, expires_at, approved_at, approved_by_identity_id, rejected_at, \
+                claim_challenge, expires_at, approved_at, approved_by_identity_id, project_id, rejected_at, \
                 claimed_at, worker_id FROM worker_registration_requests WHERE id = $1 FOR UPDATE",
     )
     .bind(registration_id)
@@ -1290,11 +1299,16 @@ pub(crate) async fn claim_registration(
         .ok_or_else(ApiError::internal)?;
     let worker_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO workers (id, owner_identity_id, agent_instance_id, display_name, \
-         protocol_version, capabilities, status) VALUES ($1, $2, $3, $4, $5, $6, 'idle')",
+        // The project comes from the registration request, locked when the machine radioed
+        // in, rather than from the approver: an approver may belong to several projects,
+        // and a machine's project should not depend on which of them happened to click.
+        "INSERT INTO workers (id, owner_identity_id, project_id, agent_instance_id, \
+         display_name, protocol_version, capabilities, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'idle')",
     )
     .bind(worker_id)
     .bind(owner_identity_id)
+    .bind(record.project_id)
     .bind(record.agent_instance_id)
     .bind(record.display_name)
     .bind(record.protocol_version)
@@ -1617,6 +1631,7 @@ async fn current_or_assign_job(
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
         "SELECT id, name, image_reference, timeout_seconds FROM jobs \
          WHERE status = 'queued' AND gpu_count = 1 \
+           AND jobs.project_id = (SELECT project_id FROM workers WHERE id = $1) \
            AND (SELECT count(*) FROM job_attempts a WHERE a.job_id = jobs.id) < max_attempts \
            AND ( \
                NOT EXISTS (SELECT 1 FROM job_output_requirements r WHERE r.job_id = jobs.id) \

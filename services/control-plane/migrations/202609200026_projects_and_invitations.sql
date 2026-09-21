@@ -74,6 +74,15 @@ ALTER TABLE worker_enrolments ADD COLUMN project_id uuid REFERENCES projects(id)
 ALTER TABLE workers ADD COLUMN project_id uuid REFERENCES projects(id);
 ALTER TABLE jobs ADD COLUMN project_id uuid REFERENCES projects(id);
 
+-- A registration request is created by an unauthenticated agent, so it cannot name a project and
+-- must not be able to. It is locked to the default project at creation, and approval and claim
+-- carry that value through to the worker rather than resolving one from whoever approved: an
+-- approver may belong to several projects, and the machine's project should not depend on which
+-- of them happened to click.
+--
+-- A multi-project flow needs a project-scoped pairing credential, not a guess made here.
+ALTER TABLE worker_registration_requests ADD COLUMN project_id uuid REFERENCES projects(id);
+
 -- --- Backfill -----------------------------------------------------------------------------------
 --
 -- One default project holds everything that exists. It is created unconditionally, including on
@@ -94,11 +103,13 @@ UPDATE compute_groups SET project_id = '00000000-0000-4000-8000-00000000d00f';
 UPDATE worker_enrolments SET project_id = '00000000-0000-4000-8000-00000000d00f';
 UPDATE workers SET project_id = '00000000-0000-4000-8000-00000000d00f';
 UPDATE jobs SET project_id = '00000000-0000-4000-8000-00000000d00f';
+UPDATE worker_registration_requests SET project_id = '00000000-0000-4000-8000-00000000d00f';
 
 ALTER TABLE compute_groups ALTER COLUMN project_id SET NOT NULL;
 ALTER TABLE worker_enrolments ALTER COLUMN project_id SET NOT NULL;
 ALTER TABLE workers ALTER COLUMN project_id SET NOT NULL;
 ALTER TABLE jobs ALTER COLUMN project_id SET NOT NULL;
+ALTER TABLE worker_registration_requests ALTER COLUMN project_id SET NOT NULL;
 
 -- The predicates that used to filter by owner now filter by project, so these are the shapes
 -- that matter. The old owner indexes stay: owner_identity_id is still read, as attribution.
