@@ -281,3 +281,34 @@ select { color: var(--text); background: #151f2c; border-color: var(--line-brigh
   .signal-orbit { animation: none; }
   button, .worker { transition: none; }
 }
+
+/* People: invitations and owners. Shares the registration row's shape, because revoking a
+   person's access and rejecting a worker are the same kind of decision to the eye. */
+.people-note {
+  margin: 0 0 1rem;
+  max-width: 60ch;
+  color: var(--muted, #6b7280);
+}
+
+.people-list {
+  margin-top: 1.25rem;
+}
+
+.people-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--border, #e5e7eb);
+}
+
+.people-row strong {
+  display: block;
+}
+
+.people-row p {
+  margin: 0.15rem 0 0;
+  color: var(--muted, #6b7280);
+  font-size: 0.9rem;
+}
