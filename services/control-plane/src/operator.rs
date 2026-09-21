@@ -1568,6 +1568,120 @@ pub(crate) struct CreateInvitationResponse {
     pub(crate) expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PendingInvitationResponse {
+    pub(crate) invitation_id: Uuid,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) created_by_identity_id: Uuid,
+}
+
+/// List the invitations that could still be claimed.
+///
+/// Deliberately never returns the credential, not even a fragment of one. It is shown once, when
+/// it is created, and after that the only honest answer to "what was the link?" is to issue
+/// another -- which is also what makes an unrecognised pending invitation something to revoke
+/// rather than something to look up.
+#[utoipa::path(
+    get,
+    path = "/api/v1/operator/project-invitations",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    responses(
+        (status = 200, description = "Unclaimed, unexpired invitations for the caller's project", body = [PendingInvitationResponse]),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn list_project_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PendingInvitationResponse>>, OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let rows = sqlx::query_as::<_, (Uuid, DateTime<Utc>, DateTime<Utc>, Uuid)>(
+        "SELECT id, created_at, expires_at, created_by_identity_id          FROM project_invitations          WHERE project_id = ANY($1) AND consumed_at IS NULL AND revoked_at IS NULL            AND expires_at > now()          ORDER BY created_at DESC",
+    )
+    .bind(&caller.project_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(invitation_id, created_at, expires_at, created_by_identity_id)| {
+                    PendingInvitationResponse {
+                        invitation_id,
+                        created_at,
+                        expires_at,
+                        created_by_identity_id,
+                    }
+                },
+            )
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ProjectMemberResponse {
+    pub(crate) identity_id: Uuid,
+    pub(crate) display_name: String,
+    pub(crate) email: Option<String>,
+    pub(crate) joined_at: DateTime<Utc>,
+    /// True for the caller's own membership, so the console can refuse to offer "remove me".
+    pub(crate) is_self: bool,
+}
+
+/// List who is in the caller's project.
+///
+/// Revoked memberships are left out. They are kept in the table so that "who could see this, and
+/// until when" stays answerable, but that is a question for the audit trail rather than for a
+/// list of people who can act right now.
+#[utoipa::path(
+    get,
+    path = "/api/v1/operator/project-members",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    responses(
+        (status = 200, description = "Active members of the caller's project", body = [ProjectMemberResponse]),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn list_project_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProjectMemberResponse>>, OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, DateTime<Utc>)>(
+        "SELECT i.id, i.display_name, i.email, m.created_at          FROM project_memberships m          JOIN human_identities i ON i.id = m.identity_id          WHERE m.project_id = ANY($1) AND m.revoked_at IS NULL          ORDER BY m.created_at",
+    )
+    .bind(&caller.project_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(identity_id, display_name, email, joined_at)| ProjectMemberResponse {
+                    identity_id,
+                    display_name,
+                    email,
+                    joined_at,
+                    is_self: identity_id == caller.identity_id,
+                },
+            )
+            .collect(),
+    ))
+}
+
 /// Issue an invitation to the caller's project.
 #[utoipa::path(
     post,

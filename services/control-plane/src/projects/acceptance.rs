@@ -235,6 +235,22 @@ fn worker_capabilities() -> Value {
     })
 }
 
+/// Strip the fields that describe the viewer rather than the resource.
+///
+/// `is_self` marks the caller's own membership so the console can refuse to offer "remove me". It
+/// is meant to differ between two people looking at the same list, so comparing it would make
+/// parity impossible to hold rather than proving it. Everything else must match exactly.
+fn without_viewer_fields(body: Value) -> Value {
+    match body {
+        Value::Array(items) => Value::Array(items.into_iter().map(without_viewer_fields).collect()),
+        Value::Object(mut fields) => {
+            fields.remove("is_self");
+            Value::Object(fields)
+        }
+        other => other,
+    }
+}
+
 async fn active_members(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM project_memberships WHERE project_id = $1 AND revoked_at IS NULL",
@@ -273,13 +289,19 @@ async fn co_owner_sees_exactly_what_the_founder_sees(pool: PgPool) {
     for path in [
         "/api/v1/operator/workers",
         "/api/v1/operator/jobs",
+        "/api/v1/operator/project-members",
+        "/api/v1/operator/project-invitations",
         &format!("/api/v1/operator/jobs/{job_id}/artifacts"),
     ] {
         let (founder_status, founder_body) = get(&founder_router, path, "founder-token").await;
         let (guest_status, guest_body) = get(&guest, path, "guest-token").await;
         assert_eq!(founder_status, StatusCode::OK, "founder {path}");
         assert_eq!(guest_status, StatusCode::OK, "guest {path}");
-        assert_eq!(founder_body, guest_body, "co-owner parity at {path}");
+        assert_eq!(
+            without_viewer_fields(founder_body),
+            without_viewer_fields(guest_body),
+            "co-owner parity at {path}"
+        );
     }
 
     // Parity of access, not only of reading: the access Daniel asked for was "the same as mine",
@@ -735,4 +757,62 @@ async fn the_backfill_claims_every_pre_existing_resource(pool: PgPool) {
         members, 1,
         "the founding owner must be in the default project"
     );
+}
+
+/// The pending-invitation list must never carry a credential, in any form.
+///
+/// A list endpoint is the natural place for one to leak back: the row holds a verifier, the
+/// handler selects from that row, and a careless `SELECT *` would put the Argon2id hash on the
+/// wire. This asserts against the whole serialised body rather than against named fields, so a
+/// field added later is covered without anyone remembering to come back here.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_invitation_list_never_carries_a_credential(pool: PgPool) {
+    let (founder_router, _founder_id) = found(&pool).await;
+    let credential = invite(&founder_router).await;
+
+    let (status, body) = get(
+        &founder_router,
+        "/api/v1/operator/project-invitations",
+        "founder-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(1),
+        "the pending invitation should be listed"
+    );
+
+    let serialised = serde_json::to_string(&body).unwrap();
+    assert!(
+        !serialised.contains(&credential),
+        "the list must not return the credential"
+    );
+    assert!(
+        !serialised.contains("kin_"),
+        "the list must not contain anything credential-shaped"
+    );
+    assert!(
+        !serialised.contains("$argon2"),
+        "the list must not return the stored verifier"
+    );
+
+    // Revoking it takes it off the list, which is what makes the list actionable.
+    let invitation_id = body[0]["invitation_id"].as_str().unwrap().to_owned();
+    let (status, _) = post(
+        &founder_router,
+        &format!("/api/v1/operator/project-invitations/{invitation_id}/revoke"),
+        "founder-token",
+        json!({}),
+    )
+    .await;
+    assert!(status.is_success(), "the founder may revoke an invitation");
+
+    let (_, body) = get(
+        &founder_router,
+        "/api/v1/operator/project-invitations",
+        "founder-token",
+    )
+    .await;
+    assert_eq!(body, json!([]), "a revoked invitation is no longer pending");
 }

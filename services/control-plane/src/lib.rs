@@ -91,6 +91,8 @@ pub(crate) struct AppState {
         auth_config,
         operator::create_worker_enrolment,
         operator::create_project_invitation,
+        operator::list_project_invitations,
+        operator::list_project_members,
         operator::claim_project_invitation,
         operator::revoke_project_invitation,
         operator::revoke_project_membership,
@@ -309,7 +311,11 @@ pub fn app_with_dependencies(
         )
         .route(
             "/api/v1/operator/project-invitations",
-            post(operator::create_project_invitation),
+            get(operator::list_project_invitations).post(operator::create_project_invitation),
+        )
+        .route(
+            "/api/v1/operator/project-members",
+            get(operator::list_project_members),
         )
         .route(
             "/api/v1/project-invitations/claim",
