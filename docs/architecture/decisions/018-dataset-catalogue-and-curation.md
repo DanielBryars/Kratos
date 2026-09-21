@@ -1,6 +1,6 @@
 # ADR-018 — Project datasets, curation and training inputs
 
-**Status:** Accepted for the first dataset slice  
+**Status:** Accepted for the first dataset slice
 **Date:** 2026-09-21
 
 ## Context

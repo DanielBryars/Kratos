@@ -204,7 +204,7 @@ primary use case. The same camera is used for both RGB and depth rendering.
 
                 <!-- Fixed jaw finger pad (gripping surface) - BRIGHT RED for debugging -->
                 <geom name="fixed_pad"
-                  type="box"                  
+                  type="box"
                   size="0.001 0.0065 0.015"
                   pos="-0.0085 0.0 -0.0894"
                   contype="3"
@@ -224,7 +224,7 @@ primary use case. The same camera is used for both RGB and depth rendering.
                 Use adjust_wrist_camera.py to find the right values interactively.
                 Camera looks along its -Z axis by default.
                 -->
-                
+
                 <!-- 1) Anchor -->
                 <body name="cam_anchor"
                       pos="0 0 -0.045"
