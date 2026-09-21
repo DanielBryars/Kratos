@@ -11,6 +11,13 @@ import {
 import { useEffect, useState } from "react";
 
 import {
+  buildInvitationLink,
+  describeExpiry,
+  readInvitationCredential,
+  scrubbedUrl,
+} from "./invitations";
+
+import {
   artifactRows,
   jobSnapshotState,
   jobSnapshotUnavailableMessage,
@@ -23,6 +30,9 @@ type Version = { name: string; version: string };
 type ExternalLinks = { grafana_url: string | null; mlflow_url: string | null };
 type AuthConfig = { apiKey: string; authDomain: string; projectId: string };
 type Enrolment = { enrolment_credential: string; expires_at: string };
+type Invitation = { invitation_id: string; invitation_credential: string; expires_at: string };
+type PendingInvitation = { invitation_id: string; created_at: string; expires_at: string };
+type Member = { identity_id: string; display_name: string; email: string | null; joined_at: string; is_self: boolean };
 type PendingRegistration = {
   registration_id: string;
   display_name: string;
@@ -158,6 +168,17 @@ export function App() {
   const [durableOutputMediaType, setDurableOutputMediaType] = useState("application/x-pytorch");
   const [durableOutputMaxMiB, setDurableOutputMaxMiB] = useState(1);
   const [jobAction, setJobAction] = useState(false);
+  // Held in component state and nowhere else. ADR-017 forbids putting the credential in local or
+  // session storage: it must not outlive the tab, and a claim that fails is meant to need the
+  // link again rather than be retried from something durable.
+  const [pendingClaim, setPendingClaim] = useState<string | null>(null);
+  const [claimState, setClaimState] = useState<"idle" | "claiming" | "claimed" | "failed" | "interrupted">("idle");
+  const [claimMessage, setClaimMessage] = useState<string | null>(null);
+  const [invitation, setInvitation] = useState<Invitation | null>(null);
+  const [invitationCopied, setInvitationCopied] = useState(false);
+  const [invitations, setInvitations] = useState<PendingInvitation[]>([]);
+  const [members, setMembers] = useState<Member[]>([]);
+  const [peopleActionId, setPeopleActionId] = useState<string | null>(null);
   const durableOutputValid = !durableOutputEnabled || (
     durableOutputPath.trim().length > 0
     && durableOutputRole.trim().length > 0
@@ -209,19 +230,25 @@ export function App() {
         if (stopped) return;
         const headers = { Authorization: `Bearer ${idToken}` };
         const request = { headers, signal: controller.signal };
-        const [pendingResponse, workersResponse, jobsResponse] = await Promise.all([
+        const [pendingResponse, workersResponse, jobsResponse, membersResponse, invitationsResponse] = await Promise.all([
           fetch("/api/v1/operator/worker-registration-requests", request),
           fetch("/api/v1/operator/workers", request),
           fetch("/api/v1/operator/jobs", request),
+          fetch("/api/v1/operator/project-members", request),
+          fetch("/api/v1/operator/project-invitations", request),
         ]);
-        const [nextPending, nextWorkers, nextJobs] = await Promise.all([
+        const [nextPending, nextWorkers, nextJobs, nextMembers, nextInvitations] = await Promise.all([
           pendingResponse.ok ? pendingResponse.json() as Promise<PendingRegistration[]> : null,
           workersResponse.ok ? workersResponse.json() as Promise<Worker[]> : null,
           jobsResponse.ok ? jobsResponse.json() as Promise<Job[]> : null,
+          membersResponse.ok ? membersResponse.json() as Promise<Member[]> : null,
+          invitationsResponse.ok ? invitationsResponse.json() as Promise<PendingInvitation[]> : null,
         ]);
         if (stopped) return;
         if (nextPending) setPending(nextPending);
         if (nextWorkers) setWorkers(nextWorkers);
+        if (nextMembers) setMembers(nextMembers);
+        if (nextInvitations) setInvitations(nextInvitations);
         if (nextJobs) {
           setJobs(nextJobs);
           setHasLoadedJobsSnapshot(true);
@@ -245,6 +272,64 @@ export function App() {
       if (nextRefresh !== null) window.clearTimeout(nextRefresh);
     };
   }, [user]);
+
+  // Read the invitation out of the address bar once, on load, and clean the address immediately.
+  //
+  // The scrub happens here rather than after the claim succeeds, because everything between the
+  // two is time spent with a live credential displayed on screen and sitting in the browser's
+  // history. `replaceState` rather than `pushState`, so the back button cannot return to it.
+  useEffect(() => {
+    const credential = readInvitationCredential(window.location);
+    if (!credential) return;
+    setPendingClaim(credential);
+    window.history.replaceState(null, "", scrubbedUrl(window.location.href));
+  }, []);
+
+  // Claim as soon as there is both an invitation and someone signed in to attach it to.
+  // Runs only from "idle". Every other state is a reason not to send the credential again: it is
+  // in flight, it has been accepted, it has been refused, or a retry is waiting on the person.
+  useEffect(() => {
+    if (claimState !== "idle" || !pendingClaim || !user) return;
+    let cancelled = false;
+    async function claim() {
+      setClaimState("claiming");
+      try {
+        const idToken = await user!.getIdToken();
+        const response = await fetch("/api/v1/project-invitations/claim", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${idToken}`, "content-type": "application/json" },
+          // The credential travels in the body of an HTTPS request and nowhere else.
+          body: JSON.stringify({ invitation_credential: pendingClaim }),
+        });
+        if (cancelled) return;
+        if (response.ok) {
+          setClaimState("claimed");
+          setClaimMessage(null);
+          setPendingClaim(null);
+        } else {
+          setClaimState("failed");
+          setClaimMessage(
+            response.status === 409
+              ? "That invitation has already been used. Ask for a new link."
+              : "That invitation could not be used. It may have expired or been revoked.",
+          );
+          setPendingClaim(null);
+        }
+      } catch {
+        if (cancelled) return;
+        // The request never arrived, so the invitation is still good. Keep it -- in memory only --
+        // and stop, rather than letting the effect run again: "interrupted" is not "idle", and
+        // only a deliberate retry returns it there. An automatic retry here would be a tight loop
+        // sending the credential as fast as the network refuses it.
+        setClaimState("interrupted");
+        setClaimMessage("The invitation could not be checked. Check your connection and try again.");
+      }
+    }
+    void claim();
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingClaim, user, claimState]);
 
   useEffect(() => {
     let cancelled = false;
@@ -283,6 +368,75 @@ export function App() {
       setMessage("Google sign-in did not complete. Check the provider setup and try again.");
     } finally {
       setAction("idle");
+    }
+  }
+
+  async function createInvitation() {
+    if (!user) return;
+    setAction("creating");
+    setMessage(null);
+    setInvitation(null);
+    setInvitationCopied(false);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/v1/operator/project-invitations", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      setInvitation((await response.json()) as Invitation);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The invitation could not be created.");
+    } finally {
+      setAction("idle");
+    }
+  }
+
+  async function copyInvitationLink() {
+    if (!invitation) return;
+    await navigator.clipboard.writeText(
+      buildInvitationLink(window.location.origin, invitation.invitation_credential),
+    );
+    setInvitationCopied(true);
+  }
+
+  /// Revoke either a pending invitation or an existing membership.
+  ///
+  /// The two share a function because they share a consequence -- someone who was going to have
+  /// access does not -- and because the console should not make removing a person feel like a
+  /// different class of action from cancelling a link.
+  async function revokePerson(kind: "invitation" | "member", id: string) {
+    if (!user) return;
+    setPeopleActionId(id);
+    setMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const path =
+        kind === "invitation"
+          ? `/api/v1/operator/project-invitations/${id}/revoke`
+          : `/api/v1/operator/project-members/${id}/revoke`;
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      if (kind === "invitation") {
+        setInvitations((current) => current.filter((item) => item.invitation_id !== id));
+        if (invitation?.invitation_id === id) setInvitation(null);
+      } else {
+        setMembers((current) => current.filter((item) => item.identity_id !== id));
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "That could not be revoked.");
+    } finally {
+      setPeopleActionId(null);
     }
   }
 
@@ -686,7 +840,100 @@ export function App() {
                 </div>
               )}
               </div>
+              <div className="registration-section">
+                <div><p className="label">People</p><h3>Share this Kratos</h3></div>
+                <p className="people-note">
+                  Anyone who opens the link and signs in becomes a co-owner: they can see every job
+                  and artefact, submit work, and revoke workers. Send it to one person at a time.
+                </p>
+                <div className="form-row">
+                  <button type="button" onClick={createInvitation} disabled={action !== "idle"}>
+                    {action === "creating" ? "Creating…" : "Create invitation link"}
+                  </button>
+                </div>
+                {invitation && (
+                  <div className="credential" aria-live="polite">
+                    <div>
+                      <p className="label">Shown once</p>
+                      <code>{buildInvitationLink(window.location.origin, invitation.invitation_credential)}</code>
+                    </div>
+                    <button type="button" onClick={copyInvitationLink}>{invitationCopied ? "Copied" : "Copy link"}</button>
+                    <p>
+                      Single use, and {describeExpiry(invitation.expires_at)}. It is not shown
+                      again — create another if it is lost.
+                    </p>
+                  </div>
+                )}
+                {invitations.length > 0 && (
+                  <div className="people-list">
+                    <p className="label">Unused invitations</p>
+                    {invitations.map((item) => (
+                      <div className="people-row" key={item.invitation_id}>
+                        <div>
+                          <strong>Invitation</strong>
+                          <p>Created {new Date(item.created_at).toLocaleString()} · {describeExpiry(item.expires_at)}</p>
+                        </div>
+                        <button
+                          className="button-secondary"
+                          type="button"
+                          disabled={peopleActionId !== null}
+                          onClick={() => void revokePerson("invitation", item.invitation_id)}
+                        >
+                          Revoke
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {members.length > 0 && (
+                  <div className="people-list">
+                    <p className="label">Owners</p>
+                    {members.map((member) => (
+                      <div className="people-row" key={member.identity_id}>
+                        <div>
+                          <strong>{member.display_name}{member.is_self ? " (you)" : ""}</strong>
+                          <p>{member.email ?? "No address recorded"} · joined {new Date(member.joined_at).toLocaleDateString()}</p>
+                        </div>
+                        {/* No "remove me": leaving is not the same action as removing someone
+                            else, and the last-owner rail would refuse it anyway. */}
+                        {!member.is_self && (
+                          <button
+                            className="button-secondary"
+                            type="button"
+                            disabled={peopleActionId !== null}
+                            onClick={() => void revokePerson("member", member.identity_id)}
+                          >
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </>
+          )}
+          {claimState === "claiming" && (
+            <p className="notice" role="status">Checking your invitation…</p>
+          )}
+          {claimState === "claimed" && (
+            <p className="notice" role="status">Invitation accepted. You are now an owner of this Kratos.</p>
+          )}
+          {claimState === "failed" && claimMessage && (
+            <p className="notice notice--error" role="alert">{claimMessage}</p>
+          )}
+          {claimState === "interrupted" && (
+            <p className="notice notice--error" role="alert">
+              {claimMessage}{" "}
+              <button type="button" onClick={() => { setClaimMessage(null); setClaimState("idle"); }}>
+                Try again
+              </button>
+            </p>
+          )}
+          {pendingClaim && !user && (
+            <p className="notice" role="status">
+              You have been invited to this Kratos. Sign in above to accept.
+            </p>
           )}
           {message && <p className="notice notice--error" role="alert">{message}</p>}
         </article>

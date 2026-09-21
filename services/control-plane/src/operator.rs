@@ -22,12 +22,15 @@ use crate::{
     },
     credentials::{self, CredentialKind},
     human_auth::{HumanIdentity, VerifyError},
+    projects::DEFAULT_PROJECT_ID,
     registry::{ErrorResponse, WorkerCapabilities, reconcile_expired_attempts},
 };
 
 const DEFAULT_EXPIRY_SECONDS: i64 = 900;
 const MIN_EXPIRY_SECONDS: i64 = 300;
 const MAX_EXPIRY_SECONDS: i64 = 3600;
+/// Bounded so a compromised console session cannot mint an unbounded supply of ways in.
+pub(crate) const MAX_PENDING_INVITATIONS: i64 = 10;
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -411,6 +414,38 @@ impl OperatorError {
         )
     }
 
+    const fn invitation_consumed() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "invitation_consumed",
+            "This invitation has already been claimed.",
+        )
+    }
+
+    const fn too_many_invitations() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "too_many_invitations",
+            "This project already has the maximum number of unclaimed invitations.",
+        )
+    }
+
+    const fn last_owner() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "A project cannot be left without an owner.",
+        )
+    }
+
+    const fn project_required() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "project_required",
+            "This account belongs to several projects; the request must name one.",
+        )
+    }
+
     const fn conflict() -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -516,7 +551,12 @@ pub(crate) async fn create_worker_enrolment(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let owner_identity_id = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let owner_identity_id = caller.identity_id;
+    // The enrolment carries the project forward to the worker that consumes it, which is
+    // the only place that path can learn it: the agent presenting the credential has no
+    // identity of its own to resolve one from.
+    let project_id = caller.sole_project()?;
     let credential =
         credentials::issue(CredentialKind::Enrolment).map_err(|_| OperatorError::internal())?;
     let expires_at = Utc::now()
@@ -524,11 +564,13 @@ pub(crate) async fn create_worker_enrolment(
         .ok_or_else(OperatorError::invalid_request)?;
 
     sqlx::query(
-        "INSERT INTO worker_enrolments (id, owner_identity_id, token_verifier, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO worker_enrolments \
+         (id, owner_identity_id, project_id, token_verifier, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(credential.id)
     .bind(owner_identity_id)
+    .bind(project_id)
     .bind(&credential.verifier)
     .bind(expires_at)
     .execute(&mut *transaction)
@@ -564,7 +606,7 @@ pub(crate) async fn create_worker_enrolment(
 async fn authenticate_operator(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<Uuid, OperatorError> {
+) -> Result<Caller, OperatorError> {
     let database = state
         .database
         .as_ref()
@@ -582,12 +624,12 @@ async fn authenticate_operator(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let operator_id = authorize_operator(&mut transaction, auth, &identity).await?;
+    let caller = authorize_operator(&mut transaction, auth, &identity).await?;
     transaction
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
-    Ok(operator_id)
+    Ok(caller)
 }
 
 #[utoipa::path(
@@ -641,7 +683,7 @@ async fn decide_registration(
     registration_id: Uuid,
     approve: bool,
 ) -> Result<Json<RegistrationDecisionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -670,7 +712,7 @@ async fn decide_registration(
                AND claimed_at IS NULL AND expires_at > now()",
         )
         .bind(registration_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .bind(challenge.as_slice())
         .execute(&mut *transaction)
         .await
@@ -683,7 +725,7 @@ async fn decide_registration(
                AND rejected_at IS NULL AND claimed_at IS NULL AND expires_at > now()",
         )
         .bind(registration_id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
         .execute(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -704,7 +746,7 @@ async fn decide_registration(
          VALUES ($1, 'human', $2, $3, 'worker_registration_request', $4, 'succeeded')",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(action)
     .bind(registration_id)
     .execute(&mut *transaction)
@@ -781,22 +823,27 @@ pub(crate) async fn list_workers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OperatorWorkerResponse>>, OperatorError> {
-    authenticate_operator(&state, &headers).await?;
+    // The result of authentication used to be discarded here, so every operator saw every
+    // worker in the deployment. Invisible while only one operator could exist.
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
     let workers = sqlx::query_as::<_, WorkerRecord>(
         "SELECT id, agent_instance_id, display_name, status, capabilities, last_seen_at, created_at \
-         FROM workers ORDER BY display_name, created_at",
+         FROM workers WHERE project_id = ANY($1) ORDER BY display_name, created_at",
     )
+    .bind(&caller.project_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
     let memberships = sqlx::query_as::<_, (Uuid, Uuid, String)>(
         "SELECT m.worker_id, g.id, g.name FROM compute_group_members m \
-         JOIN compute_groups g ON g.id = m.compute_group_id ORDER BY g.name",
+         JOIN compute_groups g ON g.id = m.compute_group_id \
+         WHERE g.project_id = ANY($1) ORDER BY g.name",
     )
+    .bind(&caller.project_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
@@ -834,7 +881,7 @@ async fn approve_and_group_worker(
     worker_id: Uuid,
     request: ApproveWorkerRequest,
 ) -> Result<Json<WorkerActionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -851,10 +898,15 @@ async fn approve_and_group_worker(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let worker = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT owner_identity_id, status FROM workers WHERE id = $1 FOR UPDATE",
+    // The owner used to be read here and never compared to anyone. Scoping the lookup itself
+    // means a worker outside the caller's projects is simply not found, which is the same
+    // answer as one that does not exist -- so this cannot be used to discover machines.
+    let worker = sqlx::query_as::<_, (Uuid, String, Uuid)>(
+        "SELECT owner_identity_id, status, project_id FROM workers \
+         WHERE id = $1 AND project_id = ANY($2) FOR UPDATE",
     )
     .bind(worker_id)
+    .bind(&caller.project_ids)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?
@@ -864,23 +916,33 @@ async fn approve_and_group_worker(
     }
     let approving = matches!(worker.1.as_str(), "unapproved" | "quarantined");
     let resulting_state = if approving {
-        sqlx::query("UPDATE workers SET status = 'idle', updated_at = now() WHERE id = $1")
-            .bind(worker_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| OperatorError::internal())?;
+        sqlx::query(
+            "UPDATE workers SET status = 'idle', updated_at = now() \
+             WHERE id = $1 AND project_id = ANY($2)",
+        )
+        .bind(worker_id)
+        .bind(&caller.project_ids)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
         "idle"
     } else {
         worker.1.as_str()
     };
     if let Some(group_name) = group_name {
         let group_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO compute_groups (id, owner_identity_id, name) VALUES ($1, $2, $3) \
+            // The group belongs to the worker's project, and its owner stays the worker's
+            // owner -- the same split as everywhere else. The conflict target is left on
+            // (owner_identity_id, name) because that is the uniqueness the schema still
+            // declares; making group names project-unique is a separate migration.
+            "INSERT INTO compute_groups (id, owner_identity_id, project_id, name) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (owner_identity_id, name) DO UPDATE SET name = EXCLUDED.name \
              RETURNING id",
         )
         .bind(Uuid::new_v4())
         .bind(worker.0)
+        .bind(worker.2)
         .bind(group_name)
         .fetch_one(&mut *transaction)
         .await
@@ -906,7 +968,7 @@ async fn approve_and_group_worker(
          VALUES ($1, 'human', $2, $3, 'worker', $4, 'succeeded', $5)",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(audit_action)
     .bind(worker_id)
     .bind(json!({ "compute_group_name": group_name }))
@@ -947,7 +1009,7 @@ async fn change_worker_state(
     worker_id: Uuid,
     target_state: &'static str,
 ) -> Result<Json<WorkerActionResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -956,12 +1018,16 @@ async fn change_worker_state(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Revoking or quarantining a worker took an id and no ownership predicate at all, so any
+    // operator could have stopped any machine mid-job. Harmless only while one operator
+    // could exist.
     let affected = sqlx::query(
         "UPDATE workers SET status = $2, updated_at = now() \
-         WHERE id = $1 AND status <> 'revoked'",
+         WHERE id = $1 AND project_id = ANY($3) AND status <> 'revoked'",
     )
     .bind(worker_id)
     .bind(target_state)
+    .bind(&caller.project_ids)
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?
@@ -998,7 +1064,7 @@ async fn change_worker_state(
          VALUES ($1, 'human', $2, $3, 'worker', $4, 'succeeded')",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(format!("worker.{target_state}"))
     .bind(worker_id)
     .execute(&mut *transaction)
@@ -1191,7 +1257,10 @@ pub(crate) async fn create_job(
     headers: HeaderMap,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<OperatorJobResponse>), OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
+    // Resolved before anything else, because a caller with no project cannot own a job and
+    // one with several has not said which they meant.
+    let project_id = caller.sole_project()?;
     let database = state
         .database
         .as_ref()
@@ -1212,12 +1281,16 @@ pub(crate) async fn create_job(
         .await
         .map_err(|_| OperatorError::internal())?;
     let query = format!(
-        "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING {JOB_COLUMNS}"
+        "INSERT INTO jobs \
+         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {JOB_COLUMNS}"
     );
+    // Both meanings are written, and they are not the same value: the identity records who
+    // queued this, the project decides who can see it afterwards.
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(id)
-        .bind(operator_id)
+        .bind(caller.identity_id)
+        .bind(project_id)
         .bind(name)
         .bind(&request.image_reference)
         .bind(request.timeout_seconds)
@@ -1247,7 +1320,7 @@ pub(crate) async fn create_job(
          VALUES ($1, 'human', $2, 'job.queued', 'job', $3, 'succeeded', $4)",
     )
     .bind(Uuid::new_v4())
-    .bind(operator_id)
+    .bind(caller.identity_id)
     .bind(id)
     .bind(json!({
         "image_reference": request.image_reference,
@@ -1285,7 +1358,7 @@ pub(crate) async fn list_jobs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OperatorJobResponse>>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -1293,11 +1366,15 @@ pub(crate) async fn list_jobs(
     reconcile_expired_attempts(database)
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Scoped by project, not by who created the row: a co-owner sees the project's jobs,
+    // including ones another member queued. `owner_identity_id` stays on the row as the record
+    // of who queued it.
     let query = format!(
-        "SELECT {JOB_COLUMNS} FROM jobs WHERE owner_identity_id = $1 ORDER BY submitted_at DESC LIMIT 100"
+        "SELECT {JOB_COLUMNS} FROM jobs \
+         WHERE project_id = ANY($1) ORDER BY submitted_at DESC LIMIT 100"
     );
     let records = sqlx::query_as::<_, JobRecord>(&query)
-        .bind(operator_id)
+        .bind(&caller.project_ids)
         .fetch_all(database)
         .await
         .map_err(|_| OperatorError::internal())?;
@@ -1341,20 +1418,22 @@ pub(crate) async fn list_job_artifacts(
     Path(job_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorArtifactListResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
-    let owns_job: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND owner_identity_id = $2)",
+    // Answers identically for a job in another project and a job that does not exist, so the
+    // probe cannot be used to discover what else is running.
+    let job_in_scope: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = $1 AND project_id = ANY($2))",
     )
     .bind(job_id)
-    .bind(operator_id)
+    .bind(&caller.project_ids)
     .fetch_one(database)
     .await
     .map_err(|_| OperatorError::internal())?;
-    if !owns_job {
+    if !job_in_scope {
         return Err(OperatorError::job_not_found());
     }
 
@@ -1381,7 +1460,7 @@ pub(crate) async fn cancel_job(
     Path(job_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<OperatorJobResponse>, OperatorError> {
-    let operator_id = authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
@@ -1400,13 +1479,16 @@ pub(crate) async fn cancel_job(
              cancel_requested_at = COALESCE(cancel_requested_at, now()), \
              finished_at = CASE WHEN status IN ('queued', 'cancelled') \
                                 THEN COALESCE(finished_at, now()) ELSE NULL END \
-         WHERE id = $1 AND owner_identity_id = $2 \
+         WHERE id = $1 AND project_id = ANY($2) \
            AND status IN ('queued', 'assigned', 'running', 'cancelling', 'cancelled') \
          RETURNING {JOB_COLUMNS}"
     );
+    // Authorisation is fused into the mutation predicate, so a job outside the caller's projects
+    // simply does not match and the handler answers exactly as it does for a job in the wrong
+    // state. That is deliberate: distinguishing them would say whether it exists.
     let record = sqlx::query_as::<_, JobRecord>(&query)
         .bind(job_id)
-        .bind(operator_id)
+        .bind(&caller.project_ids)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -1432,11 +1514,634 @@ pub(crate) async fn cancel_job(
     Ok(Json(record.into_response(outputs, visibility)))
 }
 
+/// Who is calling, and what they may act on -- deliberately two fields rather than one id.
+///
+/// Until projects existed these were the same UUID: the caller's identity was both the thing
+/// written into rows and the thing every query filtered on. That conflation is why handlers could
+/// record who acted while performing a mutation nobody had checked they were allowed to make, and
+/// why nothing flagged it.
+///
+/// Keeping them apart makes the mistake hard to write rather than merely discouraged. A query
+/// filtering on `identity_id` now reads wrongly, and a handler that touches neither field stands
+/// out instead of blending in.
+#[derive(Debug, Clone)]
+pub(crate) struct Caller {
+    /// Attribution: who did this. Written into rows and audit events, never filtered on.
+    pub(crate) identity_id: Uuid,
+    /// Authorisation: the projects this caller may act within. Empty authorises nothing.
+    pub(crate) project_ids: Vec<Uuid>,
+}
+
+impl Caller {
+    /// The project to place a new resource in.
+    ///
+    /// Fails closed while a caller belongs to more than one project: nothing in the request says
+    /// which was meant, and guessing would put a resource somewhere its creator cannot see. This
+    /// becomes a request field when a second project can exist.
+    pub(crate) fn sole_project(&self) -> Result<Uuid, OperatorError> {
+        match self.project_ids.as_slice() {
+            [only] => Ok(*only),
+            [] => Err(OperatorError::forbidden()),
+            _ => Err(OperatorError::project_required()),
+        }
+    }
+}
+
+// --- Project invitations -------------------------------------------------------------------------
+//
+// ADR-017. The credential is a near-copy of the worker enrolment secret: single use, expiring,
+// revocable, stored only as an Argon2id verifier, with a non-secret UUID inside the token so
+// lookup is an indexed read. The differences are what it grants and who may claim it.
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateInvitationRequest {
+    pub(crate) expires_in_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CreateInvitationResponse {
+    pub(crate) invitation_id: Uuid,
+    pub(crate) project_id: Uuid,
+    /// Returned exactly once. Losing it means issuing another.
+    pub(crate) invitation_credential: String,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PendingInvitationResponse {
+    pub(crate) invitation_id: Uuid,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) expires_at: DateTime<Utc>,
+    pub(crate) created_by_identity_id: Uuid,
+}
+
+/// List the invitations that could still be claimed.
+///
+/// Deliberately never returns the credential, not even a fragment of one. It is shown once, when
+/// it is created, and after that the only honest answer to "what was the link?" is to issue
+/// another -- which is also what makes an unrecognised pending invitation something to revoke
+/// rather than something to look up.
+#[utoipa::path(
+    get,
+    path = "/api/v1/operator/project-invitations",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    responses(
+        (status = 200, description = "Unclaimed, unexpired invitations for the caller's project", body = [PendingInvitationResponse]),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn list_project_invitations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PendingInvitationResponse>>, OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let rows = sqlx::query_as::<_, (Uuid, DateTime<Utc>, DateTime<Utc>, Uuid)>(
+        "SELECT id, created_at, expires_at, created_by_identity_id          FROM project_invitations          WHERE project_id = ANY($1) AND consumed_at IS NULL AND revoked_at IS NULL            AND expires_at > now()          ORDER BY created_at DESC",
+    )
+    .bind(&caller.project_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(invitation_id, created_at, expires_at, created_by_identity_id)| {
+                    PendingInvitationResponse {
+                        invitation_id,
+                        created_at,
+                        expires_at,
+                        created_by_identity_id,
+                    }
+                },
+            )
+            .collect(),
+    ))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ProjectMemberResponse {
+    pub(crate) identity_id: Uuid,
+    pub(crate) display_name: String,
+    pub(crate) email: Option<String>,
+    pub(crate) joined_at: DateTime<Utc>,
+    /// True for the caller's own membership, so the console can refuse to offer "remove me".
+    pub(crate) is_self: bool,
+}
+
+/// List who is in the caller's project.
+///
+/// Revoked memberships are left out. They are kept in the table so that "who could see this, and
+/// until when" stays answerable, but that is a question for the audit trail rather than for a
+/// list of people who can act right now.
+#[utoipa::path(
+    get,
+    path = "/api/v1/operator/project-members",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    responses(
+        (status = 200, description = "Active members of the caller's project", body = [ProjectMemberResponse]),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn list_project_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProjectMemberResponse>>, OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, DateTime<Utc>)>(
+        "SELECT i.id, i.display_name, i.email, m.created_at          FROM project_memberships m          JOIN human_identities i ON i.id = m.identity_id          WHERE m.project_id = ANY($1) AND m.revoked_at IS NULL          ORDER BY m.created_at",
+    )
+    .bind(&caller.project_ids)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(identity_id, display_name, email, joined_at)| ProjectMemberResponse {
+                    identity_id,
+                    display_name,
+                    email,
+                    joined_at,
+                    is_self: identity_id == caller.identity_id,
+                },
+            )
+            .collect(),
+    ))
+}
+
+/// Issue an invitation to the caller's project.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-invitations",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    request_body = CreateInvitationRequest,
+    responses(
+        (status = 201, description = "Single-use project invitation created", body = CreateInvitationResponse),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator, or belongs to no project", body = ErrorResponse),
+        (status = 409, description = "Too many unclaimed invitations, or the project is ambiguous", body = ErrorResponse),
+        (status = 422, description = "Invalid expiry", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn create_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateInvitationRequest>,
+) -> Result<(StatusCode, Json<CreateInvitationResponse>), OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let expiry_seconds = request.expires_in_seconds.unwrap_or(DEFAULT_EXPIRY_SECONDS);
+    if !(MIN_EXPIRY_SECONDS..=MAX_EXPIRY_SECONDS).contains(&expiry_seconds) {
+        return Err(OperatorError::invalid_request());
+    }
+
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let project_id = caller.sole_project()?;
+
+    // Bounded, so that a console session which has been taken over cannot mint an unlimited
+    // supply of ways in before anyone notices.
+    //
+    // The count and the insert are serialised on the project row, the same lock membership
+    // removal takes. Counting outside a lock is how a ceiling of ten becomes a ceiling of
+    // however many requests arrive together: each one reads nine, each one believes it is the
+    // tenth, and all of them commit. A bound that only holds when nobody is in a hurry is not a
+    // bound, and this one exists precisely for the case where someone is.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_invitations \
+         WHERE project_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL \
+           AND expires_at > now()",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    if pending >= MAX_PENDING_INVITATIONS {
+        return Err(OperatorError::too_many_invitations());
+    }
+
+    let credential =
+        credentials::issue(CredentialKind::Invitation).map_err(|_| OperatorError::internal())?;
+    let expires_at = Utc::now()
+        .checked_add_signed(TimeDelta::seconds(expiry_seconds))
+        .ok_or_else(OperatorError::invalid_request)?;
+
+    sqlx::query(
+        "INSERT INTO project_invitations \
+         (id, project_id, created_by_identity_id, token_verifier, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(credential.id)
+    .bind(project_id)
+    .bind(caller.identity_id)
+    .bind(&credential.verifier)
+    .bind(expires_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.created', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(credential.id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateInvitationResponse {
+            invitation_id: credential.id,
+            project_id,
+            invitation_credential: credential.plaintext.expose().to_owned(),
+            expires_at,
+        }),
+    ))
+}
+
+/// Stop an invitation being claimed. Distinct from removing someone already in the project.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-invitations/{invitation_id}/revoke",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("invitation_id" = Uuid, Path, description = "Invitation to revoke")),
+    responses(
+        (status = 204, description = "Invitation can no longer be claimed"),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 404, description = "No such claimable invitation in the caller's projects", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn revoke_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(invitation_id): Path<Uuid>,
+) -> Result<StatusCode, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+
+    let affected = sqlx::query(
+        "UPDATE project_invitations SET revoked_at = now(), revoked_by_identity_id = $2 \
+         WHERE id = $1 AND project_id = ANY($3) AND consumed_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(invitation_id)
+    .bind(caller.identity_id)
+    .bind(&caller.project_ids)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .rows_affected();
+    if affected == 0 {
+        // Already claimed, already revoked, or in another project: the same answer for all three,
+        // so this cannot be used to learn which.
+        return Err(OperatorError::not_found());
+    }
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.revoked', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(invitation_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove someone from a project, with the rail that a project cannot be left ownerless.
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/project-members/{member_identity_id}/revoke",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("member_identity_id" = Uuid, Path, description = "Member to remove from the project")),
+    responses(
+        (status = 204, description = "Membership revoked"),
+        (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
+        (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 404, description = "No such active membership", body = ErrorResponse),
+        (status = 409, description = "A project cannot be left without an owner", body = ErrorResponse),
+    )
+)]
+pub(crate) async fn revoke_project_membership(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(member_identity_id): Path<Uuid>,
+) -> Result<StatusCode, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
+    let project_id = caller.sole_project()?;
+
+    // The project row is the lock, taken before counting, so two owners removing each other at
+    // the same instant cannot both observe a second owner and both proceed. A count taken outside
+    // a lock would pass every test written against it and fail once, in production, leaving
+    // nobody able to administer the project.
+    //
+    // It is the project rather than the membership rows because PostgreSQL refuses FOR UPDATE
+    // alongside an aggregate: `SELECT count(*) ... FOR UPDATE` is not a lock, it is an error. One
+    // row per project also states the rule plainly -- one membership change at a time, here.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_memberships \
+         WHERE project_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    if remaining <= 1 {
+        return Err(OperatorError::last_owner());
+    }
+
+    let affected = sqlx::query(
+        "UPDATE project_memberships \
+         SET revoked_at = now(), revoked_by_identity_id = $3 \
+         WHERE project_id = $1 AND identity_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(project_id)
+    .bind(member_identity_id)
+    .bind(caller.identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .rows_affected();
+    if affected == 0 {
+        return Err(OperatorError::not_found());
+    }
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.membership.revoked', 'human_identity', $3, \
+         'succeeded', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(caller.identity_id)
+    .bind(member_identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimInvitationRequest {
+    /// The `kin_` credential from the invitation link. Sent in the body, never in a URL.
+    pub(crate) invitation_credential: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ClaimInvitationResponse {
+    pub(crate) project_id: Uuid,
+    pub(crate) identity_id: Uuid,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/project-invitations/claim",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    request_body = ClaimInvitationRequest,
+    responses(
+        (status = 200, description = "Invitation claimed; the signed-in identity is now a project member", body = ClaimInvitationResponse),
+        (status = 401, description = "Identity token or invitation invalid, revoked or expired", body = ErrorResponse),
+        (status = 409, description = "Invitation already claimed", body = ErrorResponse),
+    )
+)]
+/// Bind an invitation to whoever is signed in.
+///
+/// The one authenticated path that must work for a person with no identity row, so it cannot
+/// authorise the way every other operator handler does: there is nothing yet to authorise. The
+/// invitation is the authority, and the Identity Platform token only says who is claiming it.
+pub(crate) async fn claim_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimInvitationRequest>,
+) -> Result<Json<ClaimInvitationResponse>, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+
+    // Parsed before the database is touched, so a malformed credential costs nothing and a
+    // credential of the wrong kind is refused on its prefix rather than by hashing.
+    let invitation_id =
+        credentials::identifier(CredentialKind::Invitation, &request.invitation_credential)
+            .map_err(|_| OperatorError::unauthorized())?;
+
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    // Locked and re-checked inside the transaction. Reading first and acting afterwards is what
+    // would let two people claim one invitation.
+    let record = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Uuid,
+        ),
+    >(
+        "SELECT project_id, token_verifier, expires_at, consumed_at, revoked_at, \
+                created_by_identity_id \
+         FROM project_invitations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invitation_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::unauthorized)?;
+
+    let (project_id, verifier, expires_at, consumed_at, revoked_at, invited_by) = record;
+    if revoked_at.is_some() || expires_at <= Utc::now() {
+        return Err(OperatorError::unauthorized());
+    }
+    // Distinguished from an invalid credential on purpose: someone clicking a link twice should
+    // be told it is spent, not that it never existed.
+    if consumed_at.is_some() {
+        return Err(OperatorError::invitation_consumed());
+    }
+    if !credentials::verify(&request.invitation_credential, &verifier) {
+        return Err(OperatorError::unauthorized());
+    }
+
+    let identity_id = find_or_create_identity(&mut transaction, &identity).await?;
+
+    // Re-inviting someone previously removed restores them rather than failing on the primary
+    // key, and the row keeps its history: who invited them, and that they were once revoked.
+    sqlx::query(
+        "INSERT INTO project_memberships \
+         (project_id, identity_id, invited_by_identity_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (project_id, identity_id) DO UPDATE \
+         SET revoked_at = NULL, revoked_by_identity_id = NULL, \
+             invited_by_identity_id = EXCLUDED.invited_by_identity_id",
+    )
+    .bind(project_id)
+    .bind(identity_id)
+    .bind(invited_by)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "UPDATE project_invitations \
+         SET consumed_at = now(), consumed_by_identity_id = $2 WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .bind(identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.claimed', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(identity_id)
+    .bind(invitation_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    Ok(Json(ClaimInvitationResponse {
+        project_id,
+        identity_id,
+    }))
+}
+
+/// Find the identity behind a verified token, creating it the first time that subject appears.
+///
+/// Claiming an invitation is the one authenticated path that must work for someone with no
+/// identity row at all, and the subject may equally already exist -- someone re-invited after
+/// being removed keeps the row they always had. So this finds or creates rather than assuming
+/// either, under the same lock and transaction as the claim itself.
+async fn find_or_create_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    identity: &HumanIdentity,
+) -> Result<Uuid, OperatorError> {
+    let existing = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM human_identities          WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
+    )
+    .bind(&identity.subject)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities          (id, provider, provider_subject, display_name, email, role)          VALUES ($1, 'identity-platform', $2, $3, $4, 'operator')",
+    )
+    .bind(id)
+    .bind(&identity.subject)
+    .bind(truncate(&identity.display_name, 200))
+    .bind(&identity.email)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(id)
+}
+
 async fn authorize_operator(
     transaction: &mut Transaction<'_, Postgres>,
     auth: &crate::human_auth::HumanAuth,
     identity: &HumanIdentity,
-) -> Result<Uuid, OperatorError> {
+) -> Result<Caller, OperatorError> {
     let existing = sqlx::query_as::<_, IdentityRecord>(
         "SELECT id, role, disabled_at FROM human_identities \
          WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
@@ -1472,6 +2177,15 @@ async fn authorize_operator(
         .execute(&mut **transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+        // In the same transaction as the identity itself, so a first operator cannot be created
+        // into a state where it owns nothing: it would authenticate perfectly, see an empty
+        // console, and have no way to tell that from having no data.
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| OperatorError::internal())?;
         IdentityRecord {
             id,
             role: "operator".to_owned(),
@@ -1482,7 +2196,25 @@ async fn authorize_operator(
     if record.disabled_at.is_some() || record.role != "operator" {
         return Err(OperatorError::forbidden());
     }
-    Ok(record.id)
+
+    // Read once here rather than per query, so every handler in a request authorises against the
+    // same set and a revocation cannot take effect halfway through one.
+    let project_ids = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT project_id FROM project_memberships \
+         WHERE identity_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(record.id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .into_iter()
+    .map(|row| row.0)
+    .collect();
+
+    Ok(Caller {
+        identity_id: record.id,
+        project_ids,
+    })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, OperatorError> {
@@ -1502,6 +2234,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::projects::DEFAULT_PROJECT_ID;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -1536,6 +2269,22 @@ mod tests {
                 Err(VerifyError::Rejected)
             }
         }
+    }
+
+    /// Give an identity the project membership that bootstrap or an invitation claim would have
+    /// created for it.
+    ///
+    /// A fixture that inserts a `human_identities` row alone describes a state production never
+    /// reaches: an identity that authenticates perfectly and then authorises against an empty
+    /// project set. Before projects existed the identity row *was* the authority, so these
+    /// fixtures were complete; now they are half of one.
+    async fn join_default_project(pool: &PgPool, identity_id: Uuid) {
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(identity_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn healthy_worker_capabilities() -> Value {
@@ -1675,8 +2424,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO worker_registration_requests \
              (id, agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-              confirmation_code, expires_at) VALUES ($1, $2, 'Rented GPU', '1.0', $3, $4, \
-              'ABCD-2345', $5)",
+              confirmation_code, expires_at, project_id) VALUES ($1, $2, 'Rented GPU', '1.0', $3, $4, \
+              'ABCD-2345', $5, $6)",
         )
         .bind(registration_id)
         .bind(Uuid::new_v4())
@@ -1696,6 +2445,7 @@ mod tests {
         }))
         .bind([1_u8; 32].as_slice())
         .bind(Utc::now() + Duration::minutes(15))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -1768,11 +2518,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              capabilities, last_seen_at) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now())",
+              capabilities, last_seen_at, project_id) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now(), $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
@@ -1796,6 +2547,7 @@ mod tests {
             }],
             "gpu_health": { "status": "unverified", "detail": "pending" }
         }))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -1901,17 +2653,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
 
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              status, capabilities) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4)",
+              status, capabilities, project_id) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4, $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2045,17 +2799,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
 
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              status, capabilities) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4)",
+              status, capabilities, project_id) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4, $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2074,13 +2830,14 @@ mod tests {
         let attempt_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO jobs \
-             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id) \
-             VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4)",
+             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id, project_id) \
+             VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4, $5)",
         )
         .bind(job_id)
         .bind(operator_id)
         .bind(format!("example.test/work@sha256:{}", "b".repeat(64)))
         .bind(worker_id)
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2231,7 +2988,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn artifact_visibility_is_owner_scoped_and_excludes_storage_locations(pool: PgPool) {
+    async fn artifact_visibility_is_project_scoped_and_excludes_storage_locations(pool: PgPool) {
         let owner_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
         let auth = HumanAuth::new(
@@ -2265,16 +3022,38 @@ mod tests {
             .await
             .unwrap();
         }
+        // The hidden job is in a *different project*, which is what the last assertion now
+        // proves. A different owner used to be enough to hide it, but ADR-017 makes every member
+        // of a project a co-owner: a second person in this project is meant to see this job, so
+        // owner alone would no longer hide anything.
+        let other_project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, 'Someone else')")
+            .bind(other_project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        join_default_project(&pool, owner_id).await;
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(other_project_id)
+            .bind(other_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let job_id = Uuid::new_v4();
         let other_job_id = Uuid::new_v4();
-        for (id, owner) in [(job_id, owner_id), (other_job_id, other_id)] {
+        for (id, owner, project) in [
+            (job_id, owner_id, DEFAULT_PROJECT_ID),
+            (other_job_id, other_id, other_project_id),
+        ] {
             sqlx::query(
-                "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-                 VALUES ($1, $2, 'Artifact visibility', $3, 120)",
+                "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+                 VALUES ($1, $2, 'Artifact visibility', $3, 120, $4)",
             )
             .bind(id)
             .bind(owner)
             .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+            .bind(project)
             .execute(&pool)
             .await
             .unwrap();
@@ -2282,13 +3061,14 @@ mod tests {
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'Artifact worker', '1.1', 'busy', $4)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'Artifact worker', '1.1', 'busy', $4, $5)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2535,6 +3315,7 @@ mod tests {
             )
             .await
             .unwrap();
+        // Not 403: a job in another project is not one this caller may be told exists.
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
     }
 }

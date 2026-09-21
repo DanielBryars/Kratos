@@ -25,6 +25,7 @@ use crate::{
     AppState,
     artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions, delivery_window},
     credentials::{self, CredentialKind, IssuedCredential},
+    projects::DEFAULT_PROJECT_ID,
 };
 
 const HEARTBEAT_INTERVAL_SECONDS: u32 = 30;
@@ -305,6 +306,7 @@ struct RegistrationRecord {
     expires_at: DateTime<Utc>,
     approved_at: Option<DateTime<Utc>>,
     approved_by_identity_id: Option<Uuid>,
+    project_id: Uuid,
     rejected_at: Option<DateTime<Utc>>,
     claimed_at: Option<DateTime<Utc>>,
     worker_id: Option<Uuid>,
@@ -489,6 +491,7 @@ impl IntoResponse for ApiError {
 #[derive(FromRow)]
 struct EnrolmentRecord {
     owner_identity_id: Uuid,
+    project_id: Uuid,
     token_verifier: String,
     expires_at: DateTime<Utc>,
     consumed_at: Option<DateTime<Utc>>,
@@ -876,7 +879,7 @@ pub(crate) async fn enrol_worker(
     }
 
     let record = sqlx::query_as::<_, EnrolmentRecord>(
-        "SELECT owner_identity_id, token_verifier, expires_at, consumed_at, revoked_at \
+        "SELECT owner_identity_id, project_id, token_verifier, expires_at, consumed_at, revoked_at \
          FROM worker_enrolments WHERE id = $1",
     )
     .bind(credential_id)
@@ -911,7 +914,7 @@ pub(crate) async fn enrol_worker(
         .await
         .map_err(|error| database_error(&error, "begin enrolment"))?;
     let locked = sqlx::query_as::<_, EnrolmentRecord>(
-        "SELECT owner_identity_id, token_verifier, expires_at, consumed_at, revoked_at \
+        "SELECT owner_identity_id, project_id, token_verifier, expires_at, consumed_at, revoked_at \
          FROM worker_enrolments WHERE id = $1 FOR UPDATE",
     )
     .bind(credential_id)
@@ -930,11 +933,14 @@ pub(crate) async fn enrol_worker(
 
     sqlx::query(
         "INSERT INTO workers \
-         (id, owner_identity_id, agent_instance_id, display_name, protocol_version, capabilities) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+         (id, owner_identity_id, project_id, agent_instance_id, display_name, protocol_version, capabilities) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(worker_id)
     .bind(record.owner_identity_id)
+    // Taken from the locked row rather than the unlocked read above: they agree today, and
+    // a worker landing in the wrong project is not a failure anyone would notice quickly.
+    .bind(locked.project_id)
     .bind(request.agent_instance_id)
     .bind(request.display_name.trim())
     .bind(&request.protocol_version)
@@ -1116,9 +1122,13 @@ pub(crate) async fn request_registration(
     let capabilities =
         serde_json::to_value(&request.capabilities).map_err(|_| ApiError::internal())?;
     sqlx::query(
+        // The project is fixed here rather than taken from the request. This endpoint is
+        // unauthenticated -- an agent radios in before anyone has approved it -- so a
+        // project it could name would be a project it could choose.
         "INSERT INTO worker_registration_requests \
          (id, agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-          confirmation_code, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          confirmation_code, expires_at, project_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(registration_id)
     .bind(request.agent_instance_id)
@@ -1128,6 +1138,7 @@ pub(crate) async fn request_registration(
     .bind(public_key.as_slice())
     .bind(&code)
     .bind(expires_at)
+    .bind(DEFAULT_PROJECT_ID)
     .execute(pool)
     .await
     .map_err(|error| {
@@ -1238,7 +1249,7 @@ pub(crate) async fn claim_registration(
         .map_err(|error| database_error(&error, "begin registration claim"))?;
     let record = sqlx::query_as::<_, RegistrationRecord>(
         "SELECT agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-                claim_challenge, expires_at, approved_at, approved_by_identity_id, rejected_at, \
+                claim_challenge, expires_at, approved_at, approved_by_identity_id, project_id, rejected_at, \
                 claimed_at, worker_id FROM worker_registration_requests WHERE id = $1 FOR UPDATE",
     )
     .bind(registration_id)
@@ -1286,11 +1297,16 @@ pub(crate) async fn claim_registration(
         .ok_or_else(ApiError::internal)?;
     let worker_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO workers (id, owner_identity_id, agent_instance_id, display_name, \
-         protocol_version, capabilities, status) VALUES ($1, $2, $3, $4, $5, $6, 'idle')",
+        // The project comes from the registration request, locked when the machine radioed
+        // in, rather than from the approver: an approver may belong to several projects,
+        // and a machine's project should not depend on which of them happened to click.
+        "INSERT INTO workers (id, owner_identity_id, project_id, agent_instance_id, \
+         display_name, protocol_version, capabilities, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'idle')",
     )
     .bind(worker_id)
     .bind(owner_identity_id)
+    .bind(record.project_id)
     .bind(record.agent_instance_id)
     .bind(record.display_name)
     .bind(record.protocol_version)
@@ -1613,6 +1629,7 @@ async fn current_or_assign_job(
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
         "SELECT id, name, image_reference, timeout_seconds FROM jobs \
          WHERE status = 'queued' AND gpu_count = 1 \
+           AND jobs.project_id = (SELECT project_id FROM workers WHERE id = $1) \
            AND (SELECT count(*) FROM job_attempts a WHERE a.job_id = jobs.id) < max_attempts \
            AND ( \
                NOT EXISTS (SELECT 1 FROM job_output_requirements r WHERE r.job_id = jobs.id) \
@@ -2205,6 +2222,7 @@ pub(crate) async fn report_job_result(
 
 #[cfg(test)]
 mod tests {
+    use crate::projects::DEFAULT_PROJECT_ID;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header::AUTHORIZATION},
@@ -2411,13 +2429,14 @@ mod tests {
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.0', $4, '{}'::jsonb)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', $4, '{}'::jsonb, $5)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
         .bind(status)
+        .bind(DEFAULT_PROJECT_ID)
         .execute(pool)
         .await
         .unwrap();
@@ -2427,12 +2446,13 @@ mod tests {
     async fn insert_job(pool: &PgPool, owner_id: Uuid) -> Uuid {
         let job_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-             VALUES ($1, $2, 'Matrix check', $3, 120)",
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+             VALUES ($1, $2, 'Matrix check', $3, 120, $4)",
         )
         .bind(job_id)
         .bind(owner_id)
         .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(pool)
         .await
         .unwrap();
@@ -3249,22 +3269,24 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb, $4)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-             VALUES ($1, $2, 'Training', $3, 120)",
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+             VALUES ($1, $2, 'Training', $3, 120, $4)",
         )
         .bind(job_id)
         .bind(owner_id)
         .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();

@@ -14,6 +14,9 @@ const SECRET_BYTES: usize = 32;
 pub enum CredentialKind {
     Enrolment,
     Worker,
+    /// Invites a person into a project. Distinct from the others so that presenting one
+    /// where another is expected is rejected on its prefix, before any hashing.
+    Invitation,
 }
 
 impl CredentialKind {
@@ -21,6 +24,7 @@ impl CredentialKind {
         match self {
             Self::Enrolment => "ken",
             Self::Worker => "kwc",
+            Self::Invitation => "kin",
         }
     }
 }

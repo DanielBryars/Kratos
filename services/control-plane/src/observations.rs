@@ -300,6 +300,7 @@ mod tests {
     use tower::ServiceExt;
     use uuid::Uuid;
 
+    use crate::projects::DEFAULT_PROJECT_ID;
     use crate::{
         app,
         credentials::{self, CredentialKind},
@@ -355,12 +356,13 @@ mod tests {
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.2', 'busy', '{}'::jsonb)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.2', 'busy', '{}'::jsonb, $4)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -377,13 +379,14 @@ mod tests {
         let job_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO jobs \
-             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id) \
-             VALUES ($1, $2, 'Observed job', $3, 120, 'assigned', $4)",
+             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id, project_id) \
+             VALUES ($1, $2, 'Observed job', $3, 120, 'assigned', $4, $5)",
         )
         .bind(job_id)
         .bind(owner_id)
         .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
         .bind(worker_id)
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
