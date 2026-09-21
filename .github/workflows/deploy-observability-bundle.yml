@@ -1,0 +1,87 @@
+name: Deploy observability bundle
+
+# The stack's configuration -- dashboards, datasources, collector and backend config -- reaches the
+# instance as a tarball in a GCS bucket. A systemd timer on the instance re-reads it whenever the
+# object's generation changes, so uploading a new bundle is the whole deployment: no reboot, no
+# second apply, no SSH.
+#
+# Until this workflow existed that upload was a command in a README, which meant the deployed
+# dashboards were whatever the last person had run locally.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "observability/**"
+      - ".github/workflows/deploy-observability-bundle.yml"
+
+concurrency:
+  group: deploy-observability-bundle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bundle:
+    # Skipped rather than failed where the observability stack was never enabled, so a fork or a
+    # deployment without it does not see a permanently red workflow.
+    if: >-
+      ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' &&
+          vars.GCP_DEPLOYMENT_SERVICE_ACCOUNT != '' &&
+          vars.GCP_DEVELOPMENT_PROJECT_ID != '' &&
+          vars.GCP_OBSERVABILITY_CONFIG_BUCKET != '' }}
+    runs-on: ubuntu-latest
+    environment: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same validation the CI job runs. A bundle is not worth uploading if it would not have
+      # passed review, and this workflow runs after merge where nothing else would catch it.
+      - name: Validate the configuration
+        run: sh observability/validate.sh
+
+      # Every dashboard must parse before any of them is deployed. Grafana skips a malformed file
+      # and carries on, so a broken dashboard would otherwise reach the instance and simply be
+      # missing from the list with no error anyone sees.
+      - name: Check every dashboard parses
+        run: |
+          for file in observability/config/grafana/provisioning/dashboards/*.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$file" \
+              || { echo "::error file=$file::dashboard is not valid JSON"; exit 1; }
+          done
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYMENT_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # The exclusion matters: observability/.env is a local development file holding the Grafana
+      # password. The instance writes its own from Secret Manager after extracting the bundle, and
+      # a stray local .env in the tarball would overwrite it.
+      - name: Build the bundle
+        run: tar --exclude='observability/.env' -czf observability.tar.gz observability
+
+      - name: Upload the bundle
+        run: |
+          gcloud storage cp observability.tar.gz \
+            "gs://${{ vars.GCP_OBSERVABILITY_CONFIG_BUCKET }}/bundles/observability-current.tar.gz" \
+            --project="${{ vars.GCP_DEVELOPMENT_PROJECT_ID }}"
+
+      # The instance polls for a changed generation rather than being pushed to, so the deployment
+      # is not finished when this step is. Printing the generation gives whoever is watching
+      # something to compare against the instance.
+      - name: Report the deployed generation
+        run: |
+          gcloud storage objects describe \
+            "gs://${{ vars.GCP_OBSERVABILITY_CONFIG_BUCKET }}/bundles/observability-current.tar.gz" \
+            --project="${{ vars.GCP_DEVELOPMENT_PROJECT_ID }}" \
+            --format="value(generation)" \
+            | sed 's/^/uploaded generation: /'
+          echo "The instance reconciles within five minutes; no reboot or apply is needed."

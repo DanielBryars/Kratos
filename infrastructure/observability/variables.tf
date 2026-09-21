@@ -108,6 +108,16 @@ variable "config_bundle_object" {
   default     = "bundles/observability-current.tar.gz"
 }
 
+variable "deployment_service_account" {
+  description = <<-EOT
+    Email of the CI deployment service account that uploads the configuration bundle, granted
+    write access to the configuration bucket. Empty means no automated deployment: the bundle is
+    uploaded by hand as infrastructure/README.md describes, and no binding is created.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "mlflow_database_instance" {
   description = <<-EOT
     Name of the existing Cloud SQL instance that holds MLflow metadata, so it is covered by the
