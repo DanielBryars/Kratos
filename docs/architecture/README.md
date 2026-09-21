@@ -2,6 +2,8 @@
 
 Status distinguishes a selected direction from a recommendation still under discussion. An accepted decision does not mean it has been implemented or deployed.
 
+The editable [system diagram](kratos-system.drawio) contains the cloud context and the worker execution, observation and durable-model flow.
+
 | Decision | Status | Record |
 |---|---|---|
 | GCP control plane; remote GPU workers | Accepted | [ADR-001](decisions/001-gcp-control-plane.md) |
