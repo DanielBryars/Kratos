@@ -871,10 +871,15 @@ async fn approve_and_group_worker(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
-    let worker = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT owner_identity_id, status FROM workers WHERE id = $1 FOR UPDATE",
+    // The owner used to be read here and never compared to anyone. Scoping the lookup itself
+    // means a worker outside the caller's projects is simply not found, which is the same
+    // answer as one that does not exist -- so this cannot be used to discover machines.
+    let worker = sqlx::query_as::<_, (Uuid, String, Uuid)>(
+        "SELECT owner_identity_id, status, project_id FROM workers \
+         WHERE id = $1 AND project_id = ANY($2) FOR UPDATE",
     )
     .bind(worker_id)
+    .bind(&caller.project_ids)
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?
@@ -884,8 +889,12 @@ async fn approve_and_group_worker(
     }
     let approving = matches!(worker.1.as_str(), "unapproved" | "quarantined");
     let resulting_state = if approving {
-        sqlx::query("UPDATE workers SET status = 'idle', updated_at = now() WHERE id = $1")
-            .bind(worker_id)
+        sqlx::query(
+            "UPDATE workers SET status = 'idle', updated_at = now() \
+             WHERE id = $1 AND project_id = ANY($2)",
+        )
+        .bind(worker_id)
+        .bind(&caller.project_ids)
             .execute(&mut *transaction)
             .await
             .map_err(|_| OperatorError::internal())?;
@@ -895,12 +904,18 @@ async fn approve_and_group_worker(
     };
     if let Some(group_name) = group_name {
         let group_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO compute_groups (id, owner_identity_id, name) VALUES ($1, $2, $3) \
+            // The group belongs to the worker's project, and its owner stays the worker's
+            // owner -- the same split as everywhere else. The conflict target is left on
+            // (owner_identity_id, name) because that is the uniqueness the schema still
+            // declares; making group names project-unique is a separate migration.
+            "INSERT INTO compute_groups (id, owner_identity_id, project_id, name) \
+             VALUES ($1, $2, $3, $4) \
              ON CONFLICT (owner_identity_id, name) DO UPDATE SET name = EXCLUDED.name \
              RETURNING id",
         )
         .bind(Uuid::new_v4())
         .bind(worker.0)
+        .bind(worker.2)
         .bind(group_name)
         .fetch_one(&mut *transaction)
         .await
@@ -976,12 +991,16 @@ async fn change_worker_state(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Revoking or quarantining a worker took an id and no ownership predicate at all, so any
+    // operator could have stopped any machine mid-job. Harmless only while one operator
+    // could exist.
     let affected = sqlx::query(
         "UPDATE workers SET status = $2, updated_at = now() \
-         WHERE id = $1 AND status <> 'revoked'",
+         WHERE id = $1 AND project_id = ANY($3) AND status <> 'revoked'",
     )
     .bind(worker_id)
     .bind(target_state)
+    .bind(&caller.project_ids)
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?
