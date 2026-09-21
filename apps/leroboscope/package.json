@@ -1,0 +1,27 @@
+{
+  "name": "@kratos/leroboscope",
+  "version": "1.0.0",
+  "description": "Kratos LeRobot dataset review and curation viewer",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/three": "^0.183.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "coi-serviceworker": "^0.1.7",
+    "hyparquet": "^1.25.0",
+    "hyparquet-compressors": "^1.1.1",
+    "mujoco-js": "^0.0.7",
+    "three": "^0.183.1"
+  }
+}

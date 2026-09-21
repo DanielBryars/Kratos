@@ -60,6 +60,8 @@ jobs:
       - run: pnpm web:test
       - run: pnpm web:typecheck
       - run: pnpm web:build
+      - run: pnpm leroboscope:typecheck
+      - run: pnpm leroboscope:build
 
   agent:
     runs-on: ubuntu-latest
