@@ -260,6 +260,7 @@ class DockerExecutor:
         on_tick: Callable[[], bool] | None = None,
         tick_seconds: float = 30,
         observe: "LogObserver | None" = None,
+        on_observations_closed: Callable[[], None] | None = None,
     ) -> JobExecutionResult:
         """Supervise the attempt's container until it exits or its authority ends.
 
@@ -286,14 +287,17 @@ class DockerExecutor:
         try:
             container = self._client.containers.get(container_name)
             if container.status == "created":
+                _notify_observations_closed(on_observations_closed)
                 return _failure(125, "job container was created but never started")
             observed_start = _state_time(container, "StartedAt")
             started_at = observed_start or self._clock()
             resumed = True
         except docker.errors.NotFound:
             if self._clock() >= assignment.lease_expires_at:
+                _notify_observations_closed(on_observations_closed)
                 return _failure(124, "assignment lease expired before execution", timed_out=True)
             if not may_start:
+                _notify_observations_closed(on_observations_closed)
                 return _failure(
                     125,
                     "attempt was already started on this worker but its container is missing; "
@@ -335,6 +339,7 @@ class DockerExecutor:
                     },
                 )
             except docker.errors.APIError as error:
+                _notify_observations_closed(on_observations_closed)
                 return _failure(125, f"job container could not be started: {error}")
             started_at = self._clock()
             # Read back rather than assumed: the runtime's own clock is the evidence.
@@ -342,7 +347,12 @@ class DockerExecutor:
             observed_start = _state_time(container, "StartedAt")
             resumed = False
 
-        log_reader = self._start_log_reader(container, observe, resumed=resumed)
+        log_reader = self._start_log_reader(
+            container,
+            observe,
+            resumed=resumed,
+            on_closed=on_observations_closed,
+        )
 
         runtime_deadline = started_at + timedelta(seconds=assignment.timeout_seconds)
         deadline = min(runtime_deadline, assignment.lease_expires_at)
@@ -524,6 +534,7 @@ class DockerExecutor:
         observe: "LogObserver | None",
         *,
         resumed: bool,
+        on_closed: Callable[[], None] | None = None,
     ) -> _LogReader | None:
         """Follow the container's output on its own thread, or decline to.
 
@@ -534,21 +545,28 @@ class DockerExecutor:
         telemetry for a resumed attempt is the lesser fault, and it is counted rather than silent.
         """
         if observe is None:
+            _notify_observations_closed(on_closed)
             return None
         if resumed:
             observe(Stream.STDERR, self._clock(), _RESUMED_NOTICE)
+            _notify_observations_closed(on_closed)
             return None
         reader = _LogReader(observe, self._clock)
         thread = threading.Thread(
             target=self._follow_logs,
-            args=(container, reader.observe),
+            args=(container, reader.observe, on_closed),
             name="kratos-log-reader",
             daemon=True,
         )
         thread.start()
         return reader
 
-    def _follow_logs(self, container: Any, observe: "LogObserver") -> None:
+    def _follow_logs(
+        self,
+        container: Any,
+        observe: "LogObserver",
+        on_closed: Callable[[], None] | None = None,
+    ) -> None:
         """Read until Docker closes the exited container's finite log stream. Never raises."""
         assemblers = {
             Stream.STDOUT: LineAssembler(LOG_LINE_BOUND_BYTES),
@@ -577,6 +595,7 @@ class DockerExecutor:
                 for which, assembler in assemblers.items():
                     for line in assembler.flush():
                         emit(which, line)
+            _notify_observations_closed(on_closed)
 
     def _kill(self, container: Any, logical_name: str) -> None:
         """Stop a container whose authority has ended, or refuse to report a result."""
@@ -635,6 +654,12 @@ class DockerExecutor:
 
 def _container_name(attempt_id: UUID) -> str:
     return f"kratos-job-{attempt_id}"
+
+
+def _notify_observations_closed(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        with contextlib.suppress(Exception):
+            callback()
 
 
 def _failure(exit_code: int, message: str, *, timed_out: bool = False) -> JobExecutionResult:

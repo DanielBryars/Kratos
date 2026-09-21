@@ -242,11 +242,14 @@ class FakeJobExecutor(DockerExecutor):
         on_tick: Callable[[], bool] | None = None,
         tick_seconds: float = 30,
         observe: LogObserver | None = None,
+        on_observations_closed: Callable[[], None] | None = None,
     ) -> JobExecutionResult:
         self.runs.append((assignment.attempt_id, may_start))
         self.tick_seconds = tick_seconds
         if on_tick is not None:
             self.authorised = [on_tick() for _ in range(self.ticks)]
+        if on_observations_closed is not None:
+            on_observations_closed()
         return JobExecutionResult(
             exit_code=0, timed_out=False, stdout="done\n", stderr="", failure_message=None
         )
@@ -400,12 +403,17 @@ def test_result_lost_to_a_network_outage_is_replayed_without_a_second_start(
             on_tick: Callable[[], bool] | None = None,
             tick_seconds: float = 30,
             observe: LogObserver | None = None,
+            on_observations_closed: Callable[[], None] | None = None,
         ) -> JobExecutionResult:
             nonlocal link_up
             if may_start:
                 link_up = False
             return super().run_job(
-                assignment, may_start=may_start, on_tick=on_tick, tick_seconds=tick_seconds
+                assignment,
+                may_start=may_start,
+                on_tick=on_tick,
+                tick_seconds=tick_seconds,
+                on_observations_closed=on_observations_closed,
             )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -635,9 +643,14 @@ def test_recorded_attempt_is_supervised_before_any_heartbeat(tmp_path: Path) -> 
             on_tick: Callable[[], bool] | None = None,
             tick_seconds: float = 30,
             observe: LogObserver | None = None,
+            on_observations_closed: Callable[[], None] | None = None,
         ) -> JobExecutionResult:
             events.append(f"supervise may_start={may_start}")
-            return super().run_job(assignment, may_start=may_start)
+            return super().run_job(
+                assignment,
+                may_start=may_start,
+                on_observations_closed=on_observations_closed,
+            )
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/heartbeat"):

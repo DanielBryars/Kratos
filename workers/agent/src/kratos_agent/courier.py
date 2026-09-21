@@ -65,6 +65,7 @@ class ObservationCourier:
         self._sleep = sleep
         self._poll = poll_seconds
         self._adopted: dict[Path, ObservationSpool] = {}
+        self._active_writers: set[Path] = set()
         self._idle_since: dict[Path, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -83,6 +84,12 @@ class ObservationCourier:
         """
         with self._lock:
             self._adopted[path] = spool
+            self._active_writers.add(path)
+
+    def release(self, path: Path) -> None:
+        """Declare that no log reader can append to this spool again."""
+        with self._lock:
+            self._active_writers.discard(path)
 
     def discover(self) -> list[Path]:
         """Find spools left behind by an earlier process."""
@@ -161,7 +168,9 @@ class ObservationCourier:
         final line, and deleting the directory underneath it would lose that line and log an error
         for something that is not wrong.
         """
-        if spool.pending(CONTROL_PLANE_SINK):
+        with self._lock:
+            active = path in self._active_writers
+        if active or spool.pending(CONTROL_PLANE_SINK):
             self._idle_since.pop(path, None)
             return
         first_idle = self._idle_since.setdefault(path, self._clock())
@@ -178,6 +187,7 @@ class ObservationCourier:
             return
         with self._lock:
             self._adopted.pop(path, None)
+            self._active_writers.discard(path)
         self._idle_since.pop(path, None)
 
     # --- The thread ----------------------------------------------------------------------------

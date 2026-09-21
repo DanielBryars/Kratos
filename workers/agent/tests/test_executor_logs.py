@@ -193,20 +193,27 @@ def test_output_buffered_until_container_exit_is_drained_after_result() -> None:
     )
     seen: list[tuple[Stream, datetime, str]] = []
     delivered = threading.Event()
+    observations_closed = threading.Event()
 
     def observe(stream: Stream, at: datetime, text: str) -> None:
         seen.append((stream, at, text))
         delivered.set()
 
-    result = executor.run_job(assignment(), tick_seconds=1, observe=observe)
+    result = executor.run_job(
+        assignment(),
+        tick_seconds=1,
+        observe=observe,
+        on_observations_closed=observations_closed.set,
+    )
 
     assert result.exit_code == 0
     assert delivered.is_set()
     assert [(stream, text) for stream, _, text in seen] == [(Stream.STDOUT, "buffered until exit")]
+    assert not observations_closed.is_set()
     release.set()
     # The delayed stream gets a chance to produce the same line, but sealing prevents a duplicate.
     assert container.exited.wait(timeout=1)
-    threading.Event().wait(0.01)
+    assert observations_closed.wait(timeout=1)
     assert [(stream, text) for stream, _, text in seen] == [(Stream.STDOUT, "buffered until exit")]
 
 
