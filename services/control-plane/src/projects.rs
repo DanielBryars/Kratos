@@ -22,3 +22,6 @@ use uuid::Uuid;
 /// caller forgot to say, which is the exact failure the NOT NULL is there to catch: the point of
 /// the constraint is that a path with no project is a bug, not a row quietly filed here.
 pub const DEFAULT_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_d00f);
+
+#[cfg(test)]
+mod acceptance;

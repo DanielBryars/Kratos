@@ -1643,7 +1643,10 @@ pub(crate) async fn create_project_invitation(
     .map_err(|_| OperatorError::internal())?;
 
     sqlx::query(
-        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.invitation.created', 'project_invitation', $3, 'succeeded', '{{}}'::jsonb)",
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.created', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
     )
     .bind(Uuid::new_v4())
     .bind(caller.identity_id)
@@ -1717,7 +1720,10 @@ pub(crate) async fn revoke_project_invitation(
     }
 
     sqlx::query(
-        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.invitation.revoked', 'project_invitation', $3, 'succeeded', '{{}}'::jsonb)",
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.revoked', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
     )
     .bind(Uuid::new_v4())
     .bind(caller.identity_id)
@@ -1766,13 +1772,23 @@ pub(crate) async fn revoke_project_membership(
     let caller = authorize_operator(&mut transaction, &auth, &identity).await?;
     let project_id = caller.sole_project()?;
 
-    // Locked before counting, so two owners removing each other at the same instant cannot both
-    // observe a second owner and both proceed. A count taken outside this lock would pass every
-    // test written against it and fail once, in production, leaving nobody able to administer
-    // the project.
+    // The project row is the lock, taken before counting, so two owners removing each other at
+    // the same instant cannot both observe a second owner and both proceed. A count taken outside
+    // a lock would pass every test written against it and fail once, in production, leaving
+    // nobody able to administer the project.
+    //
+    // It is the project rather than the membership rows because PostgreSQL refuses FOR UPDATE
+    // alongside an aggregate: `SELECT count(*) ... FOR UPDATE` is not a lock, it is an error. One
+    // row per project also states the rule plainly -- one membership change at a time, here.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
     let remaining: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM project_memberships \
-         WHERE project_id = $1 AND revoked_at IS NULL FOR UPDATE",
+         WHERE project_id = $1 AND revoked_at IS NULL",
     )
     .bind(project_id)
     .fetch_one(&mut *transaction)
@@ -1799,7 +1815,10 @@ pub(crate) async fn revoke_project_membership(
     }
 
     sqlx::query(
-        "INSERT INTO audit_events          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail)          VALUES ($1, 'human', $2, 'project.membership.revoked', 'human_identity', $3, 'succeeded', '{{}}'::jsonb)",
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.membership.revoked', 'human_identity', $3, \
+         'succeeded', '{}'::jsonb)",
     )
     .bind(Uuid::new_v4())
     .bind(caller.identity_id)
