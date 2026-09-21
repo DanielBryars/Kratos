@@ -62,6 +62,12 @@ services:
       GF_AUTH_SIGNOUT_REDIRECT_URL: https://${KRATOS_GRAFANA_HOST:?the public Grafana host must be named}/?gcp-iap-mode=CLEAR_LOGIN_COOKIE
       # Identity-Aware Proxy has already authenticated the request at the load balancer.
       GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-Goog-Authenticated-User-Email
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
     volumes:
       - ${KRATOS_DATA_ROOT:?the cloud overlay needs KRATOS_DATA_ROOT}/grafana:/var/lib/grafana
     ports:
