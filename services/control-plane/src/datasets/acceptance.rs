@@ -830,3 +830,142 @@ async fn replacing_a_datasets_contents_creates_a_second_version(pool: PgPool) {
         "the ready version must be left exactly as it was"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit trail
+// ---------------------------------------------------------------------------------------------
+
+/// Every dataset action that changes something leaves a trail entry, in the same transaction.
+///
+/// Same transaction rather than after it, so the trail cannot disagree with the catalogue: an
+/// event without the change it describes is worse than no event, because it gets read as proof.
+///
+/// The detail is checked for what it must *not* contain as well. A storage object key or a
+/// resumable-session URI in the audit table would turn a record of what happened into a way of
+/// reaching the bytes, which is the one thing the guardrails single out.
+#[sqlx::test(migrations = "./migrations")]
+async fn every_dataset_action_is_audited_without_leaking_storage_locations(pool: PgPool) {
+    let (founder, founder_id) = found(&pool, storage_agreeing()).await;
+    let (dataset_id, version_id, file_id) =
+        declare_upload(&founder, "founder-token", "Audited", 2).await;
+
+    put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/upload"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    let (status, _) = put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/complete"),
+        "founder-token",
+        &json!({ "generation": "3" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = put(
+        &founder,
+        &format!("/api/v1/operator/dataset-versions/{version_id}/episodes/0/curation"),
+        "founder-token",
+        &json!({ "decision": "included" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = post(
+        &founder,
+        &format!("/api/v1/operator/dataset-versions/{version_id}/views"),
+        "founder-token",
+        &json!({ "name": "Audited cut" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let actions: Vec<(String, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT action, outcome, actor_id FROM audit_events \
+         WHERE action LIKE 'dataset.%' ORDER BY occurred_at, action",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = actions.iter().map(|row| row.0.as_str()).collect();
+    for expected in [
+        "dataset.version.declared",
+        "dataset.file.verified",
+        "dataset.curation.updated",
+        "dataset.view.published",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "{expected} should be on the audit trail, found {names:?}"
+        );
+    }
+    for (action, outcome, actor) in &actions {
+        assert_eq!(outcome, "succeeded", "{action} should have succeeded");
+        assert_eq!(*actor, Some(founder_id), "{action} should name who did it");
+    }
+
+    // Whatever else the detail carries, it must not be a way to reach the object.
+    let details: Vec<(Value,)> =
+        sqlx::query_as("SELECT detail FROM audit_events WHERE action LIKE 'dataset.%'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    for (detail,) in &details {
+        let text = serde_json::to_string(detail).unwrap();
+        assert!(
+            !text.contains("v1/projects/"),
+            "an audit detail must not carry a storage object key: {text}"
+        );
+        assert!(
+            !text.contains("storage.example.test") && !text.contains("upload/session"),
+            "an audit detail must not carry a resumable-session URI: {text}"
+        );
+    }
+
+    let _ = dataset_id;
+}
+
+/// A rejected upload is recorded as a failure, not omitted.
+///
+/// The trail has to answer "did anything go wrong with this dataset", and a rejection that left
+/// no entry would make a failed version look like one that was simply never finished.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_rejected_upload_is_recorded_as_a_failure(pool: PgPool) {
+    let (founder, _founder_id) = found(&pool, storage_disagreeing()).await;
+    let (_dataset_id, _version_id, file_id) =
+        declare_upload(&founder, "founder-token", "Rejected", 1).await;
+
+    put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/upload"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    let (status, _) = put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/complete"),
+        "founder-token",
+        &json!({ "generation": "1" }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK);
+
+    let (outcome, detail): (String, Value) = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_events \
+         WHERE action = 'dataset.file.rejected' AND target_id = $1",
+    )
+    .bind(file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcome, "failed", "a rejection is a failure, not a success");
+    assert_eq!(detail["reason"], "integrity mismatch");
+    assert!(
+        detail["declared_byte_length"] != detail["stored_byte_length"],
+        "the trail should record what disagreed"
+    );
+}

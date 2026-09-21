@@ -282,6 +282,16 @@ pub(crate) async fn import_hugging_face_dataset(
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.version.imported",
+        "dataset_version",
+        version_id,
+        "succeeded",
+        json!({ "dataset_id": dataset_id, "source_kind": "hugging_face", "resolved_revision": resolved_revision }),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -377,6 +387,16 @@ pub(crate) async fn create_upload_dataset(
         .await
         .map_err(|_| OperatorError::internal())?;
     }
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.version.declared",
+        "dataset_version",
+        version_id,
+        "succeeded",
+        json!({ "dataset_id": dataset_id, "source_kind": "upload", "declared_files": request.files.len() }),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -527,27 +547,7 @@ pub(crate) async fn complete_dataset_file_upload(
         .await
         .map_err(|_| OperatorError::unavailable())?;
     if metadata.byte_length != row.byte_length || metadata.sha256 != row.sha256 {
-        let mut transaction = database
-            .begin()
-            .await
-            .map_err(|_| OperatorError::internal())?;
-        sqlx::query(
-            "UPDATE dataset_files SET status = 'rejected', rejection_reason = 'integrity mismatch' \
-             WHERE id = $1",
-        )
-        .bind(file_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| OperatorError::internal())?;
-        sqlx::query("UPDATE dataset_versions SET status = 'failed' WHERE id = $1")
-            .bind(row.version_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| OperatorError::internal())?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| OperatorError::internal())?;
+        reject_uploaded_file(database, &caller, file_id, &row, metadata.byte_length).await?;
         return Err(OperatorError::dataset_integrity());
     }
     storage
@@ -573,6 +573,21 @@ pub(crate) async fn complete_dataset_file_upload(
         .await
         .map_err(|_| OperatorError::internal())?;
     publish_version_if_complete(&mut transaction, row.version_id).await?;
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.file.verified",
+        "dataset_file",
+        file_id,
+        "succeeded",
+        json!({
+            "version_id": row.version_id,
+            "logical_path": row.logical_path,
+            "byte_length": row.byte_length,
+            "storage_generation": generation,
+        }),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -622,6 +637,10 @@ pub(crate) async fn upsert_episode_curation(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
     let row = sqlx::query_as::<_, (Uuid, i32, String, Option<String>, DateTime<Utc>)>(
         "INSERT INTO dataset_episode_curations \
          (version_id, project_id, episode_index, decision, note, updated_by_identity_id) \
@@ -645,10 +664,26 @@ pub(crate) async fn upsert_episode_curation(
     )
     .bind(caller.identity_id)
     .bind(&caller.project_ids)
-    .fetch_optional(database)
+    .fetch_optional(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?
     .ok_or_else(OperatorError::dataset_not_found)?;
+    // The decision and the record of who made it commit together. A curation the audit trail
+    // does not know about is how "who excluded this episode, and why" stops being answerable.
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.curation.updated",
+        "dataset_version",
+        row.0,
+        "succeeded",
+        json!({ "episode_index": row.1, "decision": row.2 }),
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
     Ok(Json(EpisodeCurationResponse {
         version_id: row.0,
         episode_index: row.1,
@@ -737,6 +772,19 @@ pub(crate) async fn create_dataset_view(
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.view.published",
+        "dataset_view",
+        view_id,
+        "succeeded",
+        json!({
+            "version_id": version_id,
+            "included_episode_count": episodes.len(),
+        }),
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -793,6 +841,92 @@ struct CompleteFileRow {
     sha256: String,
     storage_bucket: String,
     storage_object_key: String,
+}
+
+/// Refuse an uploaded object that does not match what was declared, and fail its version.
+///
+/// The version fails rather than merely losing one file. A version that stayed selectable with a
+/// rejected file in it is the dangerous outcome: a training run would pick it and quietly train
+/// on an incomplete dataset.
+async fn reject_uploaded_file(
+    database: &sqlx::PgPool,
+    caller: &crate::operator::Caller,
+    file_id: Uuid,
+    row: &CompleteFileRow,
+    stored_byte_length: i64,
+) -> Result<(), OperatorError> {
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    sqlx::query(
+        "UPDATE dataset_files SET status = 'rejected', rejection_reason = 'integrity mismatch'          WHERE id = $1",
+    )
+    .bind(file_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    sqlx::query("UPDATE dataset_versions SET status = 'failed' WHERE id = $1")
+        .bind(row.version_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.file.rejected",
+        "dataset_file",
+        file_id,
+        "failed",
+        json!({
+            "version_id": row.version_id,
+            "logical_path": row.logical_path,
+            "reason": "integrity mismatch",
+            "declared_byte_length": row.byte_length,
+            "stored_byte_length": stored_byte_length,
+        }),
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    Ok(())
+}
+
+/// Record a dataset action on the audit trail, inside the caller's transaction.
+///
+/// Inside, rather than after, so the trail cannot disagree with the catalogue: an event without
+/// the change it describes is worse than no event, because it is read as proof.
+///
+/// `detail` carries identifiers and the operator's own words -- a logical path, an episode
+/// index, a rejection reason. It never carries a storage object key, a resumable-session URI or
+/// anything else that would turn the audit table into a way of reaching the bytes.
+async fn record_dataset_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    actor_id: Uuid,
+    action: &str,
+    target_type: &str,
+    target_id: Uuid,
+    outcome: &str,
+    detail: Value,
+) -> Result<(), OperatorError> {
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(actor_id)
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(outcome)
+    .bind(detail)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(())
 }
 
 async fn load_dataset(
