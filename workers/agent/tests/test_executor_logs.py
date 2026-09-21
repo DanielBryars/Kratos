@@ -235,6 +235,33 @@ def test_a_broken_log_stream_does_not_fail_the_job() -> None:
     assert result.exit_code == 0
 
 
+def test_a_broken_log_stream_keeps_observations_open_through_result_reconciliation() -> None:
+    """A Docker read timeout can close the follower before the workload itself exits."""
+
+    class Exploding(Container):
+        def logs(self, **options: Any) -> Any:
+            if options.get("stream"):
+                raise docker.errors.APIError("log stream went away")
+            return b"captured after the stream closed\n" if options.get("stdout") else b""
+
+    clock = Clock()
+    container = Exploding(clock, [])
+    executor = DockerExecutor(
+        Client(Containers(container, existing=False)), clock=clock, sleep=clock.sleep
+    )
+    events: list[str] = []
+
+    result = executor.run_job(
+        assignment(),
+        tick_seconds=1,
+        observe=lambda *_: events.append("observed"),
+        on_observations_closed=lambda: events.append("closed"),
+    )
+
+    assert result.exit_code == 0
+    assert events == ["observed", "closed"]
+
+
 def test_a_resumed_container_is_not_re_read_and_says_so() -> None:
     """Docker replays a log from the start, and every replayed line would take a new sequence.
 
