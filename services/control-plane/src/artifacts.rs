@@ -115,7 +115,7 @@ pub struct BeginArtifactUploadResponse {
 #[derive(FromRow)]
 struct AttemptRecord {
     job_id: Uuid,
-    owner_identity_id: Uuid,
+    project_id: Uuid,
     status: String,
     job_status: String,
     lease_expires_at: DateTime<Utc>,
@@ -280,7 +280,7 @@ async fn attempt_for_worker(
     worker_id: Uuid,
 ) -> Result<AttemptRecord, ApiError> {
     let record = sqlx::query_as::<_, AttemptRecord>(
-        "SELECT a.job_id, j.owner_identity_id, a.status, j.status AS job_status, \
+        "SELECT a.job_id, j.project_id, a.status, j.status AS job_status, \
                 a.lease_expires_at, a.artifact_delivery_expires_at \
          FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
          WHERE a.id = $1 AND a.worker_id = $2 FOR UPDATE OF a, j",
@@ -489,9 +489,13 @@ pub(crate) async fn declare_manifest(
             .get(file.logical_path.as_str())
             .ok_or_else(ApiError::invalid_request)?;
         let artifact_id = Uuid::new_v4();
+        // ADR-014's project-scoped shape, used for newly declared objects only. Keys already
+        // stored stay exactly as they are: the object key is where the bytes live, so rewriting
+        // one is a storage migration, not a rename, and authorisation follows the database's
+        // project membership rather than anything encoded in the path.
         let object_key = format!(
-            "v1/owners/{}/jobs/{}/attempts/{attempt_id}/artifacts/{artifact_id}",
-            attempt.owner_identity_id, attempt.job_id
+            "v1/projects/{}/jobs/{}/attempts/{attempt_id}/artefacts/{artifact_id}",
+            attempt.project_id, attempt.job_id
         );
         sqlx::query(
             "INSERT INTO job_artifacts \
@@ -1682,6 +1686,88 @@ mod tests {
         assert_eq!(delivery_window(512), TimeDelta::minutes(15));
         assert!(delivery_window(MAX_TOTAL_BYTES) > TimeDelta::hours(22));
         assert!(delivery_window(MAX_TOTAL_BYTES) <= TimeDelta::hours(24));
+    }
+
+    /// New objects use ADR-014's project-scoped key; keys already stored are left alone.
+    ///
+    /// The object key is where the bytes actually live, so changing one on an existing row is a
+    /// storage migration rather than a rename -- it would point a verified artefact at nothing.
+    /// Authorisation follows project membership in the database, never the path, so the two
+    /// shapes coexisting costs nothing.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn newly_declared_artifacts_use_the_project_scoped_key(pool: PgPool) {
+        let fixture = fixture(&pool).await;
+        let router = app(None, Some(pool.clone()));
+        let manifest_id = Uuid::new_v4();
+        let uri = format!(
+            "/api/v1/workers/{}/job-attempts/{}/artifact-manifest",
+            fixture.worker_id, fixture.attempt_id
+        );
+        let declare = || {
+            router.clone().oneshot(
+                Request::put(&uri)
+                    .header(AUTHORIZATION, format!("Bearer {}", fixture.credential))
+                    .header("content-type", "application/json")
+                    .body(Body::from(manifest_body(manifest_id).to_string()))
+                    .unwrap(),
+            )
+        };
+
+        let response = declare().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let keys: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, object_key FROM job_artifacts WHERE manifest_id = $1 ORDER BY logical_path",
+        )
+        .bind(manifest_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !keys.is_empty(),
+            "the manifest should have declared artifacts"
+        );
+
+        let expected_prefix = format!(
+            "v1/projects/{}/jobs/{}/attempts/{}/artefacts/",
+            DEFAULT_PROJECT_ID, fixture.job_id, fixture.attempt_id
+        );
+        for (_, key) in &keys {
+            assert!(
+                key.starts_with(&expected_prefix),
+                "new artefact key should be project-scoped, got {key}"
+            );
+            assert!(
+                !key.contains("v1/owners/"),
+                "no new key may be owner-scoped"
+            );
+        }
+
+        // Now make one of them look like a row stored before projects existed, and declare the
+        // same manifest again. Re-declaration is idempotent, and idempotent must mean "leaves the
+        // stored key alone" -- rewriting it would point a verified object at nothing.
+        let (legacy_id, _) = keys[0].clone();
+        let legacy_key = "v1/owners/11111111-1111-4111-8111-111111111111/jobs/x/legacy";
+        sqlx::query("UPDATE job_artifacts SET object_key = $2 WHERE id = $1")
+            .bind(legacy_id)
+            .bind(legacy_key)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = declare().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (survived,): (String,) =
+            sqlx::query_as("SELECT object_key FROM job_artifacts WHERE id = $1")
+                .bind(legacy_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            survived, legacy_key,
+            "an existing stored key must not be rewritten"
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

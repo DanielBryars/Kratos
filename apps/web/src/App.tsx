@@ -172,7 +172,7 @@ export function App() {
   // session storage: it must not outlive the tab, and a claim that fails is meant to need the
   // link again rather than be retried from something durable.
   const [pendingClaim, setPendingClaim] = useState<string | null>(null);
-  const [claimState, setClaimState] = useState<"idle" | "claiming" | "claimed" | "failed">("idle");
+  const [claimState, setClaimState] = useState<"idle" | "claiming" | "claimed" | "failed" | "interrupted">("idle");
   const [claimMessage, setClaimMessage] = useState<string | null>(null);
   const [invitation, setInvitation] = useState<Invitation | null>(null);
   const [invitationCopied, setInvitationCopied] = useState(false);
@@ -286,8 +286,10 @@ export function App() {
   }, []);
 
   // Claim as soon as there is both an invitation and someone signed in to attach it to.
+  // Runs only from "idle". Every other state is a reason not to send the credential again: it is
+  // in flight, it has been accepted, it has been refused, or a retry is waiting on the person.
   useEffect(() => {
-    if (!pendingClaim || !user || claimState === "claiming" || claimState === "claimed") return;
+    if (claimState !== "idle" || !pendingClaim || !user) return;
     let cancelled = false;
     async function claim() {
       setClaimState("claiming");
@@ -315,8 +317,12 @@ export function App() {
         }
       } catch {
         if (cancelled) return;
-        setClaimState("failed");
-        setClaimMessage("The invitation could not be checked. Try again.");
+        // The request never arrived, so the invitation is still good. Keep it -- in memory only --
+        // and stop, rather than letting the effect run again: "interrupted" is not "idle", and
+        // only a deliberate retry returns it there. An automatic retry here would be a tight loop
+        // sending the credential as fast as the network refuses it.
+        setClaimState("interrupted");
+        setClaimMessage("The invitation could not be checked. Check your connection and try again.");
       }
     }
     void claim();
@@ -915,6 +921,14 @@ export function App() {
           )}
           {claimState === "failed" && claimMessage && (
             <p className="notice notice--error" role="alert">{claimMessage}</p>
+          )}
+          {claimState === "interrupted" && (
+            <p className="notice notice--error" role="alert">
+              {claimMessage}{" "}
+              <button type="button" onClick={() => { setClaimMessage(null); setClaimState("idle"); }}>
+                Try again
+              </button>
+            </p>
           )}
           {pendingClaim && !user && (
             <p className="notice" role="status">

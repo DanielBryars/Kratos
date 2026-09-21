@@ -10,7 +10,7 @@
 //! are where "argued correct" and "actually correct" part company, so those are asserted against
 //! the database's own state after the race rather than against the responses alone.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -18,13 +18,14 @@ use axum::{
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
     app_with_human_auth,
     human_auth::{ClientAuthConfig, HumanAuth, HumanIdentity, IdentityVerifier, VerifyError},
+    operator::MAX_PENDING_INVITATIONS,
     projects::DEFAULT_PROJECT_ID,
 };
 
@@ -815,4 +816,154 @@ async fn the_invitation_list_never_carries_a_credential(pool: PgPool) {
     )
     .await;
     assert_eq!(body, json!([]), "a revoked invitation is no longer pending");
+}
+
+/// The ceiling itself: the eleventh invitation is refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_invitation_ceiling_refuses_the_next_one(pool: PgPool) {
+    let (founder_router, _founder_id) = found(&pool).await;
+    for _ in 0..MAX_PENDING_INVITATIONS {
+        invite(&founder_router).await;
+    }
+
+    let (status, _) = post(
+        &founder_router,
+        "/api/v1/operator/project-invitations",
+        "founder-token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "the allowance is full and must say so"
+    );
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_invitations \
+         WHERE project_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL \
+           AND expires_at > now()",
+    )
+    .bind(DEFAULT_PROJECT_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, MAX_PENDING_INVITATIONS,
+        "the ceiling must hold exactly, not approximately"
+    );
+
+    // Revoking one frees a slot, so the bound is a live allowance rather than a lifetime total.
+    let (_, listed) = get(
+        &founder_router,
+        "/api/v1/operator/project-invitations",
+        "founder-token",
+    )
+    .await;
+    let victim = listed[0]["invitation_id"].as_str().unwrap().to_owned();
+    let (status, _) = post(
+        &founder_router,
+        &format!("/api/v1/operator/project-invitations/{victim}/revoke"),
+        "founder-token",
+        json!({}),
+    )
+    .await;
+    assert!(status.is_success());
+    let (status, _) = post(
+        &founder_router,
+        "/api/v1/operator/project-invitations",
+        "founder-token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "a revoked slot is reusable");
+}
+
+/// The pending-invitation ceiling must be counted under a lock, not merely counted.
+///
+/// ADR-017 bounds the supply so a console session that has been taken over cannot mint an
+/// unlimited number of ways in. A count taken outside a lock reads the same nine for every
+/// concurrent request, each believes it is the tenth, and all of them commit.
+///
+/// The interleaving is forced rather than hoped for. Two requests fired with `tokio::join!` do
+/// not overlap at all here -- a local `PostgreSQL` answers inside one poll, so the first
+/// runs to completion before the second starts, and such a test passes with the lock deleted. So
+/// a connection outside the pool holds the project row, the request blocks against it, and the
+/// tenth invitation is written and committed underneath before the request is let through. What
+/// distinguishes the two implementations is the final count: a request that counted before the
+/// writer committed creates an eleventh.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_invitation_ceiling_counts_under_the_lock(pool: PgPool) {
+    let (founder_router, _founder_id) = found(&pool).await;
+    for _ in 0..(MAX_PENDING_INVITATIONS - 1) {
+        invite(&founder_router).await;
+    }
+
+    // The outside writer credits a different identity. Crediting the founder would make its
+    // insert wait on the founder's `human_identities` row, which the blocked request already
+    // holds `FOR UPDATE` from `authorize_operator` -- a cycle, and PostgreSQL kills one side as
+    // a deadlock rather than letting the test observe anything.
+    let colleague_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities          (id, provider, provider_subject, display_name, email, role)          VALUES ($1, 'identity-platform', 'colleague', 'Colleague', 'colleague@example.com', 'operator')",
+    )
+    .bind(colleague_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut outside = PgConnection::connect_with(&pool.connect_options())
+        .await
+        .unwrap();
+    let mut blocker = outside.begin().await.unwrap();
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(DEFAULT_PROJECT_ID)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let (attempt, ()) = tokio::join!(
+        post(
+            &founder_router,
+            "/api/v1/operator/project-invitations",
+            "founder-token",
+            json!({})
+        ),
+        async {
+            // Long enough for the request to have reached the lock and stopped there.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            sqlx::query(
+                "INSERT INTO project_invitations \
+                 (id, project_id, created_by_identity_id, token_verifier, expires_at) \
+                 VALUES ($1, $2, $3, 'verifier', now() + interval '1 hour')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(colleague_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+            blocker.commit().await.unwrap();
+        },
+    );
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_invitations \
+         WHERE project_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL \
+           AND expires_at > now()",
+    )
+    .bind(DEFAULT_PROJECT_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, MAX_PENDING_INVITATIONS,
+        "the ceiling must hold exactly; the request answered {:?}",
+        attempt.0
+    );
+    assert_eq!(
+        attempt.0,
+        StatusCode::CONFLICT,
+        "the request must see the invitation written while it waited"
+    );
 }

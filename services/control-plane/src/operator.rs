@@ -30,7 +30,7 @@ const DEFAULT_EXPIRY_SECONDS: i64 = 900;
 const MIN_EXPIRY_SECONDS: i64 = 300;
 const MAX_EXPIRY_SECONDS: i64 = 3600;
 /// Bounded so a compromised console session cannot mint an unbounded supply of ways in.
-const MAX_PENDING_INVITATIONS: i64 = 10;
+pub(crate) const MAX_PENDING_INVITATIONS: i64 = 10;
 
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -1723,6 +1723,18 @@ pub(crate) async fn create_project_invitation(
 
     // Bounded, so that a console session which has been taken over cannot mint an unlimited
     // supply of ways in before anyone notices.
+    //
+    // The count and the insert are serialised on the project row, the same lock membership
+    // removal takes. Counting outside a lock is how a ceiling of ten becomes a ceiling of
+    // however many requests arrive together: each one reads nine, each one believes it is the
+    // tenth, and all of them commit. A bound that only holds when nobody is in a hurry is not a
+    // bound, and this one exists precisely for the case where someone is.
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
+        .bind(project_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
     let pending: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM project_invitations \
          WHERE project_id = $1 AND consumed_at IS NULL AND revoked_at IS NULL \
