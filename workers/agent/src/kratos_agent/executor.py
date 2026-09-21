@@ -77,12 +77,21 @@ ACTIVE_CONTAINER_STATUSES = frozenset({"running", "paused", "restarting"})
 class _LogReader:
     """Own the asynchronous reader and reconcile a wholly delayed stream exactly once."""
 
-    def __init__(self, observe: LogObserver, clock: Callable[[], datetime]) -> None:
+    def __init__(
+        self,
+        observe: LogObserver,
+        clock: Callable[[], datetime],
+        on_closed: Callable[[], None] | None = None,
+    ) -> None:
         self._observe = observe
         self._clock = clock
+        self._on_closed = on_closed
         self._lock = threading.Lock()
         self._delivered = 0
         self._sealed = False
+        self._reader_closed = False
+        self._result_complete = False
+        self._close_notified = False
 
     def observe(self, stream: Stream, at: datetime, text: str) -> None:
         with self._lock:
@@ -106,6 +115,26 @@ class _LogReader:
         for stream, captured in ((Stream.STDOUT, stdout), (Stream.STDERR, stderr)):
             for line in captured.splitlines():
                 self._observe(stream, self._clock(), line)
+
+    def reader_closed(self) -> None:
+        """Record that Docker's streaming reader cannot append again."""
+        self._mark_closed(reader=True)
+
+    def result_complete(self) -> None:
+        """Record that result-log reconciliation cannot append again."""
+        self._mark_closed(reader=False)
+
+    def _mark_closed(self, *, reader: bool) -> None:
+        callback: Callable[[], None] | None = None
+        with self._lock:
+            if reader:
+                self._reader_closed = True
+            else:
+                self._result_complete = True
+            if self._reader_closed and self._result_complete and not self._close_notified:
+                self._close_notified = True
+                callback = self._on_closed
+        _notify_observations_closed(callback)
 
 
 class ExecutorError(RuntimeError):
@@ -410,6 +439,7 @@ class DockerExecutor:
         stderr = self._bounded_log(container, stdout=False, stderr=True)
         if log_reader is not None:
             log_reader.reconcile_if_empty(stdout, stderr)
+            log_reader.result_complete()
         if exit_code != 0 and failure_message is None:
             failure_message = f"container exited with code {exit_code}"
         # The reader is deliberately never joined: the result path cannot wait on telemetry. When
@@ -551,10 +581,10 @@ class DockerExecutor:
             observe(Stream.STDERR, self._clock(), _RESUMED_NOTICE)
             _notify_observations_closed(on_closed)
             return None
-        reader = _LogReader(observe, self._clock)
+        reader = _LogReader(observe, self._clock, on_closed)
         thread = threading.Thread(
             target=self._follow_logs,
-            args=(container, reader.observe, on_closed),
+            args=(container, reader.observe, reader.reader_closed),
             name="kratos-log-reader",
             daemon=True,
         )
