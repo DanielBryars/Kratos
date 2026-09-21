@@ -134,7 +134,7 @@ preview adapters behind the same catalogue contract.
 
 ## References
 
-- [Dataset and provenance requirements](../../requirements/03-datasets-and-provenance.md)
+- [Dataset and provenance requirements](../../../requirements/03-datasets-and-provenance.md)
 - [ADR-014: Job artefacts in Cloud Storage](014-gcs-job-artefact-transfer.md)
 - [ADR-017: Invitations and shared ownership](017-invitations-and-shared-ownership.md)
 - [Leroboscope](https://github.com/DanielBryars/leroboscope)
