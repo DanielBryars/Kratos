@@ -12,6 +12,7 @@ PROMETHEUS="prom/prometheus@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115
 LOKI="grafana/loki@sha256:1107dd5274e0ada47e42472b7a7e71f3b2a2fe878878108f3e2f9e51528f0193"
 TEMPO="grafana/tempo@sha256:0296560ac66f8a3600d7fb3014a52c189d4d9c3549ad6ff441bf2409855d68d5"
 COLLECTOR="otel/opentelemetry-collector-contrib@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1"
+NGINX="nginx@sha256:42a516af16b852e33b7682d5ef8acbd5d13fe08fecadc7ed98605ba5e3b26ab8"
 
 config="$(pwd)/config"
 
@@ -61,6 +62,10 @@ docker run --rm --entrypoint promtool -v "$config/prometheus/prometheus.yml:/p.y
 echo "collector"
 docker run --rm -v "$config/otel-gateway/config.yaml:/c.yaml:ro" \
   "$COLLECTOR" validate --config=/c.yaml
+
+echo "MLflow IAP edge"
+docker run --rm -v "$config/mlflow-edge/nginx.conf:/etc/nginx/nginx.conf:ro" \
+  "$NGINX" nginx -t
 
 echo "loki (cloud)"
 docker run --rm -e KRATOS_TELEMETRY_BUCKET=validate-bucket \

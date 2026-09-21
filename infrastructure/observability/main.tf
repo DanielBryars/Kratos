@@ -476,6 +476,16 @@ resource "google_compute_backend_service" "human" {
     enabled = true
   }
 
+  # A console-generated custom OAuth client is the supported escape hatch when the managed
+  # client's organisation gate rejects an account. Its secret must stay out of Terraform state,
+  # and a later apply must not silently replace it with the managed client.
+  lifecycle {
+    ignore_changes = [
+      iap[0].oauth2_client_id,
+      iap[0].oauth2_client_secret,
+    ]
+  }
+
   log_config {
     enable      = true
     sample_rate = 1
