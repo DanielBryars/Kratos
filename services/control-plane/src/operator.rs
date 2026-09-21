@@ -413,6 +413,14 @@ impl OperatorError {
         )
     }
 
+    const fn invitation_consumed() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "invitation_consumed",
+            "This invitation has already been claimed.",
+        )
+    }
+
     const fn too_many_invitations() -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -1806,6 +1814,166 @@ pub(crate) async fn revoke_project_membership(
         .await
         .map_err(|_| OperatorError::internal())?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClaimInvitationRequest {
+    /// The `kin_` credential from the invitation link. Sent in the body, never in a URL.
+    pub(crate) invitation_credential: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ClaimInvitationResponse {
+    pub(crate) project_id: Uuid,
+    pub(crate) identity_id: Uuid,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/project-invitations/claim",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    request_body = ClaimInvitationRequest,
+    responses(
+        (status = 200, description = "Invitation claimed; the signed-in identity is now a project member", body = ClaimInvitationResponse),
+        (status = 401, description = "Identity token or invitation invalid, revoked or expired", body = ErrorResponse),
+        (status = 409, description = "Invitation already claimed", body = ErrorResponse),
+    )
+)]
+/// Bind an invitation to whoever is signed in.
+///
+/// The one authenticated path that must work for a person with no identity row, so it cannot
+/// authorise the way every other operator handler does: there is nothing yet to authorise. The
+/// invitation is the authority, and the Identity Platform token only says who is claiming it.
+pub(crate) async fn claim_project_invitation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClaimInvitationRequest>,
+) -> Result<Json<ClaimInvitationResponse>, OperatorError> {
+    let database = state.database.ok_or_else(OperatorError::unavailable)?;
+    let auth = state.human_auth.ok_or_else(OperatorError::unavailable)?;
+    let bearer = bearer_token(&headers)?;
+    let identity = auth.verify(bearer).await.map_err(|error| match error {
+        VerifyError::Rejected => OperatorError::unauthorized(),
+        VerifyError::Unavailable => OperatorError::unavailable(),
+    })?;
+
+    // Parsed before the database is touched, so a malformed credential costs nothing and a
+    // credential of the wrong kind is refused on its prefix rather than by hashing.
+    let invitation_id = credentials::identifier(CredentialKind::Invitation, &request.invitation_credential)
+        .map_err(|_| OperatorError::unauthorized())?;
+
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    // Locked and re-checked inside the transaction. Reading first and acting afterwards is what
+    // would let two people claim one invitation.
+    let record = sqlx::query_as::<_, (Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Uuid)>(
+        "SELECT project_id, token_verifier, expires_at, consumed_at, revoked_at, \
+                created_by_identity_id \
+         FROM project_invitations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(invitation_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::unauthorized)?;
+
+    let (project_id, verifier, expires_at, consumed_at, revoked_at, invited_by) = record;
+    if revoked_at.is_some() || expires_at <= Utc::now() {
+        return Err(OperatorError::unauthorized());
+    }
+    // Distinguished from an invalid credential on purpose: someone clicking a link twice should
+    // be told it is spent, not that it never existed.
+    if consumed_at.is_some() {
+        return Err(OperatorError::invitation_consumed());
+    }
+    if !credentials::verify(&request.invitation_credential, &verifier) {
+        return Err(OperatorError::unauthorized());
+    }
+
+    // The subject may already exist -- someone re-invited after being removed -- so this finds or
+    // creates rather than assuming either.
+    let existing = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM human_identities \
+         WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
+    )
+    .bind(&identity.subject)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    let identity_id = match existing {
+        Some((id,)) => id,
+        None => {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO human_identities \
+                 (id, provider, provider_subject, display_name, email, role) \
+                 VALUES ($1, 'identity-platform', $2, $3, $4, 'operator')",
+            )
+            .bind(id)
+            .bind(&identity.subject)
+            .bind(truncate(&identity.display_name, 200))
+            .bind(&identity.email)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| OperatorError::internal())?;
+            id
+        }
+    };
+
+    // Re-inviting someone previously removed restores them rather than failing on the primary
+    // key, and the row keeps its history: who invited them, and that they were once revoked.
+    sqlx::query(
+        "INSERT INTO project_memberships \
+         (project_id, identity_id, invited_by_identity_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (project_id, identity_id) DO UPDATE \
+         SET revoked_at = NULL, revoked_by_identity_id = NULL, \
+             invited_by_identity_id = EXCLUDED.invited_by_identity_id",
+    )
+    .bind(project_id)
+    .bind(identity_id)
+    .bind(invited_by)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "UPDATE project_invitations \
+         SET consumed_at = now(), consumed_by_identity_id = $2 WHERE id = $1",
+    )
+    .bind(invitation_id)
+    .bind(identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    sqlx::query(
+        "INSERT INTO audit_events \
+         (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
+         VALUES ($1, 'human', $2, 'project.invitation.claimed', 'project_invitation', $3, \
+         'succeeded', '{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(identity_id)
+    .bind(invitation_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    Ok(Json(ClaimInvitationResponse {
+        project_id,
+        identity_id,
+    }))
 }
 
 async fn authorize_operator(
