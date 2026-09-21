@@ -126,6 +126,9 @@ mod tests {
                 .unwrap();
         }
 
+        // No project_id on these rows: this test replays the schema as it stood at
+        // 202609200010, before the projects migration added the column. Adding it here
+        // would test a schema that never existed.
         let owner_id = Uuid::new_v4();
         let worker_id = Uuid::new_v4();
         let job_id = Uuid::new_v4();

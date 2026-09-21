@@ -22,6 +22,7 @@ use crate::{
     },
     credentials::{self, CredentialKind},
     human_auth::{HumanIdentity, VerifyError},
+    projects::DEFAULT_PROJECT_ID,
     registry::{ErrorResponse, WorkerCapabilities, reconcile_expired_attempts},
 };
 
@@ -921,9 +922,9 @@ async fn approve_and_group_worker(
         )
         .bind(worker_id)
         .bind(&caller.project_ids)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| OperatorError::internal())?;
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
         "idle"
     } else {
         worker.1.as_str()
@@ -1513,9 +1514,6 @@ pub(crate) async fn cancel_job(
     Ok(Json(record.into_response(outputs, visibility)))
 }
 
-/// The project every existing resource was migrated into, and the one a first operator joins.
-const DEFAULT_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_d00f);
-
 /// Who is calling, and what they may act on -- deliberately two fields rather than one id.
 ///
 /// Until projects existed these were the same UUID: the caller's identity was both the thing
@@ -1861,8 +1859,9 @@ pub(crate) async fn claim_project_invitation(
 
     // Parsed before the database is touched, so a malformed credential costs nothing and a
     // credential of the wrong kind is refused on its prefix rather than by hashing.
-    let invitation_id = credentials::identifier(CredentialKind::Invitation, &request.invitation_credential)
-        .map_err(|_| OperatorError::unauthorized())?;
+    let invitation_id =
+        credentials::identifier(CredentialKind::Invitation, &request.invitation_credential)
+            .map_err(|_| OperatorError::unauthorized())?;
 
     let mut transaction = database
         .begin()
@@ -1871,7 +1870,17 @@ pub(crate) async fn claim_project_invitation(
 
     // Locked and re-checked inside the transaction. Reading first and acting afterwards is what
     // would let two people claim one invitation.
-    let record = sqlx::query_as::<_, (Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Uuid)>(
+    let record = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Uuid,
+        ),
+    >(
         "SELECT project_id, token_verifier, expires_at, consumed_at, revoked_at, \
                 created_by_identity_id \
          FROM project_invitations WHERE id = $1 FOR UPDATE",
@@ -1895,36 +1904,7 @@ pub(crate) async fn claim_project_invitation(
         return Err(OperatorError::unauthorized());
     }
 
-    // The subject may already exist -- someone re-invited after being removed -- so this finds or
-    // creates rather than assuming either.
-    let existing = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM human_identities \
-         WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
-    )
-    .bind(&identity.subject)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|_| OperatorError::internal())?;
-
-    let identity_id = match existing {
-        Some((id,)) => id,
-        None => {
-            let id = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO human_identities \
-                 (id, provider, provider_subject, display_name, email, role) \
-                 VALUES ($1, 'identity-platform', $2, $3, $4, 'operator')",
-            )
-            .bind(id)
-            .bind(&identity.subject)
-            .bind(truncate(&identity.display_name, 200))
-            .bind(&identity.email)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| OperatorError::internal())?;
-            id
-        }
-    };
+    let identity_id = find_or_create_identity(&mut transaction, &identity).await?;
 
     // Re-inviting someone previously removed restores them rather than failing on the primary
     // key, and the row keeps its history: who invited them, and that they were once revoked.
@@ -1974,6 +1954,42 @@ pub(crate) async fn claim_project_invitation(
         project_id,
         identity_id,
     }))
+}
+
+/// Find the identity behind a verified token, creating it the first time that subject appears.
+///
+/// Claiming an invitation is the one authenticated path that must work for someone with no
+/// identity row at all, and the subject may equally already exist -- someone re-invited after
+/// being removed keeps the row they always had. So this finds or creates rather than assuming
+/// either, under the same lock and transaction as the claim itself.
+async fn find_or_create_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    identity: &HumanIdentity,
+) -> Result<Uuid, OperatorError> {
+    let existing = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM human_identities          WHERE provider = 'identity-platform' AND provider_subject = $1 FOR UPDATE",
+    )
+    .bind(&identity.subject)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    if let Some((id,)) = existing {
+        return Ok(id);
+    }
+
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities          (id, provider, provider_subject, display_name, email, role)          VALUES ($1, 'identity-platform', $2, $3, $4, 'operator')",
+    )
+    .bind(id)
+    .bind(&identity.subject)
+    .bind(truncate(&identity.display_name, 200))
+    .bind(&identity.email)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    Ok(id)
 }
 
 async fn authorize_operator(
@@ -2073,6 +2089,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::projects::DEFAULT_PROJECT_ID;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2107,6 +2124,22 @@ mod tests {
                 Err(VerifyError::Rejected)
             }
         }
+    }
+
+    /// Give an identity the project membership that bootstrap or an invitation claim would have
+    /// created for it.
+    ///
+    /// A fixture that inserts a `human_identities` row alone describes a state production never
+    /// reaches: an identity that authenticates perfectly and then authorises against an empty
+    /// project set. Before projects existed the identity row *was* the authority, so these
+    /// fixtures were complete; now they are half of one.
+    async fn join_default_project(pool: &PgPool, identity_id: Uuid) {
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(identity_id)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn healthy_worker_capabilities() -> Value {
@@ -2246,8 +2279,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO worker_registration_requests \
              (id, agent_instance_id, display_name, protocol_version, capabilities, public_key, \
-              confirmation_code, expires_at) VALUES ($1, $2, 'Rented GPU', '1.0', $3, $4, \
-              'ABCD-2345', $5)",
+              confirmation_code, expires_at, project_id) VALUES ($1, $2, 'Rented GPU', '1.0', $3, $4, \
+              'ABCD-2345', $5, $6)",
         )
         .bind(registration_id)
         .bind(Uuid::new_v4())
@@ -2267,6 +2300,7 @@ mod tests {
         }))
         .bind([1_u8; 32].as_slice())
         .bind(Utc::now() + Duration::minutes(15))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2339,11 +2373,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              capabilities, last_seen_at) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now())",
+              capabilities, last_seen_at, project_id) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now(), $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
@@ -2367,6 +2402,7 @@ mod tests {
             }],
             "gpu_health": { "status": "unverified", "detail": "pending" }
         }))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2472,17 +2508,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
 
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              status, capabilities) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4)",
+              status, capabilities, project_id) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4, $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2616,17 +2654,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        join_default_project(&pool, operator_id).await;
 
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
              (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
-              status, capabilities) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4)",
+              status, capabilities, project_id) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4, $5)",
         )
         .bind(worker_id)
         .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2645,13 +2685,14 @@ mod tests {
         let attempt_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO jobs \
-             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id) \
-             VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4)",
+             (id, owner_identity_id, name, image_reference, timeout_seconds, status, assigned_worker_id, project_id) \
+             VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4, $5)",
         )
         .bind(job_id)
         .bind(operator_id)
         .bind(format!("example.test/work@sha256:{}", "b".repeat(64)))
         .bind(worker_id)
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -2802,7 +2843,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
-    async fn artifact_visibility_is_owner_scoped_and_excludes_storage_locations(pool: PgPool) {
+    async fn artifact_visibility_is_project_scoped_and_excludes_storage_locations(pool: PgPool) {
         let owner_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
         let auth = HumanAuth::new(
@@ -2836,16 +2877,38 @@ mod tests {
             .await
             .unwrap();
         }
+        // The hidden job is in a *different project*, which is what the last assertion now
+        // proves. A different owner used to be enough to hide it, but ADR-017 makes every member
+        // of a project a co-owner: a second person in this project is meant to see this job, so
+        // owner alone would no longer hide anything.
+        let other_project_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, name) VALUES ($1, 'Someone else')")
+            .bind(other_project_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        join_default_project(&pool, owner_id).await;
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(other_project_id)
+            .bind(other_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let job_id = Uuid::new_v4();
         let other_job_id = Uuid::new_v4();
-        for (id, owner) in [(job_id, owner_id), (other_job_id, other_id)] {
+        for (id, owner, project) in [
+            (job_id, owner_id, DEFAULT_PROJECT_ID),
+            (other_job_id, other_id, other_project_id),
+        ] {
             sqlx::query(
-                "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-                 VALUES ($1, $2, 'Artifact visibility', $3, 120)",
+                "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+                 VALUES ($1, $2, 'Artifact visibility', $3, 120, $4)",
             )
             .bind(id)
             .bind(owner)
             .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+            .bind(project)
             .execute(&pool)
             .await
             .unwrap();
@@ -2853,13 +2916,14 @@ mod tests {
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'Artifact worker', '1.1', 'busy', $4)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'Artifact worker', '1.1', 'busy', $4, $5)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
@@ -3106,6 +3170,7 @@ mod tests {
             )
             .await
             .unwrap();
+        // Not 403: a job in another project is not one this caller may be told exists.
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
     }
 }

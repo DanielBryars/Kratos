@@ -25,12 +25,10 @@ use crate::{
     AppState,
     artifacts::{JobOutputRequirement, cancel_attempt_upload_sessions, delivery_window},
     credentials::{self, CredentialKind, IssuedCredential},
+    projects::DEFAULT_PROJECT_ID,
 };
 
 const HEARTBEAT_INTERVAL_SECONDS: u32 = 30;
-/// The project an interactive registration enters, until a project-scoped pairing
-/// credential exists. Matches the row the projects migration creates.
-const DEFAULT_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_d00f);
 const REGISTRATION_TTL_MINUTES: i64 = 15;
 const REGISTRATION_POLL_SECONDS: u32 = 3;
 const MAX_OPEN_REGISTRATIONS: i64 = 1_000;
@@ -2224,6 +2222,7 @@ pub(crate) async fn report_job_result(
 
 #[cfg(test)]
 mod tests {
+    use crate::projects::DEFAULT_PROJECT_ID;
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header::AUTHORIZATION},
@@ -2430,13 +2429,14 @@ mod tests {
         let worker_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.0', $4, '{}'::jsonb)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', $4, '{}'::jsonb, $5)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
         .bind(status)
+        .bind(DEFAULT_PROJECT_ID)
         .execute(pool)
         .await
         .unwrap();
@@ -2446,12 +2446,13 @@ mod tests {
     async fn insert_job(pool: &PgPool, owner_id: Uuid) -> Uuid {
         let job_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-             VALUES ($1, $2, 'Matrix check', $3, 120)",
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+             VALUES ($1, $2, 'Matrix check', $3, 120, $4)",
         )
         .bind(job_id)
         .bind(owner_id)
         .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(pool)
         .await
         .unwrap();
@@ -3268,22 +3269,24 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO workers \
-             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities) \
-             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb)",
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, status, capabilities, project_id) \
+             VALUES ($1, $2, $3, 'GPU worker', '1.0', 'idle', '{}'::jsonb, $4)",
         )
         .bind(worker_id)
         .bind(owner_id)
         .bind(Uuid::new_v4())
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds) \
-             VALUES ($1, $2, 'Training', $3, 120)",
+            "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, project_id) \
+             VALUES ($1, $2, 'Training', $3, 120, $4)",
         )
         .bind(job_id)
         .bind(owner_id)
         .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+        .bind(DEFAULT_PROJECT_ID)
         .execute(&pool)
         .await
         .unwrap();

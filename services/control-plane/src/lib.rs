@@ -24,6 +24,7 @@ pub mod human_auth;
 pub mod migration;
 mod observations;
 mod operator;
+pub mod projects;
 mod registry;
 
 use artifact_storage::{ArtifactStorageClient, ResumableUploadSession};

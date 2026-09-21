@@ -5,6 +5,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
+use kratos_control_plane::projects::DEFAULT_PROJECT_ID;
 use kratos_control_plane::{
     app,
     credentials::{CredentialKind, issue},
@@ -75,13 +76,14 @@ async fn enrolment_and_heartbeat_are_transactional_and_replay_safe(pool: PgPool)
 
     let enrolment = issue(CredentialKind::Enrolment).unwrap();
     sqlx::query(
-        "INSERT INTO worker_enrolments (id, owner_identity_id, token_verifier, expires_at) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO worker_enrolments (id, owner_identity_id, token_verifier, expires_at, project_id) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(enrolment.id)
     .bind(owner_id)
     .bind(&enrolment.verifier)
     .bind(Utc::now() + Duration::minutes(10))
+    .bind(DEFAULT_PROJECT_ID)
     .execute(&pool)
     .await
     .unwrap();
