@@ -213,6 +213,14 @@ The ignored `observability/.env` file is for local development only and SHALL NO
 bundle. The exclusion above is deliberate: the instance writes its own private `.env` from Secret
 Manager after extracting the bundle.
 
+After the first upload, that bundle command is CI's job rather than yours: the
+`Deploy observability bundle` workflow runs it on every push to `main` that touches
+`observability/**`, so what is deployed is what was reviewed. Automating it needs two things
+beyond the merge — a `GCP_OBSERVABILITY_CONFIG_BUCKET` repository variable holding the
+`config_bucket` output, and `-var deployment_service_account=<the CI account email>` on the apply,
+which grants that account write access to this one bucket. Without either the workflow skips
+rather than failing, and the manual command above remains the deployment path.
+
 Copy every name in `required_dns_records` to the DNS provider. Certificate issuance begins once
 they resolve, and usually completes within the hour.
 

@@ -187,6 +187,27 @@ resource "google_storage_bucket_iam_member" "config_read" {
   member = google_service_account.observability[0].member
 }
 
+# The other end of the configuration bucket: the instance reads the bundle, CI writes it. Without
+# this the deploy workflow cannot upload and the deployed dashboards stay whatever someone last ran
+# by hand. Scoped to this one bucket, and absent entirely when no deployment account is configured.
+resource "google_storage_bucket_iam_member" "config_deploy_write" {
+  count = local.enabled == 1 && var.deployment_service_account != "" ? 1 : 0
+
+  bucket = google_storage_bucket.config[0].name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${var.deployment_service_account}"
+}
+
+# `gcloud storage cp` reads bucket metadata before writing, and objectAdmin does not include
+# storage.buckets.get -- the same gap the telemetry bucket has to work around below.
+resource "google_storage_bucket_iam_member" "config_deploy_bucket_read" {
+  count = local.enabled == 1 && var.deployment_service_account != "" ? 1 : 0
+
+  bucket = google_storage_bucket.config[0].name
+  role   = "roles/storage.legacyBucketReader"
+  member = "serviceAccount:${var.deployment_service_account}"
+}
+
 resource "google_storage_bucket_iam_member" "telemetry_write" {
   count = local.enabled
 

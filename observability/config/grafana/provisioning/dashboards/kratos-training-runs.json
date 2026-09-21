@@ -1,0 +1,139 @@
+{
+  "uid": "kratos-training-runs",
+  "title": "Kratos training runs",
+  "tags": ["kratos"],
+  "timezone": "browser",
+  "editable": false,
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "Metrics a workload emits through ADR-015 Kratos records. Metric series deliberately carry only service and worker identity, never job or attempt, because one series per attempt is unbounded across a fleet. Use the exemplars on a point to reach the run behind it.",
+  "templating": {
+    "list": [
+      {
+        "name": "worker",
+        "label": "Worker",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "kratos-prometheus" },
+        "query": "label_values(train_loss, kratos_worker_id)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "About this dashboard",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Panels are empty until OTLP ingestion is enabled. A worker cannot reach the gateway until the telemetry admission service from **ADR-016** exists, so `enable_otlp_ingress` is deliberately off and no worker metrics arrive yet. The job's own result, its parameters and its durable outputs do not depend on this path and are visible in the Kratos console today."
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Training loss",
+      "description": "train.loss from the metric allowlist. A rising line late in a run is usually a learning rate worth questioning.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "kratos-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "train_loss{kratos_worker_id=~\"$worker\"}",
+          "legendFormat": "{{kratos_worker_id}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Validation loss",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "kratos-prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "validation_loss{kratos_worker_id=~\"$worker\"}",
+          "legendFormat": "{{kratos_worker_id}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Throughput",
+      "description": "throughput.steps_per_second. A sustained drop usually means the data loader, not the GPU.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "kratos-prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "none", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "throughput_steps_per_second{kratos_worker_id=~\"$worker\"}",
+          "legendFormat": "{{kratos_worker_id}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Peak GPU memory",
+      "description": "gpu.memory.peak_bytes. Approaching the card's capacity is the usual explanation for a run that dies mid-epoch.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "kratos-prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "gpu_memory_peak_bytes{kratos_worker_id=~\"$worker\"}",
+          "legendFormat": "{{kratos_worker_id}}",
+          "exemplar": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "logs",
+      "title": "Workload output",
+      "description": "Every line a workload wrote that was not a Kratos record. Records themselves go to MLflow and to the run view rather than here.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "loki", "uid": "kratos-loki" },
+      "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\".+\"} | kratos_worker_id=~\"$worker\""
+        }
+      ]
+    }
+  ]
+}

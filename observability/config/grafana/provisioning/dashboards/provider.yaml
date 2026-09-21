@@ -1,0 +1,21 @@
+apiVersion: 1
+
+# Dashboards are files in this repository, not objects edited in Grafana.
+#
+# `allowUiUpdates: false` makes that literal: a dashboard edited in the browser cannot be saved
+# over a provisioned one, so what is deployed always matches what is reviewed. Someone wanting a
+# change makes it here and it arrives through the same bundle as everything else.
+#
+# The JSON lives in this directory rather than a sibling because Compose mounts only
+# `config/grafana/provisioning`. Grafana's file provider reads `.json` and ignores this file, so
+# the two can share a directory without a second mount.
+providers:
+  - name: kratos
+    orgId: 1
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
