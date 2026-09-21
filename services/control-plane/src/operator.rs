@@ -398,7 +398,7 @@ impl OperatorError {
         )
     }
 
-    const fn invalid_request() -> Self {
+    pub(crate) const fn invalid_request() -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_request",
@@ -486,7 +486,7 @@ impl OperatorError {
         )
     }
 
-    const fn unavailable() -> Self {
+    pub(crate) const fn unavailable() -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "operator_unavailable",
@@ -494,11 +494,43 @@ impl OperatorError {
         )
     }
 
-    const fn internal() -> Self {
+    pub(crate) const fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "The request could not be completed.",
+        )
+    }
+
+    pub(crate) const fn dataset_not_found() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "dataset_not_found",
+            "The dataset or dataset version was not found.",
+        )
+    }
+
+    pub(crate) const fn dataset_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "dataset_conflict",
+            "The dataset cannot be changed from its current state.",
+        )
+    }
+
+    pub(crate) const fn dataset_integrity() -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "dataset_integrity_mismatch",
+            "The uploaded file did not match its declared size and SHA-256 digest.",
+        )
+    }
+
+    pub(crate) const fn dataset_source_unavailable() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "dataset_source_unavailable",
+            "The external dataset source could not be read.",
         )
     }
 }
@@ -603,7 +635,7 @@ pub(crate) async fn create_worker_enrolment(
     ))
 }
 
-async fn authenticate_operator(
+pub(crate) async fn authenticate_operator(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Caller, OperatorError> {
