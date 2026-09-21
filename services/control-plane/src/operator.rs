@@ -2238,7 +2238,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'stable-subject', 'Test Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -2307,7 +2307,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(stored, (true, Some(caller.identity_id)));
+        assert_eq!(stored, (true, Some(operator_id)));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2335,7 +2335,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'fleet-operator', 'Fleet Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -2346,7 +2346,7 @@ mod tests {
               capabilities, last_seen_at) VALUES ($1, $2, $3, 'THESHED2', '1.0', $4, now())",
         )
         .bind(worker_id)
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(json!({
             "protocol_version": "1.0",
@@ -2468,7 +2468,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'job-operator', 'Job Operator', \
                      'operator@example.com', 'operator')",
         )
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -2480,7 +2480,7 @@ mod tests {
               status, capabilities) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4)",
         )
         .bind(worker_id)
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
         .execute(&pool)
@@ -2612,7 +2612,7 @@ mod tests {
              VALUES ($1, 'identity-platform', 'cancellation-operator', \
                      'Cancellation Operator', 'operator@example.com', 'operator')",
         )
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -2624,7 +2624,7 @@ mod tests {
               status, capabilities) VALUES ($1, $2, $3, 'Busy GPU', '1.0', 'busy', $4)",
         )
         .bind(worker_id)
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .bind(Uuid::new_v4())
         .bind(healthy_worker_capabilities())
         .execute(&pool)
@@ -2649,7 +2649,7 @@ mod tests {
              VALUES ($1, $2, 'Cancel active work', $3, 120, 'running', $4)",
         )
         .bind(job_id)
-        .bind(caller.identity_id)
+        .bind(operator_id)
         .bind(format!("example.test/work@sha256:{}", "b".repeat(64)))
         .bind(worker_id)
         .execute(&pool)
