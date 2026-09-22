@@ -44,6 +44,13 @@ pub(crate) struct CreateUploadDatasetRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct CreateDatasetVersionRequest {
+    info: Value,
+    files: Vec<DatasetFileDeclaration>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DatasetFileDeclaration {
     logical_path: String,
     media_type: String,
@@ -363,30 +370,15 @@ pub(crate) async fn create_upload_dataset(
     .execute(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
-    for file in &request.files {
-        let file_id = Uuid::new_v4();
-        let object_key = format!(
-            "v1/projects/{project_id}/datasets/{dataset_id}/versions/{version_id}/files/{file_id}"
-        );
-        sqlx::query(
-            "INSERT INTO dataset_files \
-             (id, version_id, project_id, logical_path, media_type, byte_length, sha256, \
-              storage_bucket, storage_object_key, status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'declared')",
-        )
-        .bind(file_id)
-        .bind(version_id)
-        .bind(project_id)
-        .bind(&file.logical_path)
-        .bind(&file.media_type)
-        .bind(file.byte_length)
-        .bind(&file.sha256)
-        .bind(storage.bucket())
-        .bind(object_key)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|_| OperatorError::internal())?;
-    }
+    declare_version_files(
+        &mut transaction,
+        project_id,
+        dataset_id,
+        version_id,
+        storage.bucket(),
+        &request.files,
+    )
+    .await?;
     record_dataset_audit(
         &mut transaction,
         caller.identity_id,
@@ -401,6 +393,134 @@ pub(crate) async fn create_upload_dataset(
         .commit()
         .await
         .map_err(|_| OperatorError::internal())?;
+    let created = load_dataset(database, dataset_id, &caller.project_ids).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/datasets/{dataset_id}/versions",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("dataset_id" = Uuid, Path, description = "Existing catalogue entry")),
+    request_body = CreateDatasetVersionRequest,
+    responses(
+        (status = 201, description = "A further immutable version declared", body = DatasetResponse),
+        (status = 404, description = "No such dataset in the caller's projects"),
+        (status = 422, description = "Invalid metadata or file declarations"),
+    )
+)]
+/// Add a version to an existing dataset.
+///
+/// ADR-018: "A `ready` version is immutable. Replacing any file, changing a Hugging Face
+/// revision, or changing generated metadata creates another version." This is the endpoint that
+/// makes that true. It is deliberately separate from `create_upload_dataset`, which must keep
+/// refusing a duplicate name -- creating a catalogue entry and adding contents to one are
+/// different intentions, and one endpoint cannot both reject a repeated name and treat it as a
+/// request for the next version.
+///
+/// Earlier versions are not touched. That is the whole point: a job that selected version 1
+/// keeps meaning exactly what it meant.
+pub(crate) async fn create_dataset_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(dataset_id): Path<Uuid>,
+    Json(request): Json<CreateDatasetVersionRequest>,
+) -> Result<(StatusCode, Json<DatasetResponse>), OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let summary = validate_info(&request.info)?;
+    validate_file_declarations(&request.files)?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let storage = state
+        .artifact_storage
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    // The dataset row is the lock, and the next version number is read behind it. Two people
+    // adding a version at the same moment would otherwise both read the same maximum and both
+    // claim the same number; one would lose to the unique constraint and be told the dataset was
+    // in a state it was not. Locking here also scopes the request: a dataset in another project
+    // is simply not found.
+    let project_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT project_id FROM datasets \
+         WHERE id = $1 AND project_id = ANY($2) AND archived_at IS NULL FOR UPDATE",
+    )
+    .bind(dataset_id)
+    .bind(&caller.project_ids)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::dataset_not_found)?;
+
+    let next_number = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT max(version_number) FROM dataset_versions WHERE dataset_id = $1",
+    )
+    .bind(dataset_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .unwrap_or(0)
+    .checked_add(1)
+    .ok_or_else(OperatorError::internal)?;
+
+    let version_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO dataset_versions \
+         (id, dataset_id, project_id, version_number, source_kind, status, info_json, \
+          validation_json, total_episodes, total_frames, fps, created_by_identity_id) \
+         VALUES ($1, $2, $3, $4, 'upload', 'uploading', $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(version_id)
+    .bind(dataset_id)
+    .bind(project_id)
+    .bind(next_number)
+    .bind(&request.info)
+    .bind(json!({ "lerobot_info": "passed", "files": "pending" }))
+    .bind(summary.total_episodes)
+    .bind(summary.total_frames)
+    .bind(summary.fps)
+    .bind(caller.identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+
+    declare_version_files(
+        &mut transaction,
+        project_id,
+        dataset_id,
+        version_id,
+        storage.bucket(),
+        &request.files,
+    )
+    .await?;
+
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.version.declared",
+        "dataset_version",
+        version_id,
+        "succeeded",
+        json!({
+            "dataset_id": dataset_id,
+            "source_kind": "upload",
+            "version_number": next_number,
+            "declared_files": request.files.len(),
+        }),
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
     let created = load_dataset(database, dataset_id, &caller.project_ids).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
@@ -841,6 +961,46 @@ struct CompleteFileRow {
     sha256: String,
     storage_bucket: String,
     storage_object_key: String,
+}
+
+/// Write the declared files of a version, each with the object key it will occupy.
+///
+/// Shared by the first version of a dataset and every later one, so the key shape cannot drift
+/// between the two paths -- which is the sort of difference nothing would notice until an
+/// artefact could not be found.
+async fn declare_version_files(
+    transaction: &mut Transaction<'_, Postgres>,
+    project_id: Uuid,
+    dataset_id: Uuid,
+    version_id: Uuid,
+    bucket: &str,
+    files: &[DatasetFileDeclaration],
+) -> Result<(), OperatorError> {
+    for file in files {
+        let file_id = Uuid::new_v4();
+        let object_key = format!(
+            "v1/projects/{project_id}/datasets/{dataset_id}/versions/{version_id}/files/{file_id}"
+        );
+        sqlx::query(
+            "INSERT INTO dataset_files \
+             (id, version_id, project_id, logical_path, media_type, byte_length, sha256, \
+              storage_bucket, storage_object_key, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'declared')",
+        )
+        .bind(file_id)
+        .bind(version_id)
+        .bind(project_id)
+        .bind(&file.logical_path)
+        .bind(&file.media_type)
+        .bind(file.byte_length)
+        .bind(&file.sha256)
+        .bind(bucket)
+        .bind(object_key)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    }
+    Ok(())
 }
 
 /// Refuse an uploaded object that does not match what was declared, and fail its version.

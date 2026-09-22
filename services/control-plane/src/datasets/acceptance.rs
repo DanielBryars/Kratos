@@ -11,7 +11,7 @@
 //! shares with the upload path -- naming, scoping, version numbering -- is covered through the
 //! upload path instead.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -20,7 +20,7 @@ use axum::{
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -752,26 +752,13 @@ async fn a_published_view_does_not_move_when_curation_changes(pool: PgPool) {
 /// ADR-018: "A `ready` version is immutable. Replacing any file, changing a Hugging Face
 /// revision, or changing generated metadata creates another version."
 ///
-/// **Ignored because the API cannot do this yet, not because the contract is wrong.** Both
-/// creation paths insert a fresh `datasets` row with `version_number` hard-coded to 1, so a
-/// second set of contents for an existing dataset is refused by the `UNIQUE (project_id, name)`
-/// constraint and answers 409. The schema is already built for versions -- `dataset_versions`
-/// numbers them uniquely per dataset, and `datasets` exists separately precisely so one
-/// catalogue entry can hold several -- but nothing writes a second one.
-///
-/// It cannot be fixed by relaxing `create_upload_dataset`: that endpoint must keep rejecting a
-/// duplicate name, which `a_dataset_name_is_unique_within_a_project_and_free_across_them`
-/// pins down. Adding a version is a different intention from creating a dataset and needs its
-/// own endpoint, something like `POST /datasets/{dataset_id}/versions`.
-///
-/// Until then the catalogue records datasets that can never change, and re-importing a Hugging
-/// Face dataset at a newer revision means inventing a second name -- which is exactly the
-/// lineage the ADR exists to keep.
-#[ignore = "no endpoint adds a version to an existing dataset; see the doc comment"]
+/// `POST /datasets/{dataset_id}/versions` is what makes that true. It is separate from the
+/// upload endpoint on purpose: that one must keep refusing a duplicate name, so it cannot also
+/// treat a repeated name as a request for the next version.
 #[sqlx::test(migrations = "./migrations")]
-async fn replacing_a_datasets_contents_creates_a_second_version(pool: PgPool) {
+async fn adding_contents_to_a_dataset_creates_a_further_version(pool: PgPool) {
     let (founder, _founder_id) = found(&pool, storage_agreeing()).await;
-    let (dataset_id, _version_id, file_id) =
+    let (dataset_id, first_version_id, file_id) =
         declare_upload(&founder, "founder-token", "Versioned", 2).await;
 
     put(
@@ -781,54 +768,121 @@ async fn replacing_a_datasets_contents_creates_a_second_version(pool: PgPool) {
         &json!({}),
     )
     .await;
-    put(
+    let (status, _) = put(
         &founder,
         &format!("/api/v1/operator/dataset-files/{file_id}/complete"),
         "founder-token",
         &json!({ "generation": "1" }),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
 
-    // Declaring the same dataset again, with different contents, should add version 2 rather
-    // than either mutating version 1 or being refused outright.
     let (status, body) = post(
         &founder,
-        "/api/v1/operator/datasets/upload",
+        &format!("/api/v1/operator/datasets/{dataset_id}/versions"),
         "founder-token",
-        &upload_request("Versioned", 5),
+        &json!({
+            "info": lerobot_info(5),
+            "files": [{
+                "logical_path": "meta/info.json",
+                "media_type": "application/json",
+                "byte_length": DECLARED_BYTES,
+                "sha256": declared_sha(),
+            }],
+        }),
     )
     .await;
     assert_eq!(
         status,
         StatusCode::CREATED,
-        "a new set of contents for an existing dataset should be a new version, got {body}"
+        "a further set of contents should be a new version, got {body}"
     );
 
-    let numbers: Vec<(i32,)> = sqlx::query_as(
-        "SELECT version_number FROM dataset_versions WHERE dataset_id = $1 ORDER BY version_number",
+    let numbers: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT version_number, status FROM dataset_versions          WHERE dataset_id = $1 ORDER BY version_number",
     )
     .bind(dataset_id)
     .fetch_all(&pool)
     .await
     .unwrap();
-    let numbers: Vec<i32> = numbers.into_iter().map(|row| row.0).collect();
     assert_eq!(
         numbers,
-        vec![1, 2],
-        "the second declaration should be version 2 of the same dataset"
+        vec![(1, "ready".to_owned()), (2, "uploading".to_owned())],
+        "version 1 must be left exactly as it was, and version 2 begins its own upload"
     );
 
-    let first_status: String = sqlx::query_scalar(
-        "SELECT status FROM dataset_versions WHERE dataset_id = $1 AND version_number = 1",
+    // Version 1 keeps its own files. A job that selected it still means what it meant.
+    let first_files: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dataset_files WHERE version_id = $1")
+            .bind(first_version_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(first_files, 1);
+
+    let verified: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM dataset_files WHERE version_id = $1 AND status = 'verified'",
     )
-    .bind(dataset_id)
+    .bind(first_version_id)
     .fetch_one(&pool)
     .await
     .unwrap();
+    assert_eq!(verified, 1, "the earlier version's file stays verified");
+
+    // The catalogue now reports both.
+    let (status, listed) = get(&founder, "/api/v1/operator/datasets", "founder-token").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        first_status, "ready",
-        "the ready version must be left exactly as it was"
+        listed[0]["versions"].as_array().map(Vec::len),
+        Some(2),
+        "the catalogue should show both versions"
     );
+}
+
+/// A dataset in another project cannot be given a version.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_version_cannot_be_added_to_another_projects_dataset(pool: PgPool) {
+    let (founder, _founder_id) = found(&pool, storage_agreeing()).await;
+    let (dataset_id, _version_id, _file_id) =
+        declare_upload(&founder, "founder-token", "Private", 1).await;
+
+    let outsider = second_project(&pool, storage_agreeing()).await;
+    let body = json!({
+        "info": lerobot_info(1),
+        "files": [{
+            "logical_path": "meta/info.json",
+            "media_type": "application/json",
+            "byte_length": DECLARED_BYTES,
+            "sha256": declared_sha(),
+        }],
+    });
+    let real = post(
+        &outsider,
+        &format!("/api/v1/operator/datasets/{dataset_id}/versions"),
+        "outsider-token",
+        &body,
+    )
+    .await;
+    let invented = post(
+        &outsider,
+        &format!("/api/v1/operator/datasets/{}/versions", Uuid::new_v4()),
+        "outsider-token",
+        &body,
+    )
+    .await;
+    assert_eq!(real.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        real.0, invented.0,
+        "a real dataset and an invented one must be indistinguishable"
+    );
+
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM dataset_versions WHERE dataset_id = $1")
+            .bind(dataset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, 1, "nothing may have been added");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -967,5 +1021,97 @@ async fn a_rejected_upload_is_recorded_as_a_failure(pool: PgPool) {
     assert!(
         detail["declared_byte_length"] != detail["stored_byte_length"],
         "the trail should record what disagreed"
+    );
+}
+
+/// The next version number is read behind a lock on the dataset row.
+///
+/// Two people adding a version at the same moment would otherwise both read the same maximum and
+/// both claim the same number, and one would lose to `UNIQUE (dataset_id, version_number)` and be
+/// told the dataset was in a state it was not.
+///
+/// The interleaving is forced rather than hoped for: joined futures do not overlap against a
+/// local database, which answers inside a single poll. A connection outside the pool holds the
+/// dataset row, the request blocks against it, a version is written and committed underneath, and
+/// the request must then number itself 3 rather than 2.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_next_version_number_is_read_under_the_dataset_lock(pool: PgPool) {
+    let (founder, _founder_id) = found(&pool, storage_agreeing()).await;
+    let (dataset_id, _version_id, _file_id) =
+        declare_upload(&founder, "founder-token", "Raced", 1).await;
+
+    // A separate identity for the outside writer: crediting the founder would deadlock against
+    // the human_identities row the blocked request already holds from authorize_operator.
+    let colleague_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities \
+         (id, provider, provider_subject, display_name, email, role) \
+         VALUES ($1, 'identity-platform', 'colleague', 'Colleague', 'colleague@example.com', 'operator')",
+    )
+    .bind(colleague_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut outside = PgConnection::connect_with(&pool.connect_options())
+        .await
+        .unwrap();
+    let mut blocker = outside.begin().await.unwrap();
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM datasets WHERE id = $1 FOR UPDATE")
+        .bind(dataset_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+
+    let body = json!({
+        "info": lerobot_info(1),
+        "files": [{
+            "logical_path": "meta/info.json",
+            "media_type": "application/json",
+            "byte_length": DECLARED_BYTES,
+            "sha256": declared_sha(),
+        }],
+    });
+    let versions_path = format!("/api/v1/operator/datasets/{dataset_id}/versions");
+    let (attempt, ()) = tokio::join!(
+        post(&founder, &versions_path, "founder-token", &body),
+        async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            sqlx::query(
+                "INSERT INTO dataset_versions \
+                 (id, dataset_id, project_id, version_number, source_kind, status, info_json, \
+                  validation_json, total_episodes, total_frames, fps, created_by_identity_id) \
+                 VALUES ($1, $2, $3, 2, 'upload', 'uploading', '{}'::jsonb, '{}'::jsonb, 1, 1, 30, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(dataset_id)
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(colleague_id)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+            blocker.commit().await.unwrap();
+        },
+    );
+
+    assert_eq!(
+        attempt.0,
+        StatusCode::CREATED,
+        "the waiting request should succeed once the lock is released, got {}",
+        attempt.1
+    );
+
+    let numbers: Vec<(i32,)> = sqlx::query_as(
+        "SELECT version_number FROM dataset_versions WHERE dataset_id = $1 ORDER BY version_number",
+    )
+    .bind(dataset_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let numbers: Vec<i32> = numbers.into_iter().map(|row| row.0).collect();
+    assert_eq!(
+        numbers,
+        vec![1, 2, 3],
+        "the request must number itself after the version committed while it waited"
     );
 }

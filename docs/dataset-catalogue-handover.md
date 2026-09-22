@@ -21,11 +21,7 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 
 - [x] Add PostgreSQL integration tests proving project isolation, immutable version numbering,
   duplicate-name handling, upload integrity rejection, and curated-view snapshots.
-  Four hold. **Version numbering does not**: both creation paths hard-code `version_number = 1`
-  into a new `datasets` row, so a second set of contents is refused by the unique name
-  constraint. The test for it is committed ignored, with the reasoning in its doc comment.
-  It needs its own endpoint (`POST /datasets/{dataset_id}/versions`); relaxing the upload
-  endpoint is not an option, because that one must keep rejecting duplicate names.
+  All five hold. Version numbering needed a new endpoint to be true: see below.
 - [ ] Add the console dataset screen: catalogue, Hugging Face import, folder upload, upload progress,
   version status, viewer launch, curation summary, and publish-view action.
 - [ ] Configure the private dataset bucket CORS policy for direct browser resumable uploads from
@@ -38,6 +34,11 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   bucket-wide credentials or durable object locations to the browser.
 - [ ] Connect the console to Leroboscope with `postMessage`: pass only the in-memory identity token,
   version metadata, current decisions, and the short-lived preview base URL.
+- [x] Add `POST /datasets/{dataset_id}/versions`, which adds an immutable version to an existing
+  dataset. Separate from the upload endpoint on purpose: that one must keep refusing a
+  duplicate name, so it cannot also read a repeated name as a request for the next version.
+  The next number is read behind a lock on the dataset row, proved by a test that fails
+  without it.
 - [x] Add audit events for dataset registration, upload completion or rejection, curation updates,
   and view publication. Written inside the transaction that makes each change; curation
   gained a transaction so its decision and its record commit together. Tests assert the

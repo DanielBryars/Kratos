@@ -111,6 +111,7 @@ pub(crate) struct AppState {
         datasets::list_datasets,
         datasets::import_hugging_face_dataset,
         datasets::create_upload_dataset,
+        datasets::create_dataset_version,
         datasets::begin_dataset_file_upload,
         datasets::complete_dataset_file_upload,
         datasets::upsert_episode_curation,
@@ -144,7 +145,7 @@ pub(crate) struct AppState {
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, AbandonArtifactUploadRequest,
         CompleteArtifactUploadRequest, ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
         ResumableUploadSession,
-        datasets::ImportHuggingFaceDatasetRequest, datasets::CreateUploadDatasetRequest,
+        datasets::ImportHuggingFaceDatasetRequest, datasets::CreateUploadDatasetRequest, datasets::CreateDatasetVersionRequest,
         datasets::DatasetFileDeclaration, datasets::DatasetFileResponse,
         datasets::DatasetVersionResponse, datasets::DatasetResponse,
         datasets::CompleteDatasetFileUploadRequest, datasets::BeginDatasetFileUploadResponse,
@@ -379,6 +380,10 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/datasets/upload",
             post(datasets::create_upload_dataset),
+        )
+        .route(
+            "/api/v1/operator/datasets/{dataset_id}/versions",
+            post(datasets::create_dataset_version),
         )
         .route(
             "/api/v1/operator/dataset-files/{file_id}/upload",
