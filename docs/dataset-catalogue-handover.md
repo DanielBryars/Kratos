@@ -26,10 +26,14 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   version status, viewer launch, curation summary, and publish-view action.
 - [ ] Configure the private dataset bucket CORS policy for direct browser resumable uploads from
   the Kratos console origin, then prove a real multi-file LeRobot upload end to end.
-- [ ] Add a short-lived, version-scoped preview session. **Needs a new storage capability first:**
-  `ArtifactStorage` can initiate uploads and read metadata but cannot mint a signed GET URL,
-  so V4 signing has to be added to the trait and its Google implementation before the
-  endpoint can redirect to one. Its file endpoint should validate a hashed
+- [x] Add the signed-read capability the preview session needs. `ArtifactStorage::signed_read_url`
+  mints a V4-signed GET for one object with a caller-chosen lifetime, reusing the IAM signBlob
+  path the resumable upload already used. A read signs over the host header alone: every extra
+  signed header is a way for the request to fail after the URL has been handed out.
+- [ ] Add the short-lived, version-scoped preview session itself: a hashed session token, a file
+  endpoint that validates it and redirects each logical path to `signed_read_url`, and a session
+  that expires. The signing half is done; this is the session table, the two endpoints and their
+  tests. Its file endpoint should validate a hashed
   token and redirect each requested logical path to a short-lived signed GET URL. Never expose
   bucket-wide credentials or durable object locations to the browser.
 - [ ] Connect the console to Leroboscope with `postMessage`: pass only the in-memory identity token,
