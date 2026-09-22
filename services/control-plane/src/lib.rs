@@ -20,6 +20,7 @@ pub mod artifact_storage;
 mod artifacts;
 pub mod credentials;
 pub mod database;
+mod datasets;
 pub mod human_auth;
 pub mod migration;
 mod observations;
@@ -107,6 +108,14 @@ pub(crate) struct AppState {
         operator::list_jobs,
         operator::list_job_artifacts,
         operator::cancel_job,
+        datasets::list_datasets,
+        datasets::import_hugging_face_dataset,
+        datasets::create_upload_dataset,
+        datasets::create_dataset_version,
+        datasets::begin_dataset_file_upload,
+        datasets::complete_dataset_file_upload,
+        datasets::upsert_episode_curation,
+        datasets::create_dataset_view,
         registry::enrol_worker,
         registry::request_registration,
         registry::registration_status,
@@ -135,7 +144,13 @@ pub(crate) struct AppState {
         observations::ObservationBatchResponse,
         DeclareArtifactManifestRequest, BeginArtifactUploadRequest, AbandonArtifactUploadRequest,
         CompleteArtifactUploadRequest, ArtifactResponse, ArtifactManifestResponse, BeginArtifactUploadResponse,
-        ResumableUploadSession
+        ResumableUploadSession,
+        datasets::ImportHuggingFaceDatasetRequest, datasets::CreateUploadDatasetRequest, datasets::CreateDatasetVersionRequest,
+        datasets::DatasetFileDeclaration, datasets::DatasetFileResponse,
+        datasets::DatasetVersionResponse, datasets::DatasetResponse,
+        datasets::CompleteDatasetFileUploadRequest, datasets::BeginDatasetFileUploadResponse,
+        datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse,
+        datasets::CreateDatasetViewRequest, datasets::DatasetViewResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -353,6 +368,38 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/jobs/{job_id}/artifacts",
             get(operator::list_job_artifacts),
+        )
+        .route(
+            "/api/v1/operator/datasets",
+            get(datasets::list_datasets),
+        )
+        .route(
+            "/api/v1/operator/datasets/import-hugging-face",
+            post(datasets::import_hugging_face_dataset),
+        )
+        .route(
+            "/api/v1/operator/datasets/upload",
+            post(datasets::create_upload_dataset),
+        )
+        .route(
+            "/api/v1/operator/datasets/{dataset_id}/versions",
+            post(datasets::create_dataset_version),
+        )
+        .route(
+            "/api/v1/operator/dataset-files/{file_id}/upload",
+            put(datasets::begin_dataset_file_upload),
+        )
+        .route(
+            "/api/v1/operator/dataset-files/{file_id}/complete",
+            put(datasets::complete_dataset_file_upload),
+        )
+        .route(
+            "/api/v1/operator/dataset-versions/{version_id}/episodes/{episode_index}/curation",
+            put(datasets::upsert_episode_curation),
+        )
+        .route(
+            "/api/v1/operator/dataset-versions/{version_id}/views",
+            post(datasets::create_dataset_view),
         )
         .route(
             "/api/v1/operator/workers/{worker_id}/approve",
