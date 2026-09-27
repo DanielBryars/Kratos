@@ -53,6 +53,15 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 - [ ] Run `cargo fmt`, Clippy with warnings denied, the complete Rust tests with PostgreSQL, web tests,
   Leroboscope type-check/build, Terraform validation, and the container build.
 
+## Marked for revisit
+
+- [ ] **The preview file endpoint requires no identity token.** Accepted by Daniel on 2026-09-27 as
+  good enough for now, on the basis that the session is version-scoped, expires in minutes and is
+  stored only as a verifier. The cost is that a leaked token is usable by whoever holds it until it
+  expires, and the audit trail records which session read a file rather than which person.
+  Requiring the identity token as well would fix both, at the cost of the viewer frame needing one.
+  Revisit before any dataset contains material that is not ours to lose.
+
 ## Training integration after the catalogue merges
 
 - [ ] Extend a job specification with exact `dataset_version_id` and optional `dataset_view_id`.

@@ -1094,8 +1094,14 @@ pub(crate) async fn create_dataset_preview_session(
 ///
 /// The preview token is the only authority here, carried in the `Authorization` header rather
 /// than the query string: a query string reaches access logs, and a capability in a log outlives
-/// the session it belonged to. No identity token is required, which is what lets the viewer be a
-/// plain frame holding nothing but this one narrow credential.
+/// the session it belonged to.
+///
+/// No identity token is required, which is what lets the viewer be a plain frame holding nothing
+/// but this one narrow credential. **Accepted provisionally, and marked for revisit** (Daniel,
+/// 2026-09-27): the session alone is the authority, so a leaked token is usable by whoever holds
+/// it until it expires. Requiring the identity token as well would tie the capability to a person
+/// and make the audit trail name them, at the cost of the viewer needing an identity token in the
+/// frame. Revisit before datasets contain anything that is not ours.
 ///
 /// The response redirects rather than proxying a body, so dataset bytes never travel through the
 /// control plane, and the URL it points at is good for one object for minutes.
