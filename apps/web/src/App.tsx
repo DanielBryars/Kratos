@@ -636,10 +636,11 @@ export function App() {
           upload: { uri: string; method: string; expires_at: string };
         };
         // Straight to storage: the bytes never pass through the control plane.
+        // The initiation already fixes the media type. An untyped view prevents fetch from
+        // adding a Content-Type request header and keeps the cross-origin PUT preflight minimal.
         const put = await fetch(upload.uri, {
           method: upload.method,
-          headers: { "Content-Type": declaredFile.media_type },
-          body: files[index],
+          body: files[index].slice(0, files[index].size, ""),
         });
         if (!put.ok) throw new Error(`Storage refused ${declaredFile.logical_path}`);
         const generation = await storageGeneration(put);

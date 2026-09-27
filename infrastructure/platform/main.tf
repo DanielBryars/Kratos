@@ -73,8 +73,8 @@ resource "google_storage_bucket" "artifacts" {
 
   cors {
     origin          = var.artifact_browser_origins
-    method          = ["GET", "HEAD", "PUT", "OPTIONS"]
-    response_header = ["Content-Type", "Content-Range", "ETag", "Range", "x-goog-generation"]
+    method          = ["GET", "HEAD", "POST", "PUT", "OPTIONS"]
+    response_header = ["Content-Type", "Content-Range", "ETag", "Range", "x-goog-generation", "x-goog-resumable"]
     max_age_seconds = 3600
   }
 
