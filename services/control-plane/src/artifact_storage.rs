@@ -255,6 +255,12 @@ struct SignBlobResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DelegatedTokenResponse {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
 struct GcsObjectResponse {
     bucket: String,
     name: String,
@@ -265,42 +271,31 @@ struct GcsObjectResponse {
     metadata: BTreeMap<String, String>,
 }
 
-struct UploadSigningMaterial {
-    canonical_uri: String,
-    canonical_query: String,
-    canonical_headers: String,
-    signed_headers: &'static str,
-    timestamp: String,
-    scope: String,
-    headers: BTreeMap<String, String>,
-}
-
-fn resumable_initiation_request(
+#[allow(clippy::too_many_arguments)]
+fn json_resumable_initiation_request(
     client: &reqwest::Client,
-    signed_url: String,
-    signed_headers: &BTreeMap<String, String>,
+    initiation_endpoint: &str,
+    delegated_token: &str,
+    object_key: &str,
+    media_type: &str,
+    byte_length: u64,
+    sha256: &str,
     browser_origin: Option<&str>,
 ) -> Result<reqwest::Request, ArtifactStorageError> {
-    let headers = signed_headers
-        .iter()
-        .map(|(name, value)| {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| ArtifactStorageError::InvalidResponse)?;
-            let value = reqwest::header::HeaderValue::from_str(value)
-                .map_err(|_| ArtifactStorageError::InvalidResponse)?;
-            Ok((name, value))
-        })
-        .collect::<Result<reqwest::header::HeaderMap, ArtifactStorageError>>()?;
     let mut request = client
-        .post(signed_url)
-        .headers(headers)
-        // GCS requires the initiation POST to declare its empty body. Without this header it
-        // rejects an otherwise valid signed request with 411 before evaluating the signature.
-        .header(
-            reqwest::header::CONTENT_LENGTH,
-            reqwest::header::HeaderValue::from_static("0"),
-        )
-        .body(Vec::new());
+        .post(initiation_endpoint)
+        .bearer_auth(delegated_token)
+        .query(&[
+            ("uploadType", "resumable"),
+            ("name", object_key),
+            ("ifGenerationMatch", "0"),
+        ])
+        .header("X-Upload-Content-Type", media_type)
+        .header("X-Upload-Content-Length", byte_length)
+        .json(&serde_json::json!({
+            "contentType": media_type,
+            "metadata": { "kratos-sha256": sha256 },
+        }));
     if let Some(origin) = browser_origin {
         request = request.header(reqwest::header::ORIGIN, origin);
     }
@@ -368,72 +363,6 @@ struct ReadSigningMaterial {
     scope: String,
 }
 
-fn upload_signing_material(
-    bucket: &str,
-    signer_service_account: &str,
-    object_key: &str,
-    media_type: &str,
-    byte_length: u64,
-    sha256: &str,
-    issued_at: DateTime<Utc>,
-) -> UploadSigningMaterial {
-    let date = issued_at.format("%Y%m%d").to_string();
-    let timestamp = issued_at.format("%Y%m%dT%H%M%SZ").to_string();
-    let scope = format!("{date}/auto/storage/goog4_request");
-    let credential = format!("{signer_service_account}/{scope}");
-    let signed_headers = "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length";
-    let canonical_uri = format!(
-        "/{}/{}",
-        percent_encode(bucket, false),
-        percent_encode(object_key, true)
-    );
-    let mut query = [
-        ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_owned()),
-        ("X-Goog-Credential", credential),
-        ("X-Goog-Date", timestamp.clone()),
-        ("X-Goog-Expires", AUTHORIZATION_LIFETIME_SECONDS.to_string()),
-        ("X-Goog-SignedHeaders", signed_headers.to_owned()),
-    ];
-    query.sort_by(|left, right| left.0.cmp(right.0));
-    let canonical_query = query
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "{}={}",
-                percent_encode(key, false),
-                percent_encode(value, false)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    let canonical_headers = format!(
-        "content-type:{media_type}\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-if-generation-match:0\nx-goog-meta-kratos-sha256:{sha256}\nx-goog-resumable:start\nx-upload-content-length:{byte_length}\n"
-    );
-    let headers = BTreeMap::from([
-        ("content-type".to_owned(), media_type.to_owned()),
-        (
-            "x-goog-content-sha256".to_owned(),
-            "UNSIGNED-PAYLOAD".to_owned(),
-        ),
-        ("x-goog-if-generation-match".to_owned(), "0".to_owned()),
-        ("x-goog-meta-kratos-sha256".to_owned(), sha256.to_owned()),
-        ("x-goog-resumable".to_owned(), "start".to_owned()),
-        (
-            "x-upload-content-length".to_owned(),
-            byte_length.to_string(),
-        ),
-    ]);
-    UploadSigningMaterial {
-        canonical_uri,
-        canonical_query,
-        canonical_headers,
-        signed_headers,
-        timestamp,
-        scope,
-        headers,
-    }
-}
-
 impl GoogleArtifactStorage {
     async fn access_token(&self) -> Result<String, ArtifactStorageError> {
         let response = self
@@ -478,6 +407,33 @@ impl GoogleArtifactStorage {
             .decode(response.signed_blob)
             .map_err(|_| ArtifactStorageError::InvalidResponse)
     }
+
+    async fn delegated_storage_token(&self) -> Result<String, ArtifactStorageError> {
+        let token = self.access_token().await?;
+        let signer = percent_encode(&self.signer_service_account, false);
+        let url = format!(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{signer}:generateAccessToken"
+        );
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "scope": ["https://www.googleapis.com/auth/devstorage.read_write"],
+                "lifetime": format!("{AUTHORIZATION_LIFETIME_SECONDS}s"),
+            }))
+            .send()
+            .await
+            .map_err(|_| ArtifactStorageError::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(ArtifactStorageError::Unavailable);
+        }
+        response
+            .json::<DelegatedTokenResponse>()
+            .await
+            .map(|response| response.access_token)
+            .map_err(|_| ArtifactStorageError::InvalidResponse)
+    }
 }
 
 #[async_trait]
@@ -491,36 +447,22 @@ impl ArtifactStorage for GoogleArtifactStorage {
         issued_at: DateTime<Utc>,
         browser_origin: Option<&str>,
     ) -> Result<ResumableUploadSession, ArtifactStorageError> {
-        let material = upload_signing_material(
-            &self.bucket,
-            &self.signer_service_account,
+        // The control plane delegates only object-creation authority to the upload signer, then
+        // uses the JSON resumable API to create the browser's one-object bearer session. This
+        // keeps signing authority server-side while following GCS's documented browser CORS path.
+        let token = self.delegated_storage_token().await?;
+        let initiation_endpoint = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{}/o",
+            percent_encode(&self.bucket, false)
+        );
+        let request = json_resumable_initiation_request(
+            &self.client,
+            &initiation_endpoint,
+            &token,
             object_key,
             media_type,
             byte_length,
             sha256,
-            issued_at,
-        );
-        let canonical_request = format!(
-            "POST\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
-            material.canonical_uri,
-            material.canonical_query,
-            material.canonical_headers,
-            material.signed_headers
-        );
-        let canonical_hash = hex_lower(&Sha256::digest(canonical_request.as_bytes()));
-        let string_to_sign = format!(
-            "GOOG4-RSA-SHA256\n{}\n{}\n{canonical_hash}",
-            material.timestamp, material.scope
-        );
-        let signature = hex_lower(&self.sign_blob(string_to_sign.as_bytes()).await?);
-        let signed_url = format!(
-            "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
-            material.canonical_uri, material.canonical_query
-        );
-        let request = resumable_initiation_request(
-            &self.client,
-            signed_url,
-            &material.headers,
             browser_origin,
         )?;
         let response = self
@@ -530,10 +472,8 @@ impl ArtifactStorage for GoogleArtifactStorage {
             .map_err(|_| ArtifactStorageError::Unavailable)?;
         if !response.status().is_success() {
             let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
             tracing::warn!(
                 %status,
-                gcs_error_code = xml_error_field(&error_body, "Code").unwrap_or("unknown"),
                 "Cloud Storage rejected resumable upload initiation"
             );
             return Err(ArtifactStorageError::Unavailable);
@@ -772,27 +712,9 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn xml_error_field<'a>(body: &'a str, field: &str) -> Option<&'a str> {
-    let start_tag = format!("<{field}>");
-    let end_tag = format!("</{field}>");
-    let value_start = body.find(&start_tag)? + start_tag.len();
-    let value_end = body[value_start..].find(&end_tag)? + value_start;
-    let value = body[value_start..value_end].trim();
-    (!value.is_empty()
-        && value.len() <= 128
-        && value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-        }))
-    .then_some(value)
-}
-
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
-
-    use super::{
-        percent_encode, resumable_initiation_request, upload_signing_material, xml_error_field,
-    };
+    use super::{json_resumable_initiation_request, percent_encode};
 
     #[test]
     fn encoding_preserves_only_canonical_path_separators() {
@@ -804,96 +726,38 @@ mod tests {
     }
 
     #[test]
-    fn xml_resumable_fixture_signs_generation_and_size_as_headers() {
-        let issued_at = DateTime::parse_from_rfc3339("2026-09-20T09:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let material = upload_signing_material(
-            "kratos-artifacts",
-            "upload@example.iam.gserviceaccount.com",
-            "v1/owners/owner/artifacts/object",
-            "application/octet-stream",
-            512,
-            &"b".repeat(64),
-            issued_at,
-        );
-
-        assert!(!material.canonical_query.contains("ifGenerationMatch"));
-        assert_eq!(
-            material.headers.get("x-goog-if-generation-match"),
-            Some(&"0".to_owned())
-        );
-        assert_eq!(
-            material.headers.get("x-upload-content-length"),
-            Some(&"512".to_owned())
-        );
-        assert_eq!(
-            material.canonical_headers,
-            format!(
-                "content-type:application/octet-stream\nhost:storage.googleapis.com\nx-goog-content-sha256:UNSIGNED-PAYLOAD\nx-goog-if-generation-match:0\nx-goog-meta-kratos-sha256:{}\nx-goog-resumable:start\nx-upload-content-length:512\n",
-                "b".repeat(64)
-            )
-        );
-        assert_eq!(
-            material.signed_headers,
-            "content-type;host;x-goog-content-sha256;x-goog-if-generation-match;x-goog-meta-kratos-sha256;x-goog-resumable;x-upload-content-length"
-        );
-    }
-
-    #[test]
-    fn resumable_initiation_declares_its_empty_body() {
-        let issued_at = DateTime::parse_from_rfc3339("2026-09-20T09:30:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let material = upload_signing_material(
-            "kratos-artifacts",
-            "upload@example.iam.gserviceaccount.com",
-            "v1/owners/owner/artifacts/object",
-            "application/octet-stream",
-            512,
-            &"b".repeat(64),
-            issued_at,
-        );
-
-        let request = resumable_initiation_request(
+    fn json_resumable_session_carries_object_guards_and_browser_origin() {
+        let request = json_resumable_initiation_request(
             &reqwest::Client::new(),
-            "https://storage.googleapis.com/kratos-artifacts/object?signed=true".to_owned(),
-            &material.headers,
+            "https://storage.googleapis.com/upload/storage/v1/b/kratos-artifacts/o",
+            "delegated-token",
+            "v1/projects/project/datasets/dataset/versions/version/files/meta/info.json",
+            "application/json",
+            512,
+            &"b".repeat(64),
             Some("https://kratos.example"),
         )
         .unwrap();
 
         assert_eq!(request.method(), reqwest::Method::POST);
-        assert_eq!(
-            request.headers().get(reqwest::header::CONTENT_LENGTH),
-            Some(&reqwest::header::HeaderValue::from_static("0"))
-        );
-        assert_eq!(
-            request.body().and_then(reqwest::Body::as_bytes),
-            Some(&[][..])
-        );
+        let query = request.url().query().unwrap();
+        assert!(query.contains("uploadType=resumable"));
+        assert!(query.contains("ifGenerationMatch=0"));
+        assert!(query.contains("name=v1%2Fprojects%2Fproject"));
         assert_eq!(
             request.headers().get(reqwest::header::ORIGIN),
             Some(&reqwest::header::HeaderValue::from_static(
                 "https://kratos.example"
             ))
         );
-    }
-
-    #[test]
-    fn extracts_only_bounded_machine_readable_storage_error_codes() {
         assert_eq!(
-            xml_error_field(
-                "<?xml version='1.0'?><Error><Code>SignatureDoesNotMatch</Code></Error>",
-                "Code"
-            ),
-            Some("SignatureDoesNotMatch")
+            request.headers().get("x-upload-content-length"),
+            Some(&reqwest::header::HeaderValue::from_static("512"))
         );
-        assert_eq!(
-            xml_error_field("<Error><Code>unsafe value</Code></Error>", "Code"),
-            None
-        );
-        assert_eq!(xml_error_field("<html>gateway error</html>", "Code"), None);
+        let body = request.body().and_then(reqwest::Body::as_bytes).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert_eq!(body["contentType"], "application/json");
+        assert_eq!(body["metadata"]["kratos-sha256"], "b".repeat(64));
     }
 }
 
