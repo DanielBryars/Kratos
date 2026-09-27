@@ -76,6 +76,20 @@ pub trait ArtifactStorage: Send + Sync {
 
     async fn cancel_resumable_upload(&self, session_uri: &str) -> Result<(), ArtifactStorageError>;
 
+    /// A URL that reads one object and expires.
+    ///
+    /// The console never receives a bucket credential or a durable object location: it is given
+    /// a URL that reaches exactly one object, for a few minutes, and nothing else. A viewer that
+    /// held a bucket-scoped token could read every dataset in the project, including ones its
+    /// operator was never shown.
+    async fn signed_read_url(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        lifetime_seconds: u32,
+        issued_at: DateTime<Utc>,
+    ) -> Result<String, ArtifactStorageError>;
+
     fn bucket(&self) -> &str;
 }
 
@@ -116,6 +130,22 @@ impl ArtifactStorageClient {
         generation: i64,
     ) -> Result<StoredObjectMetadata, ArtifactStorageError> {
         self.0.object_metadata(bucket, object_key, generation).await
+    }
+
+    /// A URL that reads one object and expires.
+    ///
+    /// # Errors
+    /// Returns an error when the object cannot be signed for, or the signer is unavailable.
+    pub async fn signed_read_url(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        lifetime_seconds: u32,
+        issued_at: DateTime<Utc>,
+    ) -> Result<String, ArtifactStorageError> {
+        self.0
+            .signed_read_url(bucket, object_key, lifetime_seconds, issued_at)
+            .await
     }
 
     /// Protects a verified object from the unverified-upload lifecycle rule.
@@ -263,6 +293,65 @@ fn resumable_initiation_request(
         .body(Vec::new())
         .build()
         .map_err(|_| ArtifactStorageError::InvalidResponse)
+}
+
+/// The canonical request for a V4-signed GET, which is the same shape as the upload signature
+/// with everything the upload needed removed.
+///
+/// A read is signed over the host header alone. Every extra signed header is a way for the
+/// request to fail after the URL has already been handed out, and a read needs none of them.
+fn read_signing_material(
+    bucket: &str,
+    signer_service_account: &str,
+    object_key: &str,
+    lifetime_seconds: u32,
+    issued_at: DateTime<Utc>,
+) -> ReadSigningMaterial {
+    let date = issued_at.format("%Y%m%d").to_string();
+    let timestamp = issued_at.format("%Y%m%dT%H%M%SZ").to_string();
+    let scope = format!("{date}/auto/storage/goog4_request");
+    let credential = format!("{signer_service_account}/{scope}");
+    let canonical_uri = format!(
+        "/{}/{}",
+        percent_encode(bucket, false),
+        percent_encode(object_key, true)
+    );
+    let mut query = [
+        ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_owned()),
+        ("X-Goog-Credential", credential),
+        ("X-Goog-Date", timestamp.clone()),
+        ("X-Goog-Expires", lifetime_seconds.to_string()),
+        ("X-Goog-SignedHeaders", "host".to_owned()),
+    ];
+    query.sort_by(|left, right| left.0.cmp(right.0));
+    let canonical_query = query
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{}={}",
+                percent_encode(key, false),
+                percent_encode(value, false)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    ReadSigningMaterial {
+        canonical_uri,
+        canonical_query,
+        canonical_headers: "host:storage.googleapis.com
+"
+        .to_owned(),
+        timestamp,
+        scope,
+    }
+}
+
+struct ReadSigningMaterial {
+    canonical_uri: String,
+    canonical_query: String,
+    canonical_headers: String,
+    timestamp: String,
+    scope: String,
 }
 
 fn upload_signing_material(
@@ -496,6 +585,44 @@ impl ArtifactStorage for GoogleArtifactStorage {
         })
     }
 
+    async fn signed_read_url(
+        &self,
+        bucket: &str,
+        object_key: &str,
+        lifetime_seconds: u32,
+        issued_at: DateTime<Utc>,
+    ) -> Result<String, ArtifactStorageError> {
+        let material = read_signing_material(
+            bucket,
+            &self.signer_service_account,
+            object_key,
+            lifetime_seconds,
+            issued_at,
+        );
+        let canonical_request = format!(
+            "GET
+{}
+{}
+{}
+host
+UNSIGNED-PAYLOAD",
+            material.canonical_uri, material.canonical_query, material.canonical_headers
+        );
+        let canonical_hash = hex_lower(&Sha256::digest(canonical_request.as_bytes()));
+        let string_to_sign = format!(
+            "GOOG4-RSA-SHA256
+{}
+{}
+{canonical_hash}",
+            material.timestamp, material.scope
+        );
+        let signature = hex_lower(&self.sign_blob(string_to_sign.as_bytes()).await?);
+        Ok(format!(
+            "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
+            material.canonical_uri, material.canonical_query
+        ))
+    }
+
     fn bucket(&self) -> &str {
         &self.bucket
     }
@@ -727,5 +854,77 @@ mod tests {
             None
         );
         assert_eq!(xml_error_field("<html>gateway error</html>", "Code"), None);
+    }
+}
+
+#[cfg(test)]
+mod read_signature_tests {
+    use super::*;
+
+    fn material() -> ReadSigningMaterial {
+        read_signing_material(
+            "kratos-datasets",
+            "kratos-signer@example.iam.gserviceaccount.com",
+            "v1/projects/p/datasets/d/versions/v/files/f",
+            300,
+            DateTime::parse_from_rfc3339("2026-09-22T08:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+    }
+
+    #[test]
+    fn signs_over_the_host_header_only() {
+        let material = material();
+        assert_eq!(material.canonical_headers, "host:storage.googleapis.com\n");
+        assert!(
+            material
+                .canonical_query
+                .contains("X-Goog-SignedHeaders=host"),
+            "a read should sign nothing but the host: {}",
+            material.canonical_query
+        );
+    }
+
+    /// The expiry is the whole safety property. A signed read URL is a bearer capability for one
+    /// object, so its lifetime is what bounds the damage if it is copied out of the browser.
+    #[test]
+    fn carries_the_requested_lifetime() {
+        assert!(
+            material().canonical_query.contains("X-Goog-Expires=300"),
+            "the lifetime must reach the signature"
+        );
+    }
+
+    /// The query must be in sorted order and percent-encoded, because the signature is computed
+    /// over this exact string. A difference here does not fail loudly -- it produces a URL that
+    /// Google rejects at the moment a person clicks it.
+    #[test]
+    fn the_canonical_query_is_sorted_and_encoded() {
+        let query = material().canonical_query;
+        let keys: Vec<&str> = query
+            .split('&')
+            .map(|pair| pair.split('=').next().unwrap())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "query parameters must be sorted: {query}");
+        assert!(
+            query.contains("kratos-signer%40example.iam.gserviceaccount.com"),
+            "the credential must be percent-encoded: {query}"
+        );
+        assert!(
+            !query.contains("X-Goog-Signature"),
+            "the signature is appended after signing, never signed over itself"
+        );
+    }
+
+    /// The object key is encoded as a path, so its slashes survive.
+    #[test]
+    fn the_object_path_keeps_its_slashes() {
+        assert_eq!(
+            material().canonical_uri,
+            "/kratos-datasets/v1/projects/p/datasets/d/versions/v/files/f"
+        );
     }
 }

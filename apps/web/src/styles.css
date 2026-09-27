@@ -168,6 +168,7 @@ input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(102, 171, 25
 .contract-state { padding: 5px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--subtle); font-size: .65rem; text-transform: uppercase; }
 .contract-state--enabled { border-color: rgba(99, 215, 160, .32); color: var(--green); }
 .output-help { color: var(--subtle); font-size: 0.78rem; }
+.dataset-viewer { width: 100%; min-height: 720px; border: 1px solid var(--line); border-radius: 10px; background: #080b0f; }
 .output-help code { color: #b4c8db; }
 .output-fields { display: grid; grid-template-columns: 1fr .7fr 1.2fr .7fr; gap: 11px; }
 

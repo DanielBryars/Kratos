@@ -19,3 +19,4 @@ terraform.tfvars
 *.auto.tfvars
 /infrastructure/bootstrap/backend_override.tf
 .DS_Store
+/.pnpm-store/

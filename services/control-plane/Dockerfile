@@ -3,9 +3,11 @@ WORKDIR /src
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/web/package.json apps/web/package.json
+COPY apps/leroboscope/package.json apps/leroboscope/package.json
 RUN pnpm install --frozen-lockfile
 COPY apps/web apps/web
-RUN pnpm web:build
+COPY apps/leroboscope apps/leroboscope
+RUN pnpm web:build && pnpm leroboscope:build && mkdir -p apps/web/dist/leroboscope && cp -R apps/leroboscope/dist/. apps/web/dist/leroboscope/
 
 FROM rust:1.90-bookworm AS api-builder
 WORKDIR /src

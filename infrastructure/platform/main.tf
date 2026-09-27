@@ -71,6 +71,13 @@ resource "google_storage_bucket" "artifacts" {
   public_access_prevention    = "enforced"
   force_destroy               = false
 
+  cors {
+    origin          = var.artifact_browser_origins
+    method          = ["GET", "HEAD", "PUT", "OPTIONS"]
+    response_header = ["Content-Type", "Content-Range", "ETag", "Range", "x-goog-generation"]
+    max_age_seconds = 3600
+  }
+
   lifecycle_rule {
     condition {
       age            = 7

@@ -20,3 +20,16 @@ variable "database_deletion_protection" {
   type        = bool
   default     = true
 }
+
+variable "artifact_browser_origins" {
+  description = "Exact browser origins allowed to upload and preview dataset objects directly."
+  type        = list(string)
+  default     = ["https://kratos.bryars.com"]
+
+  validation {
+    condition = alltrue([
+      for origin in var.artifact_browser_origins : startswith(origin, "https://") && !endswith(origin, "/")
+    ])
+    error_message = "Artifact browser origins must be exact HTTPS origins without a trailing slash."
+  }
+}

@@ -1501,6 +1501,18 @@ mod tests {
             })
         }
 
+        async fn signed_read_url(
+            &self,
+            bucket: &str,
+            object_key: &str,
+            lifetime_seconds: u32,
+            _issued_at: chrono::DateTime<Utc>,
+        ) -> Result<String, ArtifactStorageError> {
+            Ok(format!(
+                "https://storage.example.test/read/{bucket}/{object_key}?expires_in={lifetime_seconds}"
+            ))
+        }
+
         fn bucket(&self) -> &str {
             &self.bucket
         }

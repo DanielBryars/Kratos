@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Leroboscope</title>
+  <!-- COOP/COEP headers via service worker (needed for SharedArrayBuffer on GitHub Pages) -->
+  <script src="coi-serviceworker.min.js"></script>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --surface: #16213e;
+      --surface2: #0f3460;
+      --accent: #e94560;
+      --text: #eee;
+      --text-dim: #aaa;
+      --border: #333;
+      --sidebar-w: 160px;
+      --right-w: 260px;
+      --chart-h: 160px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      height: 100vh;
+    }
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* --- Header --- */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 18px; font-weight: 600; white-space: nowrap; }
+    .dataset-input {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex: 1;
+      min-width: 0;
+    }
+    .dataset-input input {
+      flex: 1;
+      min-width: 200px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+    .dataset-input input::placeholder { color: var(--text-dim); }
+    .dataset-input button, .controls button {
+      padding: 6px 14px;
+      border-radius: 4px;
+      border: none;
+      background: var(--accent);
+      color: white;
+      font-size: 13px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .dataset-input button:hover, .controls button:hover { filter: brightness(1.1); }
+    .dataset-input button:disabled, .controls button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .dataset-meta { font-size: 11px; color: var(--text-dim); padding: 0 4px; white-space: nowrap; }
+
+    /* --- Main area: sidebar + center + right --- */
+    .main-area {
+      flex: 1;
+      display: flex;
+      min-height: 0;
+    }
+
+    /* --- Episode sidebar --- */
+    .sidebar {
+      width: var(--sidebar-w);
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+    }
+    .sidebar-header {
+      padding: 8px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+    }
+    #episode-list {
+      flex: 1;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+    #episode-list::-webkit-scrollbar { width: 6px; }
+    #episode-list::-webkit-scrollbar-track { background: transparent; }
+    #episode-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .episode-item {
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      transition: background 0.1s;
+    }
+    .episode-item:hover { background: var(--surface2); }
+    .episode-item[data-decision="included"] { border-left: 3px solid #58c792; }
+    .episode-item[data-decision="excluded"] { border-left: 3px solid #e94560; opacity: .68; }
+    .episode-item[data-decision="needs_review"] { border-left: 3px solid #e8bd61; }
+    .curation-panel { display: grid; gap: 7px; padding: 9px; border-top: 1px solid var(--border); }
+    .curation-panel[hidden] { display: none; }
+    .curation-panel input { min-width: 0; width: 100%; padding: 7px; border: 1px solid var(--border); border-radius: 4px; color: var(--text); background: var(--surface2); }
+    .curation-actions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+    .curation-actions button { min-width: 0; padding: 6px 2px; border: 1px solid var(--border); border-radius: 4px; color: var(--text); background: var(--surface2); cursor: pointer; }
+    .curation-state { color: var(--text-dim); font-size: 11px; text-transform: capitalize; }
+    .episode-item.active { background: var(--accent); color: white; font-weight: 500; }
+
+    /* --- Center column: viewport + chart --- */
+    .center-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+    #viewport {
+      flex: 1;
+      position: relative;
+      min-height: 0;
+    }
+    #viewport canvas { width: 100%; height: 100%; display: block; }
+
+    #chart-panel {
+      height: var(--chart-h);
+      border-top: 1px solid var(--border);
+      background: #111;
+      flex-shrink: 0;
+    }
+
+    /* --- Right panel: cameras --- */
+    .right-panel {
+      width: var(--right-w);
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      overflow-y: auto;
+    }
+    .right-panel .sidebar-header {
+      flex-shrink: 0;
+    }
+    #camera-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 4px;
+    }
+    .camera-wrapper {
+      margin-bottom: 4px;
+    }
+    .camera-label {
+      font-size: 11px;
+      color: var(--text-dim);
+      padding: 2px 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .camera-video {
+      width: 100%;
+      display: block;
+      background: #000;
+      border-radius: 3px;
+    }
+
+    /* --- Status overlay --- */
+    #status-overlay {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.85);
+      padding: 24px 32px;
+      border-radius: 8px;
+      text-align: center;
+      z-index: 10;
+      max-width: 500px;
+    }
+    #status-overlay.hidden { display: none; }
+    #status-overlay .spinner {
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #status-overlay .status-text { font-size: 14px; color: var(--text); }
+    #status-overlay .error-text { font-size: 14px; color: var(--accent); }
+
+    /* --- Bottom controls --- */
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 16px;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .controls .btn-group { display: flex; gap: 4px; }
+    .controls button { padding: 4px 10px; font-size: 16px; line-height: 1; min-width: 32px; }
+    .timeline { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .timeline input[type="range"] { flex: 1; accent-color: var(--accent); height: 4px; }
+    .timeline .frame-info {
+      font-size: 12px; color: var(--text-dim);
+      white-space: nowrap; min-width: 100px; text-align: right;
+    }
+    .ctrl-group { display: flex; align-items: center; gap: 4px; }
+    .ctrl-group label { font-size: 12px; color: var(--text-dim); }
+    .ctrl-group select {
+      padding: 3px 6px; font-size: 12px; border-radius: 4px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    }
+
+    /* --- Repeat button --- */
+    .controls button.repeat-btn {
+      color: var(--text-dim);
+      background: transparent;
+      border: 1px solid transparent;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 6px;
+      transition: color 0.15s;
+    }
+    .controls button.repeat-btn:hover {
+      color: var(--text);
+      filter: none;
+    }
+    .controls button.repeat-btn.active {
+      color: var(--accent);
+    }
+
+    /* --- Landing page overlay --- */
+    #landing-page {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      transition: opacity 0.5s ease;
+    }
+    #landing-page.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    #landing-page.removed {
+      display: none;
+    }
+    .landing-content {
+      text-align: center;
+      max-width: 500px;
+      padding: 24px;
+    }
+    .landing-robot {
+      width: 280px;
+      max-width: 60vw;
+      margin-bottom: 24px;
+    }
+    .landing-title {
+      font-size: 28px;
+      font-weight: 700;
+      color: #1a1a2e;
+      margin-bottom: 4px;
+    }
+    .landing-author {
+      font-size: 16px;
+      color: #555;
+      margin-bottom: 16px;
+    }
+    .landing-links {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+    }
+    .landing-links a {
+      color: #0077b5;
+      text-decoration: none;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      transition: color 0.15s;
+    }
+    .landing-links a:hover {
+      color: #005582;
+      text-decoration: underline;
+    }
+    .landing-links a.github-link { color: #333; }
+    .landing-links a.github-link:hover { color: #000; }
+    .landing-links a.hf-link { color: #ff9d00; }
+    .landing-links a.hf-link:hover { color: #cc7d00; }
+    .landing-spinner {
+      border: 3px solid #ddd;
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      animation: spin 0.8s linear infinite;
+      margin: 0 auto 8px;
+    }
+    .landing-status {
+      font-size: 13px;
+      color: #888;
+    }
+    #landing-enter {
+      display: none;
+      padding: 10px 32px;
+      font-size: 16px;
+      font-weight: 600;
+      border: none;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      transition: filter 0.15s;
+    }
+    #landing-enter:hover { filter: brightness(1.1); }
+
+    /* --- About button in header --- */
+    .about-btn {
+      background: transparent !important;
+      border: 1px solid var(--border) !important;
+      color: var(--text-dim) !important;
+      padding: 4px 10px !important;
+      font-size: 12px !important;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .about-btn:hover {
+      color: var(--text) !important;
+      border-color: var(--text-dim) !important;
+      filter: none !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="landing-page">
+    <div class="landing-content">
+      <img src="/src/images/WireframeSO100.png" alt="SO-100 Robot" class="landing-robot" />
+      <div class="landing-title">Leroboscope</div>
+      <div class="landing-author">Daniel Bryars</div>
+      <div class="landing-links">
+        <a href="https://www.linkedin.com/in/danielbryars/" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433a2.062 2.062 0 0 1-2.063-2.065 2.064 2.064 0 1 1 2.063 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>
+          LinkedIn
+        </a>
+        <a href="https://github.com/DanielBryars" target="_blank" rel="noopener" class="github-link">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0 1 12 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/></svg>
+          GitHub
+        </a>
+        <a href="https://lerobot-visualize-dataset.hf.space/" target="_blank" rel="noopener" class="hf-link">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="8" r="3.5"/><circle cx="6" cy="14" r="2.5"/><circle cx="18" cy="14" r="2.5"/><path d="M3 20c0-3.5 3-5.5 5-5.5s3 1.5 4 3c1-1.5 2-3 4-3s5 2 5 5.5"/></svg>
+          Official HF Viewer
+        </a>
+      </div>
+      <div id="landing-loading">
+        <div class="landing-spinner"></div>
+        <div class="landing-status">Initializing...</div>
+      </div>
+      <button id="landing-enter">Enter</button>
+    </div>
+  </div>
+  <div id="app">
+    <header>
+      <h1>Leroboscope</h1>
+      <div class="dataset-input">
+        <select id="scene-select" title="MuJoCo scene"></select>
+        <input id="dataset-id" type="text" placeholder="HF dataset ID (e.g. danbhf/sim_pick_place_2pos_200ep_v2)" />
+        <button id="load-btn" disabled>Load</button>
+      </div>
+      <span id="dataset-meta" class="dataset-meta"></span>
+      <button id="about-btn" class="about-btn" title="About Leroboscope">About</button>
+    </header>
+    <div class="main-area">
+      <div class="sidebar">
+        <div class="sidebar-header">Episodes</div>
+        <div id="episode-list"></div>
+        <div id="curation-panel" class="curation-panel" hidden>
+          <span id="curation-state" class="curation-state">Not reviewed</span>
+          <input id="curation-note" maxlength="2000" placeholder="Optional review note" />
+          <div class="curation-actions">
+            <button data-decision="included" title="Include this episode">Keep</button>
+            <button data-decision="needs_review" title="Flag this episode for another review">Review</button>
+            <button data-decision="excluded" title="Exclude this episode">Exclude</button>
+          </div>
+        </div>
+      </div>
+      <div class="center-col">
+        <div id="viewport">
+          <div id="status-overlay">
+            <div class="spinner"></div>
+            <div class="status-text">Initializing MuJoCo...</div>
+          </div>
+        </div>
+        <div id="chart-panel"></div>
+      </div>
+      <div class="right-panel">
+        <div class="sidebar-header">Cameras</div>
+        <div id="camera-container"></div>
+      </div>
+    </div>
+    <div class="controls">
+      <div class="btn-group">
+        <button id="prev-frame" title="Previous frame [Left arrow]">&laquo;</button>
+        <button id="play-pause" title="Play/Pause [Space]">&#9654;</button>
+        <button id="next-frame" title="Next frame [Right arrow]">&raquo;</button>
+        <button id="repeat-btn" class="repeat-btn active" title="Repeat: One"></button>
+      </div>
+      <div class="timeline">
+        <input id="timeline" type="range" min="0" max="0" value="0" step="1" />
+        <span id="frame-info" class="frame-info">-- / --</span>
+      </div>
+      <div class="ctrl-group">
+        <label>Speed:</label>
+        <select id="speed-select">
+          <option value="0.25">0.25x</option>
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="4">4x</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <label>Data:</label>
+        <select id="data-source-select">
+          <option value="action" selected>Action</option>
+          <option value="state">Obs. State</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <label>Units:</label>
+        <select id="units-select">
+          <option value="normalized" selected>Normalized [-100,100]</option>
+          <option value="degrees">Degrees (grip 0-100)</option>
+          <option value="radians">Radians</option>
+        </select>
+      </div>
+      <div class="ctrl-group">
+        <label><input id="fov-toggle" type="checkbox" checked /> FOV</label>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

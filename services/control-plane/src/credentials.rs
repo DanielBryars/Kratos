@@ -17,6 +17,12 @@ pub enum CredentialKind {
     /// Invites a person into a project. Distinct from the others so that presenting one
     /// where another is expected is rejected on its prefix, before any hashing.
     Invitation,
+    /// Reads the files of one dataset version, for a few minutes, from the browser.
+    ///
+    /// The weakest credential Kratos issues, and deliberately so: it grants reading one
+    /// version's files and nothing else, it expires in minutes, and it is the only credential a
+    /// dataset viewer ever holds. It exists so that no bucket-scoped token has to.
+    DatasetPreview,
 }
 
 impl CredentialKind {
@@ -25,6 +31,7 @@ impl CredentialKind {
             Self::Enrolment => "ken",
             Self::Worker => "kwc",
             Self::Invitation => "kin",
+            Self::DatasetPreview => "kpv",
         }
     }
 }

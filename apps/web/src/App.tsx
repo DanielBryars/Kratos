@@ -8,7 +8,7 @@ import {
   type Auth,
   type User,
 } from "firebase/auth";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   buildInvitationLink,
@@ -25,6 +25,16 @@ import {
   type OutputRequirement,
 } from "./artifactPresentation";
 import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
+import {
+  buildDeclaration,
+  describeVersionStatus,
+  manifestProblems,
+  storageGeneration,
+  uploadProgress,
+  type DeclaredFile,
+  type PickedFile,
+  type UploadState,
+} from "./datasetUpload";
 
 type Version = { name: string; version: string };
 type ExternalLinks = { grafana_url: string | null; mlflow_url: string | null };
@@ -89,6 +99,50 @@ type Job = {
     structured_result: Record<string, unknown> | null;
   } | null;
   artifacts: Artifact[];
+};
+type DatasetFile = {
+  id: string;
+  logical_path: string;
+  byte_length: number;
+  status: string;
+};
+type DatasetVersion = {
+  id: string;
+  version_number: number;
+  source_kind: string;
+  status: string;
+  resolved_revision: string | null;
+  info: Record<string, unknown>;
+  total_episodes: number;
+  total_frames: number;
+  files: DatasetFile[];
+  curations: Record<string, string>;
+};
+type Dataset = {
+  id: string;
+  name: string;
+  description: string | null;
+  versions: DatasetVersion[];
+};
+type PreviewSession = {
+  preview_id: string;
+  version_id: string;
+  preview_token: string;
+  files_base_url: string;
+  expires_at: string;
+  id_token: string;
+  dataset_name: string;
+  revision: string;
+  info: Record<string, unknown>;
+  curations: Record<string, string>;
+};
+type DatasetView = {
+  id: string;
+  version_id: string;
+  name: string;
+  manifest_sha256: string;
+  included_episode_count: number;
+  created_at: string;
 };
 type ApiError = { message?: string };
 
@@ -179,6 +233,21 @@ export function App() {
   const [invitations, setInvitations] = useState<PendingInvitation[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
   const [peopleActionId, setPeopleActionId] = useState<string | null>(null);
+  const [datasets, setDatasets] = useState<Dataset[]>([]);
+  const [datasetName, setDatasetName] = useState("");
+  const [hfRepository, setHfRepository] = useState("lerobot/svla_so101_pickplace");
+  const [hfRevision, setHfRevision] = useState("main");
+  const [datasetAction, setDatasetAction] = useState<"idle" | "importing" | "uploading">("idle");
+  const [datasetMessage, setDatasetMessage] = useState<string | null>(null);
+  // Upload progress lives here rather than in the DOM so a re-render cannot lose it, and so the
+  // byte-weighted total is computed from the same list the rows are drawn from.
+  const [uploadFiles, setUploadFiles] = useState<Array<{ path: string; byteLength: number; state: UploadState }>>([]);
+  // The preview token is held in memory only, exactly as the invitation credential is: it is a
+  // capability, and it has no reason to survive the tab.
+  const [preview, setPreview] = useState<PreviewSession | null>(null);
+  const [viewName, setViewName] = useState("");
+  const [publishingView, setPublishingView] = useState(false);
+  const viewerFrame = useRef<HTMLIFrameElement | null>(null);
   const durableOutputValid = !durableOutputEnabled || (
     durableOutputPath.trim().length > 0
     && durableOutputRole.trim().length > 0
@@ -230,25 +299,28 @@ export function App() {
         if (stopped) return;
         const headers = { Authorization: `Bearer ${idToken}` };
         const request = { headers, signal: controller.signal };
-        const [pendingResponse, workersResponse, jobsResponse, membersResponse, invitationsResponse] = await Promise.all([
+        const [pendingResponse, workersResponse, jobsResponse, membersResponse, invitationsResponse, datasetsResponse] = await Promise.all([
           fetch("/api/v1/operator/worker-registration-requests", request),
           fetch("/api/v1/operator/workers", request),
           fetch("/api/v1/operator/jobs", request),
           fetch("/api/v1/operator/project-members", request),
           fetch("/api/v1/operator/project-invitations", request),
+          fetch("/api/v1/operator/datasets", request),
         ]);
-        const [nextPending, nextWorkers, nextJobs, nextMembers, nextInvitations] = await Promise.all([
+        const [nextPending, nextWorkers, nextJobs, nextMembers, nextInvitations, nextDatasets] = await Promise.all([
           pendingResponse.ok ? pendingResponse.json() as Promise<PendingRegistration[]> : null,
           workersResponse.ok ? workersResponse.json() as Promise<Worker[]> : null,
           jobsResponse.ok ? jobsResponse.json() as Promise<Job[]> : null,
           membersResponse.ok ? membersResponse.json() as Promise<Member[]> : null,
           invitationsResponse.ok ? invitationsResponse.json() as Promise<PendingInvitation[]> : null,
+          datasetsResponse.ok ? datasetsResponse.json() as Promise<Dataset[]> : null,
         ]);
         if (stopped) return;
         if (nextPending) setPending(nextPending);
         if (nextWorkers) setWorkers(nextWorkers);
         if (nextMembers) setMembers(nextMembers);
         if (nextInvitations) setInvitations(nextInvitations);
+        if (nextDatasets) setDatasets(nextDatasets);
         if (nextJobs) {
           setJobs(nextJobs);
           setHasLoadedJobsSnapshot(true);
@@ -439,6 +511,268 @@ export function App() {
       setPeopleActionId(null);
     }
   }
+
+  /// SHA-256 of one file, computed incrementally outside the UI thread. Kratos verifies it again
+  /// against storage; bounded worker chunks keep a large video from exhausting the console tab.
+  async function hashFile(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL("./datasetHash.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent<{ type: "done"; hash: string } | { type: "error"; message: string }>) => {
+        worker.terminate();
+        if (event.data.type === "done") resolve(event.data.hash);
+        else reject(new Error(event.data.message));
+      };
+      worker.onerror = (event) => {
+        worker.terminate();
+        reject(new Error(event.message || `Could not hash ${file.name}`));
+      };
+      worker.postMessage({ file });
+    });
+  }
+
+  async function importHuggingFaceDataset() {
+    if (!user) return;
+    setDatasetAction("importing");
+    setDatasetMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/v1/operator/datasets/import-hugging-face", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: datasetName.trim() || hfRepository.trim(),
+          repository: hfRepository.trim(),
+          revision: hfRevision.trim() || "main",
+        }),
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      const created = (await response.json()) as Dataset;
+      // The resolved commit is the point of the import: a symbolic name is display metadata and
+      // never identifies a version.
+      const resolved = created.versions[0]?.resolved_revision ?? "unknown";
+      setDatasetMessage(`Imported ${created.name} at ${resolved.slice(0, 12)}.`);
+      setDatasetName("");
+    } catch (error) {
+      setDatasetMessage(error instanceof Error ? error.message : "The import failed.");
+    } finally {
+      setDatasetAction("idle");
+    }
+  }
+
+  /// Declare a picked folder, then hash, upload and verify each file.
+  ///
+  /// The folder is checked before anything is hashed. Hashing a multi-gigabyte dataset and then
+  /// being told the manifest was invalid wastes the one part of this that takes real time.
+  async function uploadDatasetFolder(selected: FileList | null) {
+    if (!user || !selected || selected.length === 0) return;
+    const files = Array.from(selected);
+    const picked: PickedFile[] = files.map((file) => ({
+      relativePath: file.webkitRelativePath || file.name,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+    }));
+    const problems = manifestProblems(picked);
+    if (problems.length > 0) {
+      setDatasetMessage(
+        `That folder cannot be uploaded: ${problems
+          .slice(0, 3)
+          .map((problem) => `${problem.path || "selection"} — ${problem.reason}`)
+          .join("; ")}${problems.length > 3 ? `; and ${problems.length - 3} more` : ""}`,
+      );
+      return;
+    }
+
+    setDatasetAction("uploading");
+    setDatasetMessage(null);
+    setUploadFiles(
+      picked.map((file) => ({ path: file.relativePath, byteLength: file.size, state: "hashing" })),
+    );
+    try {
+      const idToken = await user.getIdToken();
+      const hashes: string[] = [];
+      for (const file of files) {
+        hashes.push(await hashFile(file));
+      }
+      const declaration: DeclaredFile[] = buildDeclaration(picked, hashes);
+      const infoFile = files[picked.findIndex((file) => file.relativePath.endsWith("meta/info.json"))];
+      const info = JSON.parse(await infoFile.text()) as unknown;
+
+      const declared = await fetch("/api/v1/operator/datasets/upload", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: datasetName.trim() || picked[0].relativePath.split("/")[0],
+          info,
+          files: declaration,
+        }),
+      });
+      if (!declared.ok) {
+        const error = (await declared.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Declaration failed with ${declared.status}`);
+      }
+      const dataset = (await declared.json()) as Dataset;
+      const version = dataset.versions[dataset.versions.length - 1];
+
+      for (const [index, declaredFile] of declaration.entries()) {
+        const target = version.files.find((file) => file.logical_path === declaredFile.logical_path);
+        if (!target) throw new Error(`Kratos did not declare ${declaredFile.logical_path}`);
+        setUploadFiles((current) =>
+          current.map((entry, position) =>
+            position === index ? { ...entry, state: "uploading" } : entry,
+          ),
+        );
+        const session = await fetch(`/api/v1/operator/dataset-files/${target.id}/upload`, {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+          body: "{}",
+        });
+        if (!session.ok) throw new Error(`Could not begin ${declaredFile.logical_path}`);
+        const { upload } = (await session.json()) as {
+          file_id: string;
+          upload: { uri: string; method: string; expires_at: string };
+        };
+        // Straight to storage: the bytes never pass through the control plane.
+        const put = await fetch(upload.uri, { method: upload.method, body: files[index] });
+        if (!put.ok) throw new Error(`Storage refused ${declaredFile.logical_path}`);
+        const generation = await storageGeneration(put);
+        const completed = await fetch(`/api/v1/operator/dataset-files/${target.id}/complete`, {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ generation }),
+        });
+        setUploadFiles((current) =>
+          current.map((entry, position) =>
+            position === index
+              ? { ...entry, state: completed.ok ? "verified" : "rejected" }
+              : entry,
+          ),
+        );
+        if (!completed.ok) {
+          const error = (await completed.json().catch(() => ({}))) as ApiError;
+          throw new Error(
+            error.message ?? `${declaredFile.logical_path} did not match its declaration`,
+          );
+        }
+      }
+      setDatasetMessage("Upload verified. The version is ready.");
+      setDatasetName("");
+    } catch (error) {
+      setDatasetMessage(error instanceof Error ? error.message : "The upload failed.");
+    } finally {
+      setDatasetAction("idle");
+    }
+  }
+
+  /// Open a preview session and launch the viewer against it.
+  ///
+  /// The viewer is given the short-lived preview base URL and token, and never a bucket credential
+  /// or a durable object location.
+  async function openViewer(dataset: Dataset, version: DatasetVersion) {
+    if (!user) return;
+    setDatasetMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(
+        `/api/v1/operator/dataset-versions/${version.id}/preview`,
+        { method: "POST", headers: { Authorization: `Bearer ${idToken}` } },
+      );
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Preview failed with ${response.status}`);
+      }
+      const session = await response.json() as Omit<PreviewSession, "id_token" | "dataset_name" | "revision" | "info" | "curations">;
+      setPreview({
+        ...session,
+        id_token: idToken,
+        dataset_name: dataset.name,
+        revision: version.resolved_revision ?? `v${version.version_number}`,
+        info: version.info,
+        curations: version.curations,
+      });
+      setViewName(`${dataset.name} curated`);
+    } catch (error) {
+      setDatasetMessage(error instanceof Error ? error.message : "The preview could not be opened.");
+    }
+  }
+
+  async function publishDatasetView() {
+    if (!user || !preview || publishingView) return;
+    const name = viewName.trim();
+    if (!name) {
+      setDatasetMessage("Give the curated view a name first.");
+      return;
+    }
+    setPublishingView(true);
+    setDatasetMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(
+        `/api/v1/operator/dataset-versions/${preview.version_id}/views`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        },
+      );
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(
+          error.message
+            ?? (response.status === 400
+              ? "Include at least one episode before publishing a curated view."
+              : `Publishing failed with ${response.status}`),
+        );
+      }
+      const view = await response.json() as DatasetView;
+      setDatasetMessage(
+        `Published ${view.name}: ${view.included_episode_count} included episodes · ${view.manifest_sha256.slice(0, 12)}.`,
+      );
+    } catch (error) {
+      setDatasetMessage(error instanceof Error ? error.message : "The curated view could not be published.");
+    } finally {
+      setPublishingView(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!preview) return undefined;
+    const sendContext = () => {
+      viewerFrame.current?.contentWindow?.postMessage(
+        {
+          type: "kratos:review-context",
+          versionId: preview.version_id,
+          idToken: preview.id_token,
+          decisions: preview.curations,
+          source: {
+            kind: "uploaded",
+            label: preview.dataset_name,
+            revision: preview.revision,
+            info: preview.info,
+            fileBaseUrl: preview.files_base_url,
+            previewToken: preview.preview_token,
+          },
+        },
+        window.location.origin,
+      );
+    };
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (
+        event.origin === window.location.origin
+        && event.source === viewerFrame.current?.contentWindow
+        && typeof event.data === "object"
+        && event.data !== null
+        && (event.data as { type?: unknown }).type === "kratos:review-ready"
+      ) {
+        sendContext();
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [preview]);
 
   async function createEnrolment() {
     if (!user) return;
@@ -839,6 +1173,135 @@ export function App() {
                   <p>Expires {new Date(enrolment.expires_at).toLocaleString()}.</p>
                 </div>
               )}
+              </div>
+              <div className="registration-section">
+                <div><p className="label">Datasets</p><h3>Training inputs</h3></div>
+                <p className="people-note">
+                  A dataset version is immutable once ready. Importing a Hugging Face revision
+                  records the exact commit, not the branch name, so a run can be repeated.
+                </p>
+                <div className="form-row">
+                  <label htmlFor="dataset-name">Name</label>
+                  <input
+                    id="dataset-name"
+                    value={datasetName}
+                    placeholder="Defaults to the repository or folder name"
+                    onChange={(event) => setDatasetName(event.target.value)}
+                  />
+                </div>
+                <div className="form-row">
+                  <label htmlFor="hf-repository">Hugging Face</label>
+                  <input
+                    id="hf-repository"
+                    value={hfRepository}
+                    onChange={(event) => setHfRepository(event.target.value)}
+                  />
+                  <input
+                    aria-label="Revision"
+                    value={hfRevision}
+                    onChange={(event) => setHfRevision(event.target.value)}
+                  />
+                  <button type="button" onClick={importHuggingFaceDataset} disabled={datasetAction !== "idle"}>
+                    {datasetAction === "importing" ? "Importing…" : "Import revision"}
+                  </button>
+                </div>
+                <div className="form-row">
+                  <label htmlFor="dataset-folder">Upload a folder</label>
+                  <input
+                    id="dataset-folder"
+                    type="file"
+                    multiple
+                    ref={(element) => {
+                      // Directory picking is not in the React types, and is the only way to get
+                      // webkitRelativePath, which is what makes a LeRobot layout recoverable.
+                      if (element) element.setAttribute("webkitdirectory", "");
+                    }}
+                    disabled={datasetAction !== "idle"}
+                    onChange={(event) => void uploadDatasetFolder(event.target.files)}
+                  />
+                </div>
+                {uploadFiles.length > 0 && (
+                  <div className="credential" aria-live="polite">
+                    <div>
+                      <p className="label">{uploadProgress(uploadFiles).label}</p>
+                      <progress value={uploadProgress(uploadFiles).fraction} max={1} />
+                    </div>
+                    <p>
+                      {uploadFiles.filter((file) => file.state === "verified").length} of{" "}
+                      {uploadFiles.length} files verified.
+                    </p>
+                  </div>
+                )}
+                {datasetMessage && <p className="notice" role="status">{datasetMessage}</p>}
+                {preview && (
+                  <div className="credential" aria-live="polite">
+                    <div>
+                      <p className="label">Viewer session</p>
+                      <code>{preview.files_base_url}</code>
+                    </div>
+                    <p>Expires {new Date(preview.expires_at).toLocaleTimeString()}.</p>
+                    <iframe
+                      id="leroboscope"
+                      ref={viewerFrame}
+                      className="dataset-viewer"
+                      src="/leroboscope/"
+                      title={`Review ${preview.dataset_name}`}
+                    />
+                    <div className="form-row">
+                      <label htmlFor="dataset-view-name">Curated view</label>
+                      <input
+                        id="dataset-view-name"
+                        value={viewName}
+                        maxLength={200}
+                        onChange={(event) => setViewName(event.target.value)}
+                      />
+                      <button
+                        type="button"
+                        disabled={publishingView || !viewName.trim()}
+                        onClick={() => void publishDatasetView()}
+                      >
+                        {publishingView ? "Publishing…" : "Publish included episodes"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {datasets.length > 0 && (
+                  <div className="people-list">
+                    <p className="label">Catalogue</p>
+                    {datasets.map((dataset) => (
+                      <div className="people-row" key={dataset.id}>
+                        <div>
+                          <strong>{dataset.name}</strong>
+                          {dataset.versions.map((version) => (
+                            <p key={version.id}>
+                              v{version.version_number} · {describeVersionStatus(version.status)} ·{" "}
+                              {version.total_episodes} episodes
+                              {version.resolved_revision
+                                ? ` · ${version.resolved_revision.slice(0, 12)}`
+                                : ""}
+                              {Object.keys(version.curations).length > 0
+                                ? ` · ${Object.values(version.curations).filter((decision) => decision === "included").length} included`
+                                : ""}
+                            </p>
+                          ))}
+                        </div>
+                        {dataset.versions.some((version) => version.status === "ready") && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void openViewer(
+                                dataset,
+                                dataset.versions.filter((version) => version.status === "ready").at(-1)!,
+                              )
+                            }
+                          >
+                            Open viewer
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="registration-section">
                 <div><p className="label">People</p><h3>Share this Kratos</h3></div>
