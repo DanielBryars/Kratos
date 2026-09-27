@@ -23,12 +23,12 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   duplicate-name handling, upload integrity rejection, and curated-view snapshots.
   All five hold. Version numbering needed a new endpoint to be true: see below.
 - [x] Add the console dataset screen: catalogue, Hugging Face import, folder upload, upload progress,
-  version status, viewer launch and curation summary. The publish-view action is still to come.
+  version status, viewer launch, curation summary and immutable curated-view publication.
   Path handling, manifest validation and byte-weighted progress live in `datasetUpload.ts` with
   18 tests, mirroring `validate_file_declarations` so an invalid folder is named per file before
   anything is hashed rather than as one 422 afterwards.
-- [ ] Add the publish-view action to the console (the API exists and is tested; only the control
-  is missing).
+- [x] Add the publish-view action to the console. It publishes the server-side snapshot of included
+  episodes and reports the immutable manifest identity and episode count.
 - [x] Declare the private dataset bucket CORS policy for direct browser resumable uploads and
   signed preview reads from the exact Kratos console origin. Live apply remains deliberately
   pending until the code review completes.

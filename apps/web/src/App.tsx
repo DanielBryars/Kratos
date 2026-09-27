@@ -136,6 +136,14 @@ type PreviewSession = {
   info: Record<string, unknown>;
   curations: Record<string, string>;
 };
+type DatasetView = {
+  id: string;
+  version_id: string;
+  name: string;
+  manifest_sha256: string;
+  included_episode_count: number;
+  created_at: string;
+};
 type ApiError = { message?: string };
 
 const DEMO_WORKLOAD_IMAGE = "ghcr.io/danielbryars/kratos-gpu-health-check@sha256:3ee068a54416c67c32b5d6369e9120fd4ee9b62ffd7865dcde7a688f482168a9";
@@ -237,6 +245,8 @@ export function App() {
   // The preview token is held in memory only, exactly as the invitation credential is: it is a
   // capability, and it has no reason to survive the tab.
   const [preview, setPreview] = useState<PreviewSession | null>(null);
+  const [viewName, setViewName] = useState("");
+  const [publishingView, setPublishingView] = useState(false);
   const viewerFrame = useRef<HTMLIFrameElement | null>(null);
   const durableOutputValid = !durableOutputEnabled || (
     durableOutputPath.trim().length > 0
@@ -683,8 +693,48 @@ export function App() {
         info: version.info,
         curations: version.curations,
       });
+      setViewName(`${dataset.name} curated`);
     } catch (error) {
       setDatasetMessage(error instanceof Error ? error.message : "The preview could not be opened.");
+    }
+  }
+
+  async function publishDatasetView() {
+    if (!user || !preview || publishingView) return;
+    const name = viewName.trim();
+    if (!name) {
+      setDatasetMessage("Give the curated view a name first.");
+      return;
+    }
+    setPublishingView(true);
+    setDatasetMessage(null);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch(
+        `/api/v1/operator/dataset-versions/${preview.version_id}/views`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        },
+      );
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(
+          error.message
+            ?? (response.status === 400
+              ? "Include at least one episode before publishing a curated view."
+              : `Publishing failed with ${response.status}`),
+        );
+      }
+      const view = await response.json() as DatasetView;
+      setDatasetMessage(
+        `Published ${view.name}: ${view.included_episode_count} included episodes · ${view.manifest_sha256.slice(0, 12)}.`,
+      );
+    } catch (error) {
+      setDatasetMessage(error instanceof Error ? error.message : "The curated view could not be published.");
+    } finally {
+      setPublishingView(false);
     }
   }
 
@@ -1197,6 +1247,22 @@ export function App() {
                       src="/leroboscope/"
                       title={`Review ${preview.dataset_name}`}
                     />
+                    <div className="form-row">
+                      <label htmlFor="dataset-view-name">Curated view</label>
+                      <input
+                        id="dataset-view-name"
+                        value={viewName}
+                        maxLength={200}
+                        onChange={(event) => setViewName(event.target.value)}
+                      />
+                      <button
+                        type="button"
+                        disabled={publishingView || !viewName.trim()}
+                        onClick={() => void publishDatasetView()}
+                      >
+                        {publishingView ? "Publishing…" : "Publish included episodes"}
+                      </button>
+                    </div>
                   </div>
                 )}
                 {datasets.length > 0 && (
