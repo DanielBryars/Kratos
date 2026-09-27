@@ -97,6 +97,15 @@ resource "google_storage_bucket_iam_member" "artifact_upload_create" {
   member = "serviceAccount:${google_service_account.artifact_upload_signer.email}"
 }
 
+# V4 signed reads are authorized as the signing service account. Keep this
+# bucket-scoped: preview sessions still expose only exact, short-lived object
+# URLs selected by the control plane.
+resource "google_storage_bucket_iam_member" "artifact_signed_read" {
+  bucket = google_storage_bucket.artifacts.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.artifact_upload_signer.email}"
+}
+
 resource "google_project_iam_custom_role" "artifact_metadata_manager" {
   project     = var.project_id
   role_id     = "kratosArtifactVerifier"
