@@ -1163,6 +1163,35 @@ async fn preview_get(
     (status, location, cache)
 }
 
+/// Resolve a preview file as JSON, as Leroboscope does before assigning a media URL.
+async fn preview_resolve(
+    router: &axum::Router,
+    base_url: &str,
+    logical_path: &str,
+    token: &str,
+) -> (StatusCode, Value, Option<String>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::get(format!("{base_url}{logical_path}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cache = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, body, cache)
+}
+
 /// Bring a dataset to `ready` and open a preview session over it.
 async fn ready_version_with_preview(
     pool: &PgPool,
@@ -1228,6 +1257,25 @@ async fn a_preview_redirects_to_a_signed_read_that_expires(pool: PgPool) {
         Some("no-store"),
         "a redirect that carries a capability must not be cached"
     );
+}
+
+/// A browser cannot attach an Authorization header to a video element, so it resolves the narrow
+/// preview capability once and assigns the returned short-lived URL to that element.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_can_return_one_signed_read_as_uncacheable_json(pool: PgPool) {
+    let (founder, _version_id, _preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Browser preview").await;
+
+    let (status, body, cache) =
+        preview_resolve(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["url"]
+            .as_str()
+            .is_some_and(|url| url.contains("expires_in=300")),
+        "the response must carry one short-lived read: {body}"
+    );
+    assert_eq!(cache.as_deref(), Some("no-store"));
 }
 
 /// A wrong token, an invented session, and an expired one are all simply not found.

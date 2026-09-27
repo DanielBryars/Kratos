@@ -991,6 +991,12 @@ pub(crate) struct DatasetPreviewSessionResponse {
     pub(crate) expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DatasetPreviewReadResponse {
+    /// Short-lived URL for exactly one verified object.
+    url: String,
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/dataset-versions/{version_id}/preview",
@@ -1086,11 +1092,12 @@ pub(crate) async fn create_dataset_preview_session(
         ("logical_path" = String, Path, description = "Path inside the dataset version"),
     ),
     responses(
+        (status = 200, description = "Short-lived signed read returned as JSON", body = DatasetPreviewReadResponse),
         (status = 307, description = "Redirect to a short-lived signed read"),
         (status = 404, description = "No such session, or no such file in its version"),
     )
 )]
-/// Redirect one logical path to a signed read that expires.
+/// Resolve one logical path to a signed read that expires.
 ///
 /// The preview token is the only authority here, carried in the `Authorization` header rather
 /// than the query string: a query string reaches access logs, and a capability in a log outlives
@@ -1103,8 +1110,8 @@ pub(crate) async fn create_dataset_preview_session(
 /// and make the audit trail name them, at the cost of the viewer needing an identity token in the
 /// frame. Revisit before datasets contain anything that is not ours.
 ///
-/// The response redirects rather than proxying a body, so dataset bytes never travel through the
-/// control plane, and the URL it points at is good for one object for minutes.
+/// A browser viewer asks for JSON so it can use the signed URL in a media element. Other clients
+/// receive a redirect. Either way, dataset bytes never travel through the control plane.
 pub(crate) async fn read_dataset_preview_file(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1153,6 +1160,24 @@ pub(crate) async fn read_dataset_preview_file(
         .signed_read_url(&object.0, &object.1, PREVIEW_READ_SECONDS, Utc::now())
         .await
         .map_err(|_| OperatorError::unavailable())?;
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|item| item.trim() == "application/json")
+        });
+    if wants_json {
+        let body = serde_json::to_vec(&DatasetPreviewReadResponse { url })
+            .map_err(|_| OperatorError::internal())?;
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(body))
+            .map_err(|_| OperatorError::internal());
+    }
     Response::builder()
         .status(StatusCode::TEMPORARY_REDIRECT)
         .header(header::LOCATION, url)

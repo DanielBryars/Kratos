@@ -61,6 +61,7 @@ jobs:
       - run: pnpm web:typecheck
       - run: pnpm web:build
       - run: pnpm leroboscope:typecheck
+      - run: pnpm leroboscope:test
       - run: pnpm leroboscope:build
 
   agent:

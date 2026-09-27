@@ -38,12 +38,14 @@ source: {
   label: "Warehouse picks",
   revision: manifestSha256,
   info,
-  fileBaseUrl: `/api/v1/dataset-review-sessions/${reviewToken}/files`,
+  fileBaseUrl: `/api/v1/dataset-previews/${previewId}/files/`,
+  previewToken,
 }
 ```
 
-The file route must authorise only that dataset version, support byte ranges for Parquet and video,
-and expire quickly. It must not expose a bucket credential.
+The viewer exchanges that short-lived capability for a signed URL to exactly one verified file.
+Cloud Storage then serves Parquet and video byte ranges directly. The route is limited to that
+dataset version and does not expose a bucket credential or durable object location.
 
 ## Development
 
@@ -51,6 +53,7 @@ From the repository root:
 
 ```text
 pnpm leroboscope:typecheck
+pnpm leroboscope:test
 pnpm leroboscope:build
 pnpm leroboscope:dev
 ```

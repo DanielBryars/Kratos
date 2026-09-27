@@ -386,6 +386,7 @@ async function main() {
         source.revision,
         source.info,
         source.fileBaseUrl,
+        source.previewToken,
       );
       populateEpisodes(ui, source.info.total_episodes, (idx) => loadEpisodeData(idx));
       setDatasetMeta(ui, source.info.fps, source.info.total_episodes, source.info.total_frames);

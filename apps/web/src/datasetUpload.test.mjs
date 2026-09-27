@@ -8,6 +8,8 @@ import {
   manifestProblems,
   mediaTypeFor,
   pathProblem,
+  readFileChunks,
+  storageGeneration,
   uploadProgress,
 } from "./datasetUpload.ts";
 
@@ -117,6 +119,38 @@ test("builds a declaration in the order it was given", () => {
 
 test("refuses to build a declaration with a hash missing", () => {
   assert.throws(() => buildDeclaration([picked("set/meta/info.json")], []), /exactly one hash/);
+});
+
+test("reads a large file without materialising more than one bounded chunk", async () => {
+  const bytes = new Uint8Array(25);
+  bytes.forEach((_, index) => { bytes[index] = index; });
+  const chunks = [];
+  await readFileChunks(new Blob([bytes]), (chunk) => chunks.push([...chunk]), 8);
+  assert.deepEqual(chunks.map((chunk) => chunk.length), [8, 8, 8, 1]);
+  assert.deepEqual(chunks.flat(), [...bytes]);
+});
+
+test("requires a positive chunk size", async () => {
+  await assert.rejects(readFileChunks(new Blob(["x"]), () => {}, 0), /positive integer/);
+});
+
+test("reads an immutable storage generation from the response", async () => {
+  assert.equal(
+    await storageGeneration(new Response(null, { headers: { "x-goog-generation": "1789979721850839" } })),
+    "1789979721850839",
+  );
+  assert.equal(
+    await storageGeneration(new Response(JSON.stringify({ generation: "9007199254740993" }))),
+    "9007199254740993",
+  );
+});
+
+test("never invents a storage generation", async () => {
+  await assert.rejects(storageGeneration(new Response("{}")), /did not return/);
+  await assert.rejects(
+    storageGeneration(new Response(null, { headers: { "x-goog-generation": "1.5" } })),
+    /did not return/,
+  );
 });
 
 test("weights progress by bytes rather than by file count", () => {

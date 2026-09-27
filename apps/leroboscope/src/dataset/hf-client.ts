@@ -5,14 +5,14 @@ const HF_BASE = 'https://huggingface.co';
 export interface DatasetFileSource {
   readonly label: string;
   readonly revision: string;
-  url(path: string): string;
+  resolve(path: string): Promise<string>;
 }
 
 export function huggingFaceSource(repoId: string, revision: string): DatasetFileSource {
   return {
     label: repoId,
     revision,
-    url: (path: string) => resolveUrl(repoId, revision, path),
+    resolve: async (path: string) => resolveUrl(repoId, revision, path),
   };
 }
 
@@ -20,12 +20,29 @@ export function kratosUploadSource(
   label: string,
   revision: string,
   fileBaseUrl: string,
+  previewToken: string,
 ): DatasetFileSource {
   const base = fileBaseUrl.replace(/\/$/, '');
   return {
     label,
     revision,
-    url: (path: string) => `${base}/${path.split('/').map(encodeURIComponent).join('/')}`,
+    resolve: async (path: string) => {
+      const endpoint = `${base}/${path.split('/').map(encodeURIComponent).join('/')}`;
+      const response = await fetch(endpoint, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${previewToken}`,
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`Kratos could not open ${path}: ${response.status} ${response.statusText}`);
+      }
+      const body = await response.json() as { url?: unknown };
+      if (typeof body.url !== 'string' || !body.url.startsWith('https://')) {
+        throw new Error(`Kratos returned no signed read for ${path}`);
+      }
+      return body.url;
+    },
   };
 }
 
@@ -93,7 +110,7 @@ export async function fetchDatasetInfo(repoId: string, revision: string): Promis
  * Fetch a parquet file as ArrayBuffer.
  */
 export async function fetchParquetFile(source: DatasetFileSource, path: string): Promise<ArrayBuffer> {
-  const url = source.url(path);
+  const url = await source.resolve(path);
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`Failed to fetch ${path}: ${res.status} ${res.statusText}`);

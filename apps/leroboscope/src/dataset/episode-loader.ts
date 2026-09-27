@@ -34,10 +34,11 @@ export async function loadUploadedDatasetContext(
   revision: string,
   info: DatasetInfo,
   fileBaseUrl: string,
+  previewToken: string,
 ): Promise<DatasetContext> {
   const rawVersion = info.codebase_version || '2.0';
   const version = rawVersion.startsWith('v') ? rawVersion : `v${rawVersion}`;
-  const source = kratosUploadSource(label, revision, fileBaseUrl);
+  const source = kratosUploadSource(label, revision, fileBaseUrl, previewToken);
   const episodeScenes = await fetchEpisodeScenes(source);
   return { repoId: label, version, revision, source, info, episodeScenes };
 }
@@ -59,7 +60,7 @@ async function fetchEpisodeScenes(
   source: DatasetFileSource,
 ): Promise<Record<string, EpisodeSceneEntry> | null> {
   try {
-    const url = source.url('meta/episode_scenes.json');
+    const url = await source.resolve('meta/episode_scenes.json');
     const res = await fetch(url);
     if (!res.ok) return null;
     const raw = await res.json();
@@ -119,7 +120,7 @@ async function loadEpisodeV3(
   const episodeRows = fullData.slice(localFrom, localTo);
 
   const frames = extractFrames(episodeRows);
-  const videos = extractVideoInfoV3(ctx, epMetaRaw);
+  const videos = await extractVideoInfoV3(ctx, epMetaRaw);
   const sceneEntry = ctx.episodeScenes?.[episodeIndex.toString()];
   const sceneObjects = sceneEntry?.objects;
 
@@ -149,7 +150,7 @@ async function loadEpisodeV2(
 
   const frames = extractFrames(rows);
   // v2 video paths use a simpler template
-  const videos = extractVideoInfoV2(ctx, episodeIndex, episodeChunk);
+  const videos = await extractVideoInfoV2(ctx, episodeIndex, episodeChunk);
   const sceneEntry = ctx.episodeScenes?.[episodeIndex.toString()];
   const sceneObjects = sceneEntry?.objects;
 
@@ -221,15 +222,15 @@ function parseEpisodeMetadata(row: Record<string, unknown>): EpisodeMetadata {
 
 // --- Video info extraction ---
 
-function extractVideoInfoV3(
+async function extractVideoInfoV3(
   ctx: DatasetContext,
   epRow: Record<string, unknown>,
-): VideoInfo[] {
+): Promise<VideoInfo[]> {
   const videoFeatures = Object.entries(ctx.info.features).filter(
     ([, v]) => v.dtype === 'video',
   );
 
-  return videoFeatures.map(([videoKey]) => {
+  return Promise.all(videoFeatures.map(async ([videoKey]) => {
     // Look for per-camera metadata: videos/{key}/chunk_index, file_index, from_timestamp, to_timestamp
     const chunkVal = epRow[`videos/${videoKey}/chunk_index`];
     const fileVal = epRow[`videos/${videoKey}/file_index`];
@@ -242,32 +243,32 @@ function extractVideoInfoV3(
     const toTimestamp = toTs !== undefined ? toNumber(toTs) : 30;
 
     const videoPath = `videos/${videoKey}/chunk-${pad3(chunkIndex)}/file-${pad3(fileIndex)}.mp4`;
-    const url = ctx.source.url(videoPath);
+    const url = await ctx.source.resolve(videoPath);
 
     return { key: videoKey, url, fromTimestamp, toTimestamp };
-  });
+  }));
 }
 
-function extractVideoInfoV2(
+async function extractVideoInfoV2(
   ctx: DatasetContext,
   episodeIndex: number,
   episodeChunk: number,
-): VideoInfo[] {
+): Promise<VideoInfo[]> {
   if (!ctx.info.video_path) return [];
 
   const videoFeatures = Object.entries(ctx.info.features).filter(
     ([, v]) => v.dtype === 'video',
   );
 
-  return videoFeatures.map(([videoKey]) => {
+  return Promise.all(videoFeatures.map(async ([videoKey]) => {
     const videoPath = ctx.info.video_path!
       .replace(/{video_key}/g, videoKey)
       .replace(/{episode_chunk(?::\d+d)?}/g, pad3(episodeChunk))
       .replace(/{episode_index(?::\d+d)?}/g, episodeIndex.toString().padStart(6, '0'));
 
-    const url = ctx.source.url(videoPath);
+    const url = await ctx.source.resolve(videoPath);
     return { key: videoKey, url, fromTimestamp: 0, toTimestamp: 0 };
-  });
+  }));
 }
 
 // --- Frame extraction ---

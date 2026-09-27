@@ -9,6 +9,7 @@
     "web:test": "pnpm --dir apps/web test",
     "leroboscope:dev": "pnpm --dir apps/leroboscope dev",
     "leroboscope:build": "pnpm --dir apps/leroboscope build",
-    "leroboscope:typecheck": "pnpm --dir apps/leroboscope typecheck"
+    "leroboscope:typecheck": "pnpm --dir apps/leroboscope typecheck",
+    "leroboscope:test": "pnpm --dir apps/leroboscope test"
   }
 }

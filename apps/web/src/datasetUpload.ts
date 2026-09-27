@@ -12,6 +12,10 @@ export const MAX_UPLOAD_FILES = 10_000;
 /// LeRobot metadata Kratos requires before a version can become ready.
 export const REQUIRED_LOGICAL_PATH = "meta/info.json";
 
+/// Files are hashed outside the UI thread and never buffered in full. Four MiB keeps memory
+/// bounded while avoiding tens of thousands of messages for normal LeRobot videos.
+export const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
+
 export type PickedFile = {
   /// What the browser reports for a directory pick: `dataset/meta/info.json`.
   relativePath: string;
@@ -136,6 +140,38 @@ export function buildDeclaration(files: PickedFile[], hashes: string[]): Declare
     byte_length: file.size,
     sha256: hashes[index],
   }));
+}
+
+/// Visit a file in bounded chunks. The worker owns the digest state; this helper owns the memory
+/// contract and is kept DOM-free so the exact boundary is testable in Node.
+export async function readFileChunks(
+  file: Blob,
+  visit: (chunk: Uint8Array) => void | Promise<void>,
+  chunkBytes = HASH_CHUNK_BYTES,
+): Promise<void> {
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes <= 0) {
+    throw new Error("chunk size must be a positive integer");
+  }
+  for (let offset = 0; offset < file.size; offset += chunkBytes) {
+    const end = Math.min(offset + chunkBytes, file.size);
+    const chunk = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+    await visit(chunk);
+  }
+}
+
+/// GCS generations are immutable object identities. Inventing one when a response header is hidden
+/// would make the control plane verify a different object (or none at all), so absence is fatal.
+export async function storageGeneration(response: Response): Promise<string> {
+  const header = response.headers.get("x-goog-generation");
+  let candidate: unknown = header;
+  if (!candidate) {
+    const body = await response.clone().json().catch(() => null) as { generation?: unknown } | null;
+    candidate = body?.generation;
+  }
+  if (typeof candidate !== "string" || !/^[1-9][0-9]*$/.test(candidate)) {
+    throw new Error("Storage did not return the uploaded object's generation");
+  }
+  return candidate;
 }
 
 export type UploadState = "pending" | "hashing" | "uploading" | "verified" | "rejected";

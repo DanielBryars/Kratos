@@ -8,7 +8,7 @@ import {
   type Auth,
   type User,
 } from "firebase/auth";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   buildInvitationLink,
@@ -29,6 +29,7 @@ import {
   buildDeclaration,
   describeVersionStatus,
   manifestProblems,
+  storageGeneration,
   uploadProgress,
   type DeclaredFile,
   type PickedFile,
@@ -111,6 +112,7 @@ type DatasetVersion = {
   source_kind: string;
   status: string;
   resolved_revision: string | null;
+  info: Record<string, unknown>;
   total_episodes: number;
   total_frames: number;
   files: DatasetFile[];
@@ -128,6 +130,11 @@ type PreviewSession = {
   preview_token: string;
   files_base_url: string;
   expires_at: string;
+  id_token: string;
+  dataset_name: string;
+  revision: string;
+  info: Record<string, unknown>;
+  curations: Record<string, string>;
 };
 type ApiError = { message?: string };
 
@@ -230,6 +237,7 @@ export function App() {
   // The preview token is held in memory only, exactly as the invitation credential is: it is a
   // capability, and it has no reason to survive the tab.
   const [preview, setPreview] = useState<PreviewSession | null>(null);
+  const viewerFrame = useRef<HTMLIFrameElement | null>(null);
   const durableOutputValid = !durableOutputEnabled || (
     durableOutputPath.trim().length > 0
     && durableOutputRole.trim().length > 0
@@ -494,14 +502,22 @@ export function App() {
     }
   }
 
-  /// SHA-256 of one file, computed in the browser so the declaration is a claim about bytes the
-  /// person actually has. Kratos verifies it again against what storage received; this half is what
-  /// makes a mismatch mean "the upload went wrong" rather than "nobody ever knew".
+  /// SHA-256 of one file, computed incrementally outside the UI thread. Kratos verifies it again
+  /// against storage; bounded worker chunks keep a large video from exhausting the console tab.
   async function hashFile(file: File): Promise<string> {
-    const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-    return Array.from(new Uint8Array(digest))
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
+    return new Promise((resolve, reject) => {
+      const worker = new Worker(new URL("./datasetHash.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent<{ type: "done"; hash: string } | { type: "error"; message: string }>) => {
+        worker.terminate();
+        if (event.data.type === "done") resolve(event.data.hash);
+        else reject(new Error(event.data.message));
+      };
+      worker.onerror = (event) => {
+        worker.terminate();
+        reject(new Error(event.message || `Could not hash ${file.name}`));
+      };
+      worker.postMessage({ file });
+    });
   }
 
   async function importHuggingFaceDataset() {
@@ -612,7 +628,7 @@ export function App() {
         // Straight to storage: the bytes never pass through the control plane.
         const put = await fetch(upload.uri, { method: upload.method, body: files[index] });
         if (!put.ok) throw new Error(`Storage refused ${declaredFile.logical_path}`);
-        const generation = put.headers.get("x-goog-generation") ?? "1";
+        const generation = await storageGeneration(put);
         const completed = await fetch(`/api/v1/operator/dataset-files/${target.id}/complete`, {
           method: "PUT",
           headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
@@ -645,24 +661,68 @@ export function App() {
   ///
   /// The viewer is given the short-lived preview base URL and token, and never a bucket credential
   /// or a durable object location.
-  async function openViewer(versionId: string) {
+  async function openViewer(dataset: Dataset, version: DatasetVersion) {
     if (!user) return;
     setDatasetMessage(null);
     try {
       const idToken = await user.getIdToken();
       const response = await fetch(
-        `/api/v1/operator/dataset-versions/${versionId}/preview`,
+        `/api/v1/operator/dataset-versions/${version.id}/preview`,
         { method: "POST", headers: { Authorization: `Bearer ${idToken}` } },
       );
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as ApiError;
         throw new Error(error.message ?? `Preview failed with ${response.status}`);
       }
-      setPreview((await response.json()) as PreviewSession);
+      const session = await response.json() as Omit<PreviewSession, "id_token" | "dataset_name" | "revision" | "info" | "curations">;
+      setPreview({
+        ...session,
+        id_token: idToken,
+        dataset_name: dataset.name,
+        revision: version.resolved_revision ?? `v${version.version_number}`,
+        info: version.info,
+        curations: version.curations,
+      });
     } catch (error) {
       setDatasetMessage(error instanceof Error ? error.message : "The preview could not be opened.");
     }
   }
+
+  useEffect(() => {
+    if (!preview) return undefined;
+    const sendContext = () => {
+      viewerFrame.current?.contentWindow?.postMessage(
+        {
+          type: "kratos:review-context",
+          versionId: preview.version_id,
+          idToken: preview.id_token,
+          decisions: preview.curations,
+          source: {
+            kind: "uploaded",
+            label: preview.dataset_name,
+            revision: preview.revision,
+            info: preview.info,
+            fileBaseUrl: preview.files_base_url,
+            previewToken: preview.preview_token,
+          },
+        },
+        window.location.origin,
+      );
+    };
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (
+        event.origin === window.location.origin
+        && event.source === viewerFrame.current?.contentWindow
+        && typeof event.data === "object"
+        && event.data !== null
+        && (event.data as { type?: unknown }).type === "kratos:review-ready"
+      ) {
+        sendContext();
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [preview]);
 
   async function createEnrolment() {
     if (!user) return;
@@ -1129,25 +1189,14 @@ export function App() {
                       <p className="label">Viewer session</p>
                       <code>{preview.files_base_url}</code>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        // The token reaches the viewer through the frame, never through the URL.
-                        const frame = document.getElementById("leroboscope") as HTMLIFrameElement | null;
-                        frame?.contentWindow?.postMessage(
-                          {
-                            kind: "kratos.preview",
-                            version_id: preview.version_id,
-                            files_base_url: preview.files_base_url,
-                            preview_token: preview.preview_token,
-                          },
-                          window.location.origin,
-                        );
-                      }}
-                    >
-                      Send to viewer
-                    </button>
                     <p>Expires {new Date(preview.expires_at).toLocaleTimeString()}.</p>
+                    <iframe
+                      id="leroboscope"
+                      ref={viewerFrame}
+                      className="dataset-viewer"
+                      src="/leroboscope/"
+                      title={`Review ${preview.dataset_name}`}
+                    />
                   </div>
                 )}
                 {datasets.length > 0 && (
@@ -1175,7 +1224,8 @@ export function App() {
                             type="button"
                             onClick={() =>
                               void openViewer(
-                                dataset.versions.filter((version) => version.status === "ready").at(-1)!.id,
+                                dataset,
+                                dataset.versions.filter((version) => version.status === "ready").at(-1)!,
                               )
                             }
                           >

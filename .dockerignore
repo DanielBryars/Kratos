@@ -3,8 +3,8 @@
 .devcontainer
 .vscode
 target
-node_modules
-apps/web/node_modules
+**/node_modules
+**/.pnpm-store
 apps/web/dist
 **/.venv
 **/__pycache__

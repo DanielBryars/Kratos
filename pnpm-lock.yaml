@@ -41,6 +41,9 @@ importers:
       firebase:
         specifier: 12.19.0
         version: 12.19.0
+      hash-wasm:
+        specifier: 4.12.0
+        version: 4.12.0
       react:
         specifier: 19.3.0
         version: 19.3.0
@@ -972,6 +975,9 @@ packages:
   get-caller-file@2.0.5:
     resolution: {integrity: sha512-DyFP3BM/3YHTQOCUL/w0OZHR0lpKeGrxotcHWcqNEdnltqFwXVfhEBQ94eIo34AfQpo0rGki4cyIiftY06h2Fg==}
     engines: {node: 6.* || 8.* || >= 10.*}
+
+  hash-wasm@4.12.0:
+    resolution: {integrity: sha512-+/2B2rYLb48I/evdOIhP+K/DD2ca2fgBjp6O+GBEnCDk2e4rpeXIK8GvIyRPjTezgmWn9gmKwkQjjx6BtqDHVQ==}
 
   http-parser-js@0.5.10:
     resolution: {integrity: sha512-Pysuw9XpUq5dVc/2SMHpuTY01RFl8fttgcyunjL7eEMhGM3cI4eOmiCycJDVCo/7O7ClfQD3SaI6ftDzqOXYMA==}
@@ -2039,6 +2045,8 @@ snapshots:
   fzstd@0.1.1: {}
 
   get-caller-file@2.0.5: {}
+
+  hash-wasm@4.12.0: {}
 
   http-parser-js@0.5.10: {}
 

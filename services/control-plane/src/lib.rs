@@ -151,7 +151,8 @@ pub(crate) struct AppState {
         datasets::DatasetFileDeclaration, datasets::DatasetFileResponse,
         datasets::DatasetVersionResponse, datasets::DatasetResponse,
         datasets::CompleteDatasetFileUploadRequest, datasets::BeginDatasetFileUploadResponse,
-        datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse, datasets::DatasetPreviewSessionResponse,
+        datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse, datasets::DatasetPreviewReadResponse,
+        datasets::DatasetPreviewSessionResponse,
         datasets::CreateDatasetViewRequest, datasets::DatasetViewResponse
     )),
     tags(

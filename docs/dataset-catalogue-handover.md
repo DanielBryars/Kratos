@@ -29,8 +29,10 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   anything is hashed rather than as one 422 afterwards.
 - [ ] Add the publish-view action to the console (the API exists and is tested; only the control
   is missing).
-- [ ] Configure the private dataset bucket CORS policy for direct browser resumable uploads from
-  the Kratos console origin, then prove a real multi-file LeRobot upload end to end.
+- [x] Declare the private dataset bucket CORS policy for direct browser resumable uploads and
+  signed preview reads from the exact Kratos console origin. Live apply remains deliberately
+  pending until the code review completes.
+- [ ] Prove a real multi-file LeRobot upload, preview and curation flow end to end after apply.
 - [x] Add the signed-read capability the preview session needs. `ArtifactStorage::signed_read_url`
   mints a V4-signed GET for one object with a caller-chosen lifetime, reusing the IAM signBlob
   path the resumable upload already used. A read signs over the host header alone: every extra
@@ -41,13 +43,14 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   and answers 307 to a signed read with `Cache-Control: no-store`. The token travels in the
   `Authorization` header rather than a query string, so it never reaches an access log, and it is
   stored only as an Argon2id verifier. Only verified files resolve, only within the session's own
-  version, and an expired, revoked, invented or mistyped session all answer 404 alike. Its file endpoint should validate a hashed
-  token and redirect each requested logical path to a short-lived signed GET URL. Never expose
-  bucket-wide credentials or durable object locations to the browser.
-- [~] Connect the console to Leroboscope with `postMessage`. The console side is written: it posts
-  the version id, the preview base URL and the preview token to the frame, targeted at its own
-  origin. **Leroboscope does not listen for it yet**, and the frame is not yet mounted in the
-  console, so this is half a handshake -- the sending half.
+  version, and an expired, revoked, invented or mistyped session all answer 404 alike. The file
+  endpoint can redirect a normal client or return the same short-lived signed read as uncacheable
+  JSON for a browser media element. It never exposes bucket-wide credentials or durable object
+  locations.
+- [x] Connect the console to Leroboscope with `postMessage`. The mounted viewer announces readiness,
+  accepts one validated review-context shape, resolves each private object through the preview
+  capability and assigns only short-lived signed URLs to fetches and media elements. Live proof
+  remains part of the end-to-end acceptance item above.
 - [x] Add `POST /datasets/{dataset_id}/versions`, which adds an immutable version to an existing
   dataset. Separate from the upload endpoint on purpose: that one must keep refusing a
   duplicate name, so it cannot also read a repeated name as a request for the next version.
@@ -57,8 +60,9 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   and view publication. Written inside the transaction that makes each change; curation
   gained a transaction so its decision and its record commit together. Tests assert the
   detail carries no object key or session URI.
-- [ ] Run `cargo fmt`, Clippy with warnings denied, the complete Rust tests with PostgreSQL, web tests,
-  Leroboscope type-check/build, Terraform validation, and the container build.
+- [x] Run `cargo fmt`, Clippy with warnings denied, the complete Rust tests with PostgreSQL, web tests,
+  Leroboscope tests/type-check/build, Terraform validation, migration application, and the
+  control-plane container build. All passed locally on 2026-09-27; GitHub CI remains the merge gate.
 
 ## Marked for revisit
 

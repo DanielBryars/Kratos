@@ -12,17 +12,27 @@ export interface ReviewContext {
     revision: string;
     info: DatasetInfo;
     fileBaseUrl: string;
+    previewToken: string;
   };
 }
 
-function isReviewContext(value: unknown): value is ReviewContext {
+export function isReviewContext(value: unknown): value is ReviewContext {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<ReviewContext>;
-  return candidate.type === 'kratos:review-context'
-    && typeof candidate.versionId === 'string'
-    && candidate.versionId.length > 0
-    && typeof candidate.idToken === 'string'
-    && candidate.idToken.length > 0;
+  if (candidate.type !== 'kratos:review-context') return false;
+  if (typeof candidate.versionId !== 'string' || candidate.versionId.length === 0
+    || typeof candidate.idToken !== 'string' || candidate.idToken.length === 0) return false;
+  if (candidate.source !== undefined) {
+    return candidate.source.kind === 'uploaded'
+      && typeof candidate.source.label === 'string'
+      && typeof candidate.source.revision === 'string'
+      && typeof candidate.source.fileBaseUrl === 'string'
+      && typeof candidate.source.previewToken === 'string'
+      && candidate.source.previewToken.length > 0
+      && typeof candidate.source.info === 'object'
+      && candidate.source.info !== null;
+  }
+  return true;
 }
 
 export function listenForReviewContext(onContext: (context: ReviewContext) => void): void {
