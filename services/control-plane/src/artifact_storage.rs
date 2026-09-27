@@ -538,6 +538,19 @@ impl ArtifactStorage for GoogleArtifactStorage {
             );
             return Err(ArtifactStorageError::Unavailable);
         }
+        if let Some(expected_origin) = browser_origin {
+            let returned_origin = response
+                .headers()
+                .get(reqwest::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            if returned_origin != Some(expected_origin) {
+                tracing::warn!(
+                    cors_origin_returned = returned_origin.is_some(),
+                    "Cloud Storage did not pin the browser origin to the resumable upload session"
+                );
+                return Err(ArtifactStorageError::InvalidResponse);
+            }
+        }
         let uri = response
             .headers()
             .get(reqwest::header::LOCATION)

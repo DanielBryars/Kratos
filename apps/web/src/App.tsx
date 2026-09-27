@@ -628,7 +628,7 @@ export function App() {
         const session = await fetch(`/api/v1/operator/dataset-files/${target.id}/upload`, {
           method: "PUT",
           headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
-          body: "{}",
+          body: JSON.stringify({ browser_origin: window.location.origin }),
         });
         if (!session.ok) throw new Error(`Could not begin ${declaredFile.logical_path}`);
         const { upload } = (await session.json()) as {
@@ -636,7 +636,11 @@ export function App() {
           upload: { uri: string; method: string; expires_at: string };
         };
         // Straight to storage: the bytes never pass through the control plane.
-        const put = await fetch(upload.uri, { method: upload.method, body: files[index] });
+        const put = await fetch(upload.uri, {
+          method: upload.method,
+          headers: { "Content-Type": declaredFile.media_type },
+          body: files[index],
+        });
         if (!put.ok) throw new Error(`Storage refused ${declaredFile.logical_path}`);
         const generation = await storageGeneration(put);
         const completed = await fetch(`/api/v1/operator/dataset-files/${target.id}/complete`, {
