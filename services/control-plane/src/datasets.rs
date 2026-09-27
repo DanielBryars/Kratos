@@ -107,6 +107,12 @@ pub(crate) struct CompleteDatasetFileUploadRequest {
     generation: String,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BeginDatasetFileUploadRequest {
+    browser_origin: Option<String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct BeginDatasetFileUploadResponse {
     file_id: Uuid,
@@ -534,12 +540,14 @@ pub(crate) async fn create_dataset_version(
     tag = "operator",
     security(("human_bearer" = [])),
     params(("file_id" = Uuid, Path, description = "Declared dataset file")),
+    request_body = BeginDatasetFileUploadRequest,
     responses((status = 200, description = "Replay-safe resumable upload session", body = BeginDatasetFileUploadResponse))
 )]
 pub(crate) async fn begin_dataset_file_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(file_id): Path<Uuid>,
+    Json(request): Json<BeginDatasetFileUploadRequest>,
 ) -> Result<Json<BeginDatasetFileUploadResponse>, OperatorError> {
     let caller = authenticate_operator(&state, &headers).await?;
     let database = state
@@ -588,9 +596,7 @@ pub(crate) async fn begin_dataset_file_upload(
         }));
     }
     let issued_at = Utc::now();
-    let browser_origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
+    let browser_origin = upload_browser_origin(&headers, request.browser_origin.as_deref())?;
     let upload = storage
         .initiate_resumable_upload(
             &row.storage_object_key,
@@ -598,7 +604,7 @@ pub(crate) async fn begin_dataset_file_upload(
             u64::try_from(row.byte_length).map_err(|_| OperatorError::invalid_request())?,
             &row.sha256,
             issued_at,
-            browser_origin,
+            browser_origin.as_deref(),
         )
         .await
         .map_err(|_| OperatorError::unavailable())?;
@@ -625,6 +631,35 @@ pub(crate) async fn begin_dataset_file_upload(
         .await
         .map_err(|_| OperatorError::internal())?;
     Ok(Json(BeginDatasetFileUploadResponse { file_id, upload }))
+}
+
+fn upload_browser_origin(
+    headers: &HeaderMap,
+    declared_origin: Option<&str>,
+) -> Result<Option<String>, OperatorError> {
+    let header_origin = headers
+        .get(axum::http::header::ORIGIN)
+        .map(|value| value.to_str().map_err(|_| OperatorError::invalid_request()))
+        .transpose()?;
+    if let (Some(header), Some(declared)) = (header_origin, declared_origin)
+        && header != declared
+    {
+        return Err(OperatorError::invalid_request());
+    }
+    let Some(origin) = header_origin.or(declared_origin) else {
+        return Ok(None);
+    };
+    let parsed = Url::parse(origin).map_err(|_| OperatorError::invalid_request())?;
+    if parsed.origin().is_tuple()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+    {
+        return Ok(Some(parsed.origin().ascii_serialization()));
+    }
+    Err(OperatorError::invalid_request())
 }
 
 #[utoipa::path(
@@ -1650,6 +1685,28 @@ mod tests {
             sha256: "a".repeat(64),
         }];
         assert!(validate_file_declarations(&files).is_ok());
+    }
+
+    #[test]
+    fn accepts_a_declared_browser_origin_when_same_origin_fetch_omits_the_header() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            upload_browser_origin(&headers, Some("https://kratos.example")).unwrap(),
+            Some("https://kratos.example".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_a_declared_browser_origin_that_disagrees_with_the_request() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://kratos.example".parse().unwrap(),
+        );
+        assert!(
+            upload_browser_origin(&headers, Some("https://attacker.example")).is_err(),
+            "the signed-in request and the browser declaration must describe one origin"
+        );
     }
 }
 
