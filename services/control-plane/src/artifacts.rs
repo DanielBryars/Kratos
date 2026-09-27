@@ -715,7 +715,14 @@ pub(crate) async fn begin_upload(
         .map_err(|_| ApiError::internal())?;
 
     let session = storage
-        .initiate_resumable_upload(&object_key, &media_type, byte_length, &sha256, issued_at)
+        .initiate_resumable_upload(
+            &object_key,
+            &media_type,
+            byte_length,
+            &sha256,
+            issued_at,
+            None,
+        )
         .await
         .map_err(|_| ApiError::artifact_storage_unavailable())?;
 
@@ -1465,6 +1472,7 @@ mod tests {
             byte_length: u64,
             sha256: &str,
             issued_at: chrono::DateTime<Utc>,
+            _browser_origin: Option<&str>,
         ) -> Result<ResumableUploadSession, ArtifactStorageError> {
             let sequence = self.calls.initiated.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = (media_type, byte_length, sha256);
@@ -2676,6 +2684,7 @@ mod tests {
                 512,
                 &"b".repeat(64),
                 now,
+                None,
             )
             .await
             .unwrap();

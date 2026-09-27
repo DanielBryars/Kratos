@@ -53,6 +53,7 @@ impl ArtifactStorage for FakeStorage {
         _byte_length: u64,
         _sha256: &str,
         issued_at: DateTime<Utc>,
+        _browser_origin: Option<&str>,
     ) -> Result<ResumableUploadSession, ArtifactStorageError> {
         Ok(ResumableUploadSession {
             uri: format!("https://storage.example.test/upload/{object_key}"),

@@ -588,6 +588,9 @@ pub(crate) async fn begin_dataset_file_upload(
         }));
     }
     let issued_at = Utc::now();
+    let browser_origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
     let upload = storage
         .initiate_resumable_upload(
             &row.storage_object_key,
@@ -595,6 +598,7 @@ pub(crate) async fn begin_dataset_file_upload(
             u64::try_from(row.byte_length).map_err(|_| OperatorError::invalid_request())?,
             &row.sha256,
             issued_at,
+            browser_origin,
         )
         .await
         .map_err(|_| OperatorError::unavailable())?;
