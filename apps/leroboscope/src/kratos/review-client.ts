@@ -35,6 +35,10 @@ export function isReviewContext(value: unknown): value is ReviewContext {
   return true;
 }
 
+export function shouldWaitForReviewContext(isEmbedded: boolean, hasDatasetParam: boolean): boolean {
+  return isEmbedded && !hasDatasetParam;
+}
+
 export function listenForReviewContext(onContext: (context: ReviewContext) => void): void {
   window.addEventListener('message', (event: MessageEvent<unknown>) => {
     if (event.origin !== window.location.origin || !isReviewContext(event.data)) return;

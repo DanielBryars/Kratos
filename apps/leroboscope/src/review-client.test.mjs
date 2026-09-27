@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isReviewContext } from './kratos/review-client.ts';
+import { isReviewContext, shouldWaitForReviewContext } from './kratos/review-client.ts';
 
 const context = {
   type: 'kratos:review-context',
@@ -34,4 +34,10 @@ test('requires a preview credential for an uploaded source', () => {
   const withoutCredential = structuredClone(context);
   delete withoutCredential.source.previewToken;
   assert.equal(isReviewContext(withoutCredential), false);
+});
+
+test('an embedded viewer waits for Kratos instead of loading the demo dataset', () => {
+  assert.equal(shouldWaitForReviewContext(true, false), true);
+  assert.equal(shouldWaitForReviewContext(false, false), false);
+  assert.equal(shouldWaitForReviewContext(true, true), false);
 });

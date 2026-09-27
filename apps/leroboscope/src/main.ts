@@ -32,6 +32,7 @@ import type { EpisodeData } from './types';
 import {
   listenForReviewContext,
   saveEpisodeDecision,
+  shouldWaitForReviewContext,
   type EpisodeDecision,
   type ReviewContext,
 } from './kratos/review-client';
@@ -68,7 +69,13 @@ async function main() {
   const curationState = document.getElementById('curation-state')!;
   const curationNote = document.getElementById('curation-note') as HTMLInputElement;
 
-  listenForReviewContext((context) => {
+  let viewerInitialized = false;
+  let resolveInitialReviewContext: ((context: ReviewContext) => void) | undefined;
+  const initialReviewContext = new Promise<ReviewContext>((resolve) => {
+    resolveInitialReviewContext = resolve;
+  });
+
+  async function applyReviewContext(context: ReviewContext) {
     reviewContext = context;
     curationPanel.removeAttribute('hidden');
     for (const [episode, decision] of Object.entries(context.decisions ?? {})) {
@@ -77,8 +84,17 @@ async function main() {
     const current = context.decisions?.[currentEpisodeIndex.toString()];
     curationState.textContent = current ? current.replace('_', ' ') : 'Not reviewed';
     if (context.source?.kind === 'uploaded') {
-      void loadUploadedDataset(context.source);
+      await loadUploadedDataset(context.source);
     }
+  }
+
+  listenForReviewContext((context) => {
+    if (!viewerInitialized) {
+      resolveInitialReviewContext?.(context);
+      resolveInitialReviewContext = undefined;
+      return;
+    }
+    void applyReviewContext(context);
   });
 
   async function curate(decision: EpisodeDecision) {
@@ -478,14 +494,22 @@ async function main() {
   });
 
   // --- 7. Auto-load ---
-  const repoToLoad = urlDataset || DEFAULT_DATASET;
-  await loadDataset(repoToLoad, urlEpisode, urlRevision);
+  if (shouldWaitForReviewContext(window.parent !== window, hasDatasetParam)) {
+    const context = await initialReviewContext;
+    viewerInitialized = true;
+    await applyReviewContext(context);
+    dismissLanding();
+  } else {
+    viewerInitialized = true;
+    const repoToLoad = urlDataset || DEFAULT_DATASET;
+    await loadDataset(repoToLoad, urlEpisode, urlRevision);
+  }
 
   // Landing page: ready to enter
   if (hasDatasetParam) {
     // Auto-dismiss when loaded via URL param
     dismissLanding();
-  } else {
+  } else if (window.parent === window) {
     showLandingReady();
   }
 }
