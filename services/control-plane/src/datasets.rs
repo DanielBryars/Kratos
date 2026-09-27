@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::Response,
@@ -540,14 +540,14 @@ pub(crate) async fn create_dataset_version(
     tag = "operator",
     security(("human_bearer" = [])),
     params(("file_id" = Uuid, Path, description = "Declared dataset file")),
-    request_body = BeginDatasetFileUploadRequest,
+    request_body = Option<BeginDatasetFileUploadRequest>,
     responses((status = 200, description = "Replay-safe resumable upload session", body = BeginDatasetFileUploadResponse))
 )]
 pub(crate) async fn begin_dataset_file_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(file_id): Path<Uuid>,
-    Json(request): Json<BeginDatasetFileUploadRequest>,
+    body: Bytes,
 ) -> Result<Json<BeginDatasetFileUploadResponse>, OperatorError> {
     let caller = authenticate_operator(&state, &headers).await?;
     let database = state
@@ -595,8 +595,15 @@ pub(crate) async fn begin_dataset_file_upload(
             },
         }));
     }
+    let declared_browser_origin = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice::<BeginDatasetFileUploadRequest>(&body)
+            .map_err(|_| OperatorError::invalid_request())?
+            .browser_origin
+    };
     let issued_at = Utc::now();
-    let browser_origin = upload_browser_origin(&headers, request.browser_origin.as_deref())?;
+    let browser_origin = upload_browser_origin(&headers, declared_browser_origin.as_deref())?;
     let upload = storage
         .initiate_resumable_upload(
             &row.storage_object_key,
