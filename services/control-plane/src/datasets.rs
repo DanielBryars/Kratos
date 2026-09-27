@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json,
+    body::Body,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
+    response::Response,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,7 +19,8 @@ use uuid::Uuid;
 use crate::{
     AppState,
     artifact_storage::ResumableUploadSession,
-    operator::{OperatorError, authenticate_operator},
+    credentials::{self, CredentialKind},
+    operator::{OperatorError, authenticate_operator, bearer_token},
 };
 
 const DEFAULT_HF_REVISION: &str = "main";
@@ -961,6 +964,197 @@ struct CompleteFileRow {
     sha256: String,
     storage_bucket: String,
     storage_object_key: String,
+}
+
+// --- Preview sessions ----------------------------------------------------------------------------
+//
+// ADR-018: the viewer reads a version's files through "a short-lived version-scoped preview
+// session", never through a bucket credential or a durable object location. The session is the
+// capability; the file endpoint turns a logical path into a signed read that expires.
+
+/// How long a preview session lives. Long enough to look through a dataset, short enough that a
+/// token copied out of a browser is worth little by the time it is used.
+const PREVIEW_SESSION_MINUTES: i64 = 30;
+
+/// How long each signed read lives. Shorter than the session: the session is the thing a person
+/// holds, a signed URL is what a single file fetch needs.
+const PREVIEW_READ_SECONDS: u32 = 300;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DatasetPreviewSessionResponse {
+    pub(crate) preview_id: Uuid,
+    pub(crate) version_id: Uuid,
+    /// Returned exactly once. Kratos keeps only an Argon2id verifier of it.
+    pub(crate) preview_token: String,
+    /// Where the viewer asks for files, with the logical path appended.
+    pub(crate) files_base_url: String,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/operator/dataset-versions/{version_id}/preview",
+    tag = "operator",
+    security(("human_bearer" = [])),
+    params(("version_id" = Uuid, Path, description = "Ready dataset version to preview")),
+    responses(
+        (status = 201, description = "Short-lived preview session created", body = DatasetPreviewSessionResponse),
+        (status = 404, description = "No such ready version in the caller's projects"),
+    )
+)]
+/// Open a preview session over one ready dataset version.
+///
+/// Only a `ready` version can be previewed. A version still uploading has unverified files, and
+/// showing those in a viewer would present bytes Kratos has not vouched for as though it had.
+pub(crate) async fn create_dataset_preview_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(version_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<DatasetPreviewSessionResponse>), OperatorError> {
+    let caller = authenticate_operator(&state, &headers).await?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let mut transaction = database
+        .begin()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+    let project_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT project_id FROM dataset_versions \
+         WHERE id = $1 AND project_id = ANY($2) AND status = 'ready'",
+    )
+    .bind(version_id)
+    .bind(&caller.project_ids)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::dataset_not_found)?;
+
+    let credential = credentials::issue(CredentialKind::DatasetPreview)
+        .map_err(|_| OperatorError::internal())?;
+    let expires_at = Utc::now()
+        .checked_add_signed(TimeDelta::minutes(PREVIEW_SESSION_MINUTES))
+        .ok_or_else(OperatorError::internal)?;
+    sqlx::query(
+        "INSERT INTO dataset_preview_sessions \
+         (id, version_id, project_id, token_verifier, expires_at, created_by_identity_id) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(credential.id)
+    .bind(version_id)
+    .bind(project_id)
+    .bind(&credential.verifier)
+    .bind(expires_at)
+    .bind(caller.identity_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| OperatorError::internal())?;
+    record_dataset_audit(
+        &mut transaction,
+        caller.identity_id,
+        "dataset.preview.opened",
+        "dataset_version",
+        version_id,
+        "succeeded",
+        json!({ "preview_id": credential.id, "expires_at": expires_at }),
+    )
+    .await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| OperatorError::internal())?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DatasetPreviewSessionResponse {
+            preview_id: credential.id,
+            version_id,
+            preview_token: credential.plaintext.expose().to_owned(),
+            files_base_url: format!("/api/v1/dataset-previews/{}/files/", credential.id),
+            expires_at,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dataset-previews/{preview_id}/files/{logical_path}",
+    tag = "operator",
+    params(
+        ("preview_id" = Uuid, Path, description = "Preview session"),
+        ("logical_path" = String, Path, description = "Path inside the dataset version"),
+    ),
+    responses(
+        (status = 307, description = "Redirect to a short-lived signed read"),
+        (status = 404, description = "No such session, or no such file in its version"),
+    )
+)]
+/// Redirect one logical path to a signed read that expires.
+///
+/// The preview token is the only authority here, carried in the `Authorization` header rather
+/// than the query string: a query string reaches access logs, and a capability in a log outlives
+/// the session it belonged to. No identity token is required, which is what lets the viewer be a
+/// plain frame holding nothing but this one narrow credential.
+///
+/// The response redirects rather than proxying a body, so dataset bytes never travel through the
+/// control plane, and the URL it points at is good for one object for minutes.
+pub(crate) async fn read_dataset_preview_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((preview_id, logical_path)): Path<(Uuid, String)>,
+) -> Result<Response, OperatorError> {
+    let database = state
+        .database
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let storage = state
+        .artifact_storage
+        .as_ref()
+        .ok_or_else(OperatorError::unavailable)?;
+    let presented = bearer_token(&headers)?;
+
+    // Looked up by the non-secret identifier inside the token, then the secret is verified against
+    // the stored Argon2id hash. Expiry and revocation are part of the lookup, so a spent session
+    // is indistinguishable from one that never existed.
+    let session = sqlx::query_as::<_, (String, Uuid)>(
+        "SELECT token_verifier, version_id FROM dataset_preview_sessions \
+         WHERE id = $1 AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(preview_id)
+    .fetch_optional(database)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::dataset_not_found)?;
+    if !credentials::verify(presented, &session.0) {
+        return Err(OperatorError::dataset_not_found());
+    }
+
+    // Only verified files, and only in this session's version. A rejected or still-uploading file
+    // has bytes Kratos has not vouched for.
+    let object = sqlx::query_as::<_, (String, String)>(
+        "SELECT storage_bucket, storage_object_key FROM dataset_files \
+         WHERE version_id = $1 AND logical_path = $2 AND status = 'verified'",
+    )
+    .bind(session.1)
+    .bind(&logical_path)
+    .fetch_optional(database)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .ok_or_else(OperatorError::dataset_not_found)?;
+
+    let url = storage
+        .signed_read_url(&object.0, &object.1, PREVIEW_READ_SECONDS, Utc::now())
+        .await
+        .map_err(|_| OperatorError::unavailable())?;
+    Response::builder()
+        .status(StatusCode::TEMPORARY_REDIRECT)
+        .header(header::LOCATION, url)
+        // The redirect is itself a capability. Caching it would leave it in a shared cache after
+        // the session it belonged to has gone.
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .map_err(|_| OperatorError::internal())
 }
 
 /// Write the declared files of a version, each with the object key it will occupy.

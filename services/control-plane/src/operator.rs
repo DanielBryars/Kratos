@@ -2249,7 +2249,7 @@ async fn authorize_operator(
     })
 }
 
-fn bearer_token(headers: &HeaderMap) -> Result<&str, OperatorError> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Result<&str, OperatorError> {
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|header| header.to_str().ok())

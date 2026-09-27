@@ -30,10 +30,13 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   mints a V4-signed GET for one object with a caller-chosen lifetime, reusing the IAM signBlob
   path the resumable upload already used. A read signs over the host header alone: every extra
   signed header is a way for the request to fail after the URL has been handed out.
-- [ ] Add the short-lived, version-scoped preview session itself: a hashed session token, a file
-  endpoint that validates it and redirects each logical path to `signed_read_url`, and a session
-  that expires. The signing half is done; this is the session table, the two endpoints and their
-  tests. Its file endpoint should validate a hashed
+- [x] Add the short-lived, version-scoped preview session. Migration 028 adds
+  `dataset_preview_sessions`; `POST /operator/dataset-versions/{id}/preview` opens one over a
+  **ready** version only; `GET /dataset-previews/{id}/files/{*path}` validates the hashed token
+  and answers 307 to a signed read with `Cache-Control: no-store`. The token travels in the
+  `Authorization` header rather than a query string, so it never reaches an access log, and it is
+  stored only as an Argon2id verifier. Only verified files resolve, only within the session's own
+  version, and an expired, revoked, invented or mistyped session all answer 404 alike. Its file endpoint should validate a hashed
   token and redirect each requested logical path to a short-lived signed GET URL. Never expose
   bucket-wide credentials or durable object locations to the browser.
 - [ ] Connect the console to Leroboscope with `postMessage`: pass only the in-memory identity token,

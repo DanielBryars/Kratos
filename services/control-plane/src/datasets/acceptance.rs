@@ -1127,3 +1127,326 @@ async fn the_next_version_number_is_read_under_the_dataset_lock(pool: PgPool) {
         "the request must number itself after the version committed while it waited"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Preview sessions
+// ---------------------------------------------------------------------------------------------
+
+/// Read a preview file, presenting the session token.
+async fn preview_get(
+    router: &axum::Router,
+    base_url: &str,
+    logical_path: &str,
+    token: &str,
+) -> (StatusCode, Option<String>, Option<String>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::get(format!("{base_url}{logical_path}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let cache = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, location, cache)
+}
+
+/// Bring a dataset to `ready` and open a preview session over it.
+async fn ready_version_with_preview(
+    pool: &PgPool,
+    name: &str,
+) -> (axum::Router, Uuid, Uuid, String, String) {
+    let (founder, _founder_id) = found(pool, storage_agreeing()).await;
+    let (_dataset_id, version_id, file_id) =
+        declare_upload(&founder, "founder-token", name, 2).await;
+    put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/upload"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    let (status, _) = put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{file_id}/complete"),
+        "founder-token",
+        &json!({ "generation": "1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the version should become ready");
+
+    let (status, session) = post(
+        &founder,
+        &format!("/api/v1/operator/dataset-versions/{version_id}/preview"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "opening a preview should succeed, got {session}"
+    );
+    let preview_id: Uuid = session["preview_id"].as_str().unwrap().parse().unwrap();
+    let token = session["preview_token"].as_str().unwrap().to_owned();
+    let base_url = session["files_base_url"].as_str().unwrap().to_owned();
+    (founder, version_id, preview_id, token, base_url)
+}
+
+/// The viewer is handed a redirect to a signed read, and never a durable location.
+///
+/// This is the whole point of the session. A viewer holding a bucket credential could read every
+/// dataset in the project, including ones its operator was never shown; a viewer holding a
+/// durable object key could come back to it after the session ended.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_redirects_to_a_signed_read_that_expires(pool: PgPool) {
+    let (founder, _version_id, _preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Previewed").await;
+
+    let (status, location, cache) =
+        preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+    let location = location.expect("a redirect must carry a location");
+    assert!(
+        location.contains("expires_in=300"),
+        "the read must be short lived: {location}"
+    );
+    assert_eq!(
+        cache.as_deref(),
+        Some("no-store"),
+        "a redirect that carries a capability must not be cached"
+    );
+}
+
+/// A wrong token, an invented session, and an expired one are all simply not found.
+///
+/// Indistinguishable on purpose. Telling a caller that a session exists but their token is wrong
+/// tells them which sessions to keep guessing at.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_refuses_a_wrong_invented_or_expired_token(pool: PgPool) {
+    let (founder, _version_id, preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Guarded").await;
+
+    let wrong = format!("kpv_{}_{}", Uuid::new_v4(), "z".repeat(43));
+    let (status, _, _) = preview_get(&founder, &base_url, "meta/info.json", &wrong).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a wrong token is not found");
+
+    let invented_base = format!("/api/v1/dataset-previews/{}/files/", Uuid::new_v4());
+    let (invented_status, _, _) =
+        preview_get(&founder, &invented_base, "meta/info.json", &token).await;
+    assert_eq!(
+        invented_status,
+        StatusCode::NOT_FOUND,
+        "an invented session is not found"
+    );
+
+    // Expiry is part of the lookup, so a spent session answers exactly as a missing one.
+    // Aged rather than edited backwards: the table requires expires_at > created_at, because a
+    // session expires by time passing and not by its row being rewritten.
+    sqlx::query(
+        "UPDATE dataset_preview_sessions          SET created_at = now() - interval '2 hours', expires_at = now() - interval '1 hour'          WHERE id = $1",
+    )
+    .bind(preview_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (expired, _, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(
+        expired,
+        StatusCode::NOT_FOUND,
+        "an expired session is not found"
+    );
+    assert_eq!(
+        expired, invented_status,
+        "expired and invented must be indistinguishable"
+    );
+}
+
+/// Revoking a session closes it immediately.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_revoked_preview_stops_working(pool: PgPool) {
+    let (founder, _version_id, preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Revoked").await;
+
+    let (status, _, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(status, StatusCode::TEMPORARY_REDIRECT);
+
+    sqlx::query("UPDATE dataset_preview_sessions SET revoked_at = now() WHERE id = $1")
+        .bind(preview_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A session reaches its own version's files and nothing else.
+///
+/// The session is version-scoped, so a path that exists in a different version of the same
+/// dataset must not resolve through it -- otherwise a preview of version 1 would quietly serve
+/// version 2's bytes under version 1's name.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_cannot_reach_another_versions_files(pool: PgPool) {
+    let (founder, _version_id, _preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Scoped").await;
+
+    // A second dataset, also ready, with the same logical path inside it.
+    let (_other_dataset, other_version, other_file) =
+        declare_upload(&founder, "founder-token", "Other", 2).await;
+    put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{other_file}/upload"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    put(
+        &founder,
+        &format!("/api/v1/operator/dataset-files/{other_file}/complete"),
+        "founder-token",
+        &json!({ "generation": "1" }),
+    )
+    .await;
+
+    let (status, _, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(
+        status,
+        StatusCode::TEMPORARY_REDIRECT,
+        "its own file resolves"
+    );
+
+    // The other version holds a file at the same logical path; the session must not reach it.
+    let reached: Option<String> = sqlx::query_scalar(
+        "SELECT storage_object_key FROM dataset_files WHERE version_id = $1 AND logical_path = $2",
+    )
+    .bind(other_version)
+    .bind("meta/info.json")
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let other_key = reached.expect("the other version should have that path");
+
+    let (_, location, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    let location = location.unwrap();
+    assert!(
+        !location.contains(&other_key),
+        "a session must not resolve to another version's object: {location}"
+    );
+}
+
+/// A file that has not verified is not served, even inside a live session.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_does_not_serve_an_unverified_file(pool: PgPool) {
+    let (founder, version_id, _preview_id, token, base_url) =
+        ready_version_with_preview(&pool, "Unverified").await;
+
+    // The whole verification is undone, not just the status: the table refuses a declared file
+    // that still carries the generation and timestamp of a verification.
+    sqlx::query(
+        "UPDATE dataset_files          SET status = 'declared', storage_generation = NULL, verified_at = NULL          WHERE version_id = $1",
+    )
+    .bind(version_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, _, _) = preview_get(&founder, &base_url, "meta/info.json", &token).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "bytes Kratos has not vouched for must not be shown as though it had"
+    );
+}
+
+/// Only a ready version can be previewed, and only inside the caller's project.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_preview_requires_a_ready_version_in_the_callers_project(pool: PgPool) {
+    let (founder, _founder_id) = found(&pool, storage_agreeing()).await;
+    let (_dataset_id, uploading_version, _file_id) =
+        declare_upload(&founder, "founder-token", "Not ready", 2).await;
+
+    let (status, _) = post(
+        &founder,
+        &format!("/api/v1/operator/dataset-versions/{uploading_version}/preview"),
+        "founder-token",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a version still uploading cannot be previewed"
+    );
+
+    let outsider = second_project(&pool, storage_agreeing()).await;
+    let real = post(
+        &outsider,
+        &format!("/api/v1/operator/dataset-versions/{uploading_version}/preview"),
+        "outsider-token",
+        &json!({}),
+    )
+    .await;
+    let invented = post(
+        &outsider,
+        &format!(
+            "/api/v1/operator/dataset-versions/{}/preview",
+            Uuid::new_v4()
+        ),
+        "outsider-token",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(real.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        real.0, invented.0,
+        "another project's version and an invented one must be indistinguishable"
+    );
+}
+
+/// Opening a preview is audited, and the trail records no capability.
+#[sqlx::test(migrations = "./migrations")]
+async fn opening_a_preview_is_audited_without_recording_the_token(pool: PgPool) {
+    let (_founder, version_id, preview_id, token, _base_url) =
+        ready_version_with_preview(&pool, "Audited preview").await;
+
+    let (outcome, detail): (String, Value) = sqlx::query_as(
+        "SELECT outcome, detail FROM audit_events \
+         WHERE action = 'dataset.preview.opened' AND target_id = $1",
+    )
+    .bind(version_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outcome, "succeeded");
+    assert_eq!(detail["preview_id"], preview_id.to_string());
+
+    let text = serde_json::to_string(&detail).unwrap();
+    assert!(
+        !text.contains(&token),
+        "the audit trail must not record the token itself"
+    );
+
+    // Nor may the database hold the token in the clear.
+    let verifier: String =
+        sqlx::query_scalar("SELECT token_verifier FROM dataset_preview_sessions WHERE id = $1")
+            .bind(preview_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !verifier.contains(&token) && verifier.starts_with("$argon2"),
+        "a preview token must be stored only as an Argon2id verifier"
+    );
+}

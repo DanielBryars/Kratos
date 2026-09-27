@@ -112,6 +112,8 @@ pub(crate) struct AppState {
         datasets::import_hugging_face_dataset,
         datasets::create_upload_dataset,
         datasets::create_dataset_version,
+        datasets::create_dataset_preview_session,
+        datasets::read_dataset_preview_file,
         datasets::begin_dataset_file_upload,
         datasets::complete_dataset_file_upload,
         datasets::upsert_episode_curation,
@@ -149,7 +151,7 @@ pub(crate) struct AppState {
         datasets::DatasetFileDeclaration, datasets::DatasetFileResponse,
         datasets::DatasetVersionResponse, datasets::DatasetResponse,
         datasets::CompleteDatasetFileUploadRequest, datasets::BeginDatasetFileUploadResponse,
-        datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse,
+        datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse, datasets::DatasetPreviewSessionResponse,
         datasets::CreateDatasetViewRequest, datasets::DatasetViewResponse
     )),
     tags(
@@ -396,6 +398,14 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/dataset-versions/{version_id}/episodes/{episode_index}/curation",
             put(datasets::upsert_episode_curation),
+        )
+        .route(
+            "/api/v1/operator/dataset-versions/{version_id}/preview",
+            post(datasets::create_dataset_preview_session),
+        )
+        .route(
+            "/api/v1/dataset-previews/{preview_id}/files/{*logical_path}",
+            get(datasets::read_dataset_preview_file),
         )
         .route(
             "/api/v1/operator/dataset-versions/{version_id}/views",
