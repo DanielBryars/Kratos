@@ -22,8 +22,13 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 - [x] Add PostgreSQL integration tests proving project isolation, immutable version numbering,
   duplicate-name handling, upload integrity rejection, and curated-view snapshots.
   All five hold. Version numbering needed a new endpoint to be true: see below.
-- [ ] Add the console dataset screen: catalogue, Hugging Face import, folder upload, upload progress,
-  version status, viewer launch, curation summary, and publish-view action.
+- [x] Add the console dataset screen: catalogue, Hugging Face import, folder upload, upload progress,
+  version status, viewer launch and curation summary. The publish-view action is still to come.
+  Path handling, manifest validation and byte-weighted progress live in `datasetUpload.ts` with
+  18 tests, mirroring `validate_file_declarations` so an invalid folder is named per file before
+  anything is hashed rather than as one 422 afterwards.
+- [ ] Add the publish-view action to the console (the API exists and is tested; only the control
+  is missing).
 - [ ] Configure the private dataset bucket CORS policy for direct browser resumable uploads from
   the Kratos console origin, then prove a real multi-file LeRobot upload end to end.
 - [x] Add the signed-read capability the preview session needs. `ArtifactStorage::signed_read_url`
@@ -39,8 +44,10 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   version, and an expired, revoked, invented or mistyped session all answer 404 alike. Its file endpoint should validate a hashed
   token and redirect each requested logical path to a short-lived signed GET URL. Never expose
   bucket-wide credentials or durable object locations to the browser.
-- [ ] Connect the console to Leroboscope with `postMessage`: pass only the in-memory identity token,
-  version metadata, current decisions, and the short-lived preview base URL.
+- [~] Connect the console to Leroboscope with `postMessage`. The console side is written: it posts
+  the version id, the preview base URL and the preview token to the frame, targeted at its own
+  origin. **Leroboscope does not listen for it yet**, and the frame is not yet mounted in the
+  console, so this is half a handshake -- the sending half.
 - [x] Add `POST /datasets/{dataset_id}/versions`, which adds an immutable version to an existing
   dataset. Separate from the upload endpoint on purpose: that one must keep refusing a
   duplicate name, so it cannot also read a repeated name as a request for the next version.
