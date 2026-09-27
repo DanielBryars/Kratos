@@ -51,6 +51,7 @@ pub trait ArtifactStorage: Send + Sync {
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
+        browser_origin: Option<&str>,
     ) -> Result<ResumableUploadSession, ArtifactStorageError>;
 
     async fn object_metadata(
@@ -113,9 +114,17 @@ impl ArtifactStorageClient {
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
+        browser_origin: Option<&str>,
     ) -> Result<ResumableUploadSession, ArtifactStorageError> {
         self.0
-            .initiate_resumable_upload(object_key, media_type, byte_length, sha256, issued_at)
+            .initiate_resumable_upload(
+                object_key,
+                media_type,
+                byte_length,
+                sha256,
+                issued_at,
+                browser_origin,
+            )
             .await
     }
 
@@ -270,6 +279,7 @@ fn resumable_initiation_request(
     client: &reqwest::Client,
     signed_url: String,
     signed_headers: &BTreeMap<String, String>,
+    browser_origin: Option<&str>,
 ) -> Result<reqwest::Request, ArtifactStorageError> {
     let headers = signed_headers
         .iter()
@@ -281,7 +291,7 @@ fn resumable_initiation_request(
             Ok((name, value))
         })
         .collect::<Result<reqwest::header::HeaderMap, ArtifactStorageError>>()?;
-    client
+    let mut request = client
         .post(signed_url)
         .headers(headers)
         // GCS requires the initiation POST to declare its empty body. Without this header it
@@ -290,7 +300,11 @@ fn resumable_initiation_request(
             reqwest::header::CONTENT_LENGTH,
             reqwest::header::HeaderValue::from_static("0"),
         )
-        .body(Vec::new())
+        .body(Vec::new());
+    if let Some(origin) = browser_origin {
+        request = request.header(reqwest::header::ORIGIN, origin);
+    }
+    request
         .build()
         .map_err(|_| ArtifactStorageError::InvalidResponse)
 }
@@ -475,6 +489,7 @@ impl ArtifactStorage for GoogleArtifactStorage {
         byte_length: u64,
         sha256: &str,
         issued_at: DateTime<Utc>,
+        browser_origin: Option<&str>,
     ) -> Result<ResumableUploadSession, ArtifactStorageError> {
         let material = upload_signing_material(
             &self.bucket,
@@ -502,7 +517,12 @@ impl ArtifactStorage for GoogleArtifactStorage {
             "https://storage.googleapis.com{}?{}&X-Goog-Signature={signature}",
             material.canonical_uri, material.canonical_query
         );
-        let request = resumable_initiation_request(&self.client, signed_url, &material.headers)?;
+        let request = resumable_initiation_request(
+            &self.client,
+            signed_url,
+            &material.headers,
+            browser_origin,
+        )?;
         let response = self
             .client
             .execute(request)
@@ -826,6 +846,7 @@ mod tests {
             &reqwest::Client::new(),
             "https://storage.googleapis.com/kratos-artifacts/object?signed=true".to_owned(),
             &material.headers,
+            Some("https://kratos.example"),
         )
         .unwrap();
 
@@ -837,6 +858,12 @@ mod tests {
         assert_eq!(
             request.body().and_then(reqwest::Body::as_bytes),
             Some(&[][..])
+        );
+        assert_eq!(
+            request.headers().get(reqwest::header::ORIGIN),
+            Some(&reqwest::header::HeaderValue::from_static(
+                "https://kratos.example"
+            ))
         );
     }
 
