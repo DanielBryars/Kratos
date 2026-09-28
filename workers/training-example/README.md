@@ -25,7 +25,9 @@ samples. Its required content digest is
 The data was generated once with Python's seeded Mersenne Twister from three separated Gaussian
 clusters and then committed; training reads the CSV rather than regenerating it.
 
-The single JSON line written to standard output records:
+Protocol 1.2 observation lines written to standard output send the immutable dataset/view identity,
+training configuration, loss, accuracy, and progress to the control plane for MLflow. The final
+`result` record preserves the complete structured summary:
 
 - workload, dataset and resolved training configuration;
 - seed and deterministic CUDA settings;
