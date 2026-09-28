@@ -38,6 +38,13 @@ const MAX_DISPATCH_ATTEMPTS: i32 = 8;
 /// Bounded so a pathological provider message cannot fill the column or the console.
 const MAX_ERROR_BYTES: usize = 500;
 
+/// Why a provider call did not succeed -- and, crucially, whether it might have had an effect
+/// anyway.
+///
+/// The distinction is part of the provider contract, not an inference: `Refused` is a promise that
+/// nothing was created, and an implementation must use `Unavailable` for anything it cannot
+/// promise that about. A timeout, a dropped connection, a 500 and a lost response are all
+/// `Unavailable`, because the machine may exist on the other side of them.
 #[derive(Debug, thiserror::Error)]
 pub enum CapacityError {
     #[error("the provider is unavailable")]
@@ -46,6 +53,21 @@ pub enum CapacityError {
     Refused(String),
     #[error("capacity state is inconsistent: {0}")]
     Inconsistent(String),
+}
+
+impl CapacityError {
+    /// Whether the call may have had an effect despite failing.
+    ///
+    /// Only a positive refusal says nothing happened. Everything else has to be treated as though
+    /// a machine might exist, because the alternative -- assuming it does not -- is how a running
+    /// machine stops being anybody's problem.
+    #[must_use]
+    pub const fn may_have_created_capacity(&self) -> bool {
+        match self {
+            Self::Refused(_) => false,
+            Self::Unavailable | Self::Inconsistent(_) => true,
+        }
+    }
 }
 
 /// What a provider is asked for.
@@ -76,6 +98,11 @@ pub struct ProvisionedCapacity {
 /// `release` must be idempotent on `external_id`, and releasing something already gone is success
 /// rather than an error — otherwise a crash after releasing leaves a request that can never
 /// converge.
+///
+/// Both must report failure honestly: `CapacityError::Refused` is a promise that nothing was
+/// created or changed, and anything the implementation cannot promise that about — a timeout, a
+/// dropped connection, an unparseable reply — must be `Unavailable`. Kratos decides whether a
+/// machine might be running from that distinction alone.
 #[async_trait]
 pub trait CapacityProvider: Send + Sync {
     fn name(&self) -> &'static str;
@@ -93,6 +120,9 @@ pub enum RequestStatus {
     Ready,
     Releasing,
     Released,
+    /// Asked for, never answered usably, and so of unknown effect. Stays open until the provider
+    /// answers or a person settles it.
+    Unreconciled,
     Failed,
 }
 
@@ -105,6 +135,7 @@ impl RequestStatus {
             Self::Ready => "ready",
             Self::Releasing => "releasing",
             Self::Released => "released",
+            Self::Unreconciled => "unreconciled",
             Self::Failed => "failed",
         }
     }
@@ -246,7 +277,11 @@ pub async fn release_capacity(pool: &PgPool, attempt_id: Uuid) -> Result<(), Cap
         // Nothing was ever asked for, which is the ordinary case for a job cancelled while queued.
         return Ok(());
     };
-    if matches!(request.status.as_str(), "released" | "failed") {
+    // `unreconciled` is deliberately not settled here. Converging it to released would record
+    // that nothing is running, which is the one thing nobody knows; it waits for the provider to
+    // answer or for a person to resolve it. A refusal, by contrast, promised nothing was made,
+    // so `failed` converges like any other request that never got a handle.
+    if matches!(request.status.as_str(), "released" | "unreconciled") {
         return Ok(());
     }
 
@@ -362,7 +397,7 @@ async fn run_locked(
     // would be both unreleased and invisible.
     if let Err(error) = &outcome {
         warn!(dispatch = %dispatch.id, %error, "capacity dispatch failed");
-        record_failure(pool, dispatch, &error.to_string()).await;
+        record_failure(pool, dispatch, error).await;
     }
 
     let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
@@ -440,14 +475,27 @@ async fn provision(
         complete(pool, dispatch.id).await?;
         return Ok(false);
     }
-    sqlx::query(
-        "UPDATE capacity_requests SET status = 'provisioning', updated_at = now() \
-         WHERE id = $1 AND status = 'requested'",
+    // The transition is the permission to call the provider, so its result is checked rather than
+    // assumed. Between reading the request above and this statement the row may have gone, or
+    // moved to a state that must not be provisioned; either way the update matches nothing, and
+    // calling the provider anyway would build a machine with nowhere to record it.
+    let claimed = sqlx::query(
+        "UPDATE capacity_requests \
+         SET status = CASE WHEN status = 'requested' THEN 'provisioning' ELSE status END, \
+             updated_at = now() \
+         WHERE id = $1 AND status IN ('requested', 'provisioning', 'unreconciled', 'ready')",
     )
     .bind(request.id)
     .execute(pool)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    if claimed.rows_affected() != 1 {
+        warn!(
+            request = %request.id,
+            "capacity request vanished or changed state before provisioning; not calling provider"
+        );
+        return Ok(false);
+    }
 
     let spec = CapacitySpec {
         idempotency_key: request.idempotency_key.clone(),
@@ -539,13 +587,10 @@ async fn mark_released(
         .begin()
         .await
         .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
-    // `failed` is left alone: it is a state a person is meant to see, and a request that failed
-    // before the provider answered holds nothing, so there is no machine being hidden by leaving
-    // it. The dispatch below completes either way, so the release stops being retried.
     sqlx::query(
         "UPDATE capacity_requests \
          SET status = 'released', released_at = now(), last_error = NULL, updated_at = now() \
-         WHERE id = $1 AND status NOT IN ('released', 'failed')",
+         WHERE id = $1 AND status <> 'released'",
     )
     .bind(request_id)
     .execute(&mut *transaction)
@@ -576,11 +621,32 @@ async fn complete(pool: &PgPool, dispatch_id: Uuid) -> Result<(), CapacityError>
 /// Called with the request's advisory lock held, and conditional on the dispatch still being in
 /// the state it was read in, so that a slow controller's give-up cannot overwrite a faster one's
 /// success.
-async fn record_failure(pool: &PgPool, dispatch: &DispatchRow, reason: &str) {
+async fn record_failure(pool: &PgPool, dispatch: &DispatchRow, error: &CapacityError) {
+    if let Err(failure) = write_failure(pool, dispatch, error).await {
+        // Nothing was written, so the dispatch stays exactly as it was and the next pass will
+        // find it again. Losing the bookkeeping is recoverable; a half-written give-up is not,
+        // which is why it is one transaction.
+        warn!(dispatch = %dispatch.id, %failure, "could not record capacity dispatch failure");
+    }
+}
+
+/// The whole give-up, in one transaction.
+///
+/// The compare-and-set, the request's error and the terminal transition have to commit together.
+/// Split across autocommit statements, a crash after the dispatch reaches its last attempt leaves
+/// it permanently excluded from the due query while the request still looks live and appears on no
+/// operator surface — stuck in a way nothing would ever notice.
+async fn write_failure(
+    pool: &PgPool,
+    dispatch: &DispatchRow,
+    error: &CapacityError,
+) -> Result<(), sqlx::Error> {
     let attempts = dispatch.attempts + 1;
     // Exponential, capped, and stored as a time rather than a sleep so it survives a restart.
     let backoff_seconds = f64::from(2_i32.saturating_pow(attempts.min(6).unsigned_abs())) * 5.0;
-    let message = truncate(reason, MAX_ERROR_BYTES);
+    let message = truncate(&error.to_string(), MAX_ERROR_BYTES);
+    let mut transaction = pool.begin().await?;
+
     // `attempts = $5` and `completed_at IS NULL` make this a compare-and-set against the row this
     // controller actually read. If another controller has completed or advanced the dispatch in
     // the meantime, nothing matches and their outcome stands untouched.
@@ -595,60 +661,75 @@ async fn record_failure(pool: &PgPool, dispatch: &DispatchRow, reason: &str) {
     .bind(&message)
     .bind(backoff_seconds)
     .bind(dispatch.attempts)
-    .fetch_optional(pool)
-    .await;
-    let advanced = match advanced {
-        Ok(value) => value,
-        Err(error) => {
-            warn!(dispatch = %dispatch.id, %error, "could not record capacity dispatch failure");
-            return;
-        }
-    };
+    .fetch_optional(&mut *transaction)
+    .await?;
     if advanced.is_none() {
         // Somebody else moved this dispatch on. Recording anything further would be reporting on
         // a state that no longer exists.
-        return;
+        return transaction.rollback().await;
     }
 
-    let _ = sqlx::query(
-        "UPDATE capacity_requests SET last_error = $2, updated_at = now() WHERE id = $1",
-    )
-    .bind(dispatch.request_id)
-    .bind(&message)
-    .execute(pool)
-    .await;
+    sqlx::query("UPDATE capacity_requests SET last_error = $2, updated_at = now() WHERE id = $1")
+        .bind(dispatch.request_id)
+        .bind(&message)
+        .execute(&mut *transaction)
+        .await?;
 
-    if attempts < MAX_DISPATCH_ATTEMPTS {
-        return;
+    if attempts >= MAX_DISPATCH_ATTEMPTS {
+        // Out of attempts. The due query will not select this dispatch again, so the provider
+        // stops being called; what remains is leaving the right thing behind for a person.
+        terminal_transition(&mut transaction, dispatch, error, attempts).await?;
     }
 
-    // Out of attempts. The due query will not select this dispatch again, so the provider stops
-    // being called; what remains is making sure the right thing is left behind for a person.
+    transaction.commit().await
+}
+
+/// What an exhausted dispatch leaves behind.
+async fn terminal_transition(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch: &DispatchRow,
+    error: &CapacityError,
+    attempts: i32,
+) -> Result<(), sqlx::Error> {
     if dispatch.action == "release" {
-        // A release obligation outlives its retries. Marking the request `failed` would drop it
-        // out of the open-request index and so hide a machine that is very possibly still
-        // running and still being paid for. It stays `releasing`, and `outstanding_releases`
-        // is where it surfaces.
+        // A release obligation outlives its retries. The machine is presumed alive, so the
+        // request stays `releasing` and surfaces through `outstanding_releases`.
         warn!(
             dispatch = %dispatch.id,
             request = %dispatch.request_id,
             attempts,
             "capacity release exhausted its attempts; the machine may still exist"
         );
-        return;
+        return Ok(());
     }
 
-    // A provision that never obtained a handle made nothing, so failing it strands nothing. One
-    // that did obtain a handle holds a machine, and must stay visible rather than be marked
-    // `failed` -- which is exactly the state the open-request index excludes.
-    let _ = sqlx::query(
-        "UPDATE capacity_requests SET status = 'failed', updated_at = now() \
-         WHERE id = $1 AND status NOT IN ('released', 'failed') AND external_id IS NULL",
+    // The question is not whether provisioning succeeded -- it plainly did not -- but whether a
+    // machine exists anyway. Only a positive refusal answers that, and everything else leaves it
+    // open, so only a refusal may be recorded as `failed`.
+    let status = if error.may_have_created_capacity() {
+        warn!(
+            dispatch = %dispatch.id,
+            request = %dispatch.request_id,
+            attempts,
+            "capacity provision exhausted with an unknown outcome; a machine may exist"
+        );
+        RequestStatus::Unreconciled
+    } else {
+        warn!(dispatch = %dispatch.id, attempts, "capacity provision refused; giving up");
+        RequestStatus::Failed
+    };
+    // A request that obtained a handle holds a machine, whatever this dispatch thinks, so it is
+    // left alone rather than moved to either terminal state.
+    sqlx::query(
+        "UPDATE capacity_requests SET status = $2, updated_at = now() \
+         WHERE id = $1 AND status NOT IN ('released', 'releasing', 'failed') \
+           AND external_id IS NULL",
     )
     .bind(dispatch.request_id)
-    .execute(pool)
-    .await;
-    warn!(dispatch = %dispatch.id, attempts, "capacity dispatch given up");
+    .bind(status.as_str())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 /// Requests whose release ran out of attempts and may still be holding a machine.
@@ -673,6 +754,105 @@ pub async fn outstanding_releases(pool: &PgPool) -> Result<Vec<OutstandingReleas
     .fetch_all(pool)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))
+}
+
+/// Requests that were asked for and never usably answered, which may or may not have a machine.
+///
+/// The other half of the operator surface. These are not failures — a failure would be a claim
+/// that nothing exists — they are open questions, and they stay open until the provider answers
+/// one way or the other or a person settles them.
+///
+/// # Errors
+/// Returns an error when the database cannot be reached.
+pub async fn ambiguous_provisions(pool: &PgPool) -> Result<Vec<AmbiguousProvision>, CapacityError> {
+    sqlx::query_as::<_, AmbiguousProvision>(
+        "SELECT id AS request_id, attempt_id, project_id, provider, idempotency_key, last_error \
+         FROM capacity_requests WHERE status = 'unreconciled' ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| CapacityError::Inconsistent(error.to_string()))
+}
+
+/// Ask the provider again about a request whose outcome was never established.
+///
+/// This is the cheap resolution, and the reason the idempotency key is derived rather than random:
+/// the same question gets the same answer, so a provider that did build a machine hands back the
+/// handle that was lost and the request becomes ordinary `ready` capacity that can then be
+/// released properly.
+///
+/// # Errors
+/// Returns an error when the database cannot be reached.
+pub async fn reconcile_provision(pool: &PgPool, request_id: Uuid) -> Result<bool, CapacityError> {
+    let reset = sqlx::query(
+        "UPDATE capacity_dispatches SET attempts = 0, next_attempt_at = now() \
+         WHERE request_id = $1 AND action = 'provision' AND completed_at IS NULL",
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    Ok(reset.rows_affected() > 0)
+}
+
+/// Record that a person has established there is no machine behind an unreconciled request.
+///
+/// The expensive resolution, and deliberately explicit: it asserts something Kratos could not
+/// determine, so it is never reached by any automatic path and the reason is kept.
+///
+/// # Errors
+/// Returns an error when the database cannot be reached.
+pub async fn resolve_unreconciled(
+    pool: &PgPool,
+    request_id: Uuid,
+    note: &str,
+) -> Result<bool, CapacityError> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    let resolved = sqlx::query(
+        "UPDATE capacity_requests \
+         SET status = 'released', released_at = now(), last_error = $2, updated_at = now() \
+         WHERE id = $1 AND status = 'unreconciled'",
+    )
+    .bind(request_id)
+    .bind(truncate(note, MAX_ERROR_BYTES))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    if resolved.rows_affected() == 0 {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE capacity_dispatches SET completed_at = now() \
+         WHERE request_id = $1 AND completed_at IS NULL",
+    )
+    .bind(request_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    Ok(true)
+}
+
+/// A request whose provider outcome was never established.
+#[derive(Debug, sqlx::FromRow)]
+pub struct AmbiguousProvision {
+    pub request_id: Uuid,
+    pub attempt_id: Uuid,
+    pub project_id: Uuid,
+    pub provider: String,
+    /// What to ask the provider about, if anyone goes looking by hand.
+    pub idempotency_key: String,
+    pub last_error: Option<String>,
 }
 
 /// Capacity that Kratos has given up releasing and that a person now owns.

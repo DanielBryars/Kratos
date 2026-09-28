@@ -480,7 +480,7 @@ async fn a_stale_give_up_cannot_overwrite_another_controllers_success(pool: PgPo
     let machine = won.external_id.clone().unwrap();
 
     // Now the slow one gives up, against the state it read a moment ago.
-    record_failure(&pool, &stale, "provider unreachable").await;
+    record_failure(&pool, &stale, &CapacityError::Unavailable).await;
 
     let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
     assert_eq!(
@@ -526,7 +526,7 @@ async fn a_request_holding_a_machine_is_never_marked_failed(pool: PgPool) {
         .unwrap();
 
     let dispatch = read_dispatch(&pool, request_id, "provision").await;
-    record_failure(&pool, &dispatch, "provider unreachable").await;
+    record_failure(&pool, &dispatch, &CapacityError::Unavailable).await;
 
     let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
     assert_ne!(
@@ -694,6 +694,319 @@ async fn a_job_holding_capacity_cannot_be_deleted(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("a released request must not block ordinary cleanup");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Capacity that may exist without Kratos knowing
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_request_being_provisioned_cannot_be_deleted(pool: PgPool) {
+    // A request with no handle yet is the most dangerous thing to delete, not the safest: the
+    // provider call is in flight this instant, and cascading the row away means its answer
+    // arrives with nowhere to record the machine it describes.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT job_id FROM capacity_requests WHERE attempt_id = $1")
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // Hold the provider mid-call, which is exactly when the row has a null handle and a machine
+    // is being built. Forcing the window rather than hoping to land in it.
+    let provider = Arc::new(FakeProvider::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    provider.hold_next_provision(gate.clone());
+    let started = provider.provision_started();
+    let dispatching = tokio::spawn({
+        let pool = pool.clone();
+        let provider = provider.clone();
+        async move { dispatch_once(&pool, provider.as_ref()).await }
+    });
+    started.notified().await;
+
+    let blocked = sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await;
+    assert!(
+        blocked.is_err(),
+        "a request with a provider call in flight must not be deleted"
+    );
+
+    gate.notify_waiters();
+    assert_eq!(dispatching.await.unwrap(), 1);
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(after.status, "ready");
+    assert!(
+        after.external_id.is_some(),
+        "the machine still had somewhere to be recorded: {after:?}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_vanished_request_is_never_provisioned(pool: PgPool) {
+    // The narrower window: the request is read, and is gone by the time the dispatch claims it.
+    // The claim is the permission to call the provider, so a claim that matches nothing must stop
+    // the dispatch rather than be assumed to have worked.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let request_id = request_id_of(&pool, attempt_id).await;
+    let dispatch = read_dispatch(&pool, request_id, "provision").await;
+    let stale = sqlx::query_as::<_, RequestRow>(
+        "SELECT id, attempt_id, job_id, status, external_id, idempotency_key, provider \
+         FROM capacity_requests WHERE id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stale.status, "requested");
+
+    // Settle and remove it, as a cancellation followed by retention would.
+    release_capacity(&pool, attempt_id).await.unwrap();
+    sqlx::query("DELETE FROM capacity_requests WHERE id = $1")
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The controller still holds the read it took before any of that happened.
+    let provider = FakeProvider::new();
+    let outcome = provision(&pool, &provider, &dispatch, &stale)
+        .await
+        .unwrap();
+
+    assert!(!outcome, "a vanished request completes nothing");
+    assert!(
+        provider.calls().is_empty(),
+        "the provider must not be asked for a machine nothing can record: {:?}",
+        provider.calls()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_provision_that_loses_its_answer_stays_reconcilable(pool: PgPool) {
+    // The failure a boundary cannot see through. `Unavailable` promises nothing about side
+    // effects: the provider may have built the machine and lost the reply. Treating that as
+    // "nothing was made" is how a running machine stops being anybody's problem.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+
+    for _ in 0..MAX_DISPATCH_ATTEMPTS {
+        provider.lose_next_provision_response();
+        sqlx::query(
+            "UPDATE capacity_dispatches SET next_attempt_at = now() WHERE completed_at IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        dispatch_once(&pool, &provider).await;
+    }
+
+    // A machine exists. Kratos has never been told its name.
+    assert_eq!(provider.machine_count(), 1);
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "unreconciled",
+        "an unknown outcome must not be recorded as a failure: {after:?}"
+    );
+    assert_eq!(after.external_id, None);
+    assert_eq!(
+        after.released_at, None,
+        "and must stay in the open-request index, where a person can see it"
+    );
+
+    let ambiguous = ambiguous_provisions(&pool).await.unwrap();
+    assert_eq!(ambiguous.len(), 1, "{ambiguous:?}");
+    assert_eq!(ambiguous[0].attempt_id, attempt_id);
+    assert_eq!(ambiguous[0].idempotency_key, idempotency_key(attempt_id));
+
+    // Asking the same question again is what recovers the lost handle -- the whole reason the
+    // idempotency key is derived rather than random.
+    assert!(
+        reconcile_provision(&pool, ambiguous[0].request_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+
+    let reconciled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(reconciled.status, "ready");
+    assert!(reconciled.external_id.is_some());
+    assert_eq!(
+        provider.machine_count(),
+        1,
+        "reconciling must find the machine, not build another"
+    );
+    assert!(ambiguous_provisions(&pool).await.unwrap().is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_refused_provision_is_still_recorded_as_failed(pool: PgPool) {
+    // The other side of the distinction, so that "we cannot be sure" does not swallow the case
+    // where we can be. A positive refusal is a promise that nothing was created.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+
+    for _ in 0..MAX_DISPATCH_ATTEMPTS {
+        provider.fail_next_provision("no such machine type");
+        sqlx::query(
+            "UPDATE capacity_dispatches SET next_attempt_at = now() WHERE completed_at IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        dispatch_once(&pool, &provider).await;
+    }
+
+    assert_eq!(provider.machine_count(), 0);
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "failed",
+        "a refusal is knowledge, and must not be filed as an open question: {after:?}"
+    );
+    assert!(ambiguous_provisions(&pool).await.unwrap().is_empty());
+
+    // And a failure that genuinely made nothing can still be settled and tidied away.
+    release_capacity(&pool, attempt_id).await.unwrap();
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "released"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unreconciled_request_is_not_quietly_settled(pool: PgPool) {
+    // Cancelling the job must not convert "we do not know" into "nothing is running". Only a
+    // person can assert that, and the assertion is kept.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+    for _ in 0..MAX_DISPATCH_ATTEMPTS {
+        provider.lose_next_provision_response();
+        sqlx::query(
+            "UPDATE capacity_dispatches SET next_attempt_at = now() WHERE completed_at IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        dispatch_once(&pool, &provider).await;
+    }
+
+    release_capacity(&pool, attempt_id).await.unwrap();
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "unreconciled",
+        "cancelling must not assert that an unknown machine does not exist: {after:?}"
+    );
+
+    let request_id = request_id_of(&pool, attempt_id).await;
+    let job_id: Uuid = sqlx::query_scalar("SELECT job_id FROM capacity_requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("DELETE FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .execute(&pool)
+            .await
+            .is_err(),
+        "nor let it be deleted while the question is open"
+    );
+
+    // A person looks, finds nothing, and says so.
+    assert!(
+        resolve_unreconciled(
+            &pool,
+            request_id,
+            "checked the console by hand; no such machine"
+        )
+        .await
+        .unwrap()
+    );
+    let settled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(settled.status, "released");
+    assert_eq!(
+        settled.last_error.as_deref(),
+        Some("checked the console by hand; no such machine"),
+        "the assertion is kept, because it was a judgement rather than an observation"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_last_attempt_commits_as_one_transaction(pool: PgPool) {
+    // The crash boundary at attempt eight. Advancing the dispatch and moving the request are one
+    // decision: apply the first alone and the dispatch is permanently past the due query's cutoff
+    // while the request still looks live and appears on no operator surface -- stuck in a way
+    // nothing would ever notice.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let request_id = request_id_of(&pool, attempt_id).await;
+    sqlx::query("UPDATE capacity_dispatches SET attempts = $2 WHERE request_id = $1")
+        .bind(request_id)
+        .bind(MAX_DISPATCH_ATTEMPTS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Make the terminal statement -- and only the terminal statement -- fail, which is the crash
+    // window in the middle of the give-up.
+    sqlx::query(
+        "ALTER TABLE capacity_requests \
+         ADD CONSTRAINT no_unreconciled CHECK (status <> 'unreconciled') NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let dispatch = read_dispatch(&pool, request_id, "provision").await;
+    record_failure(&pool, &dispatch, &CapacityError::Unavailable).await;
+
+    let (attempts, last_error): (i32, Option<String>) =
+        sqlx::query_as("SELECT attempts, last_error FROM capacity_dispatches WHERE id = $1")
+            .bind(dispatch.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attempts,
+        MAX_DISPATCH_ATTEMPTS - 1,
+        "a give-up that could not be completed must leave the dispatch retryable, not spent"
+    );
+    assert_eq!(last_error, None);
+    assert_eq!(
+        snapshot(&pool, attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_error,
+        None,
+        "and must write nothing about the request either"
+    );
+
+    // With the obstruction gone the same give-up applies completely, both parts together.
+    sqlx::query("ALTER TABLE capacity_requests DROP CONSTRAINT no_unreconciled")
+        .execute(&pool)
+        .await
+        .unwrap();
+    record_failure(&pool, &dispatch, &CapacityError::Unavailable).await;
+    let spent: i32 = sqlx::query_scalar("SELECT attempts FROM capacity_dispatches WHERE id = $1")
+        .bind(dispatch.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(spent, MAX_DISPATCH_ATTEMPTS);
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "unreconciled",
+        "the dispatch reaching its limit and the request moving are one decision"
+    );
 }
 
 #[test]

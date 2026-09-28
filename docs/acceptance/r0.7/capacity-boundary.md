@@ -120,6 +120,73 @@ test also checks.
 
 *With the trigger removed:* `deleting a job that still holds capacity must be refused`.
 
+### 9. Capacity in flight cannot be deleted
+
+The delete guard's test is `released_at IS NULL`, not "holds a handle". A request that is merely
+`requested` or `provisioning` has no handle *yet* and may have a provider call in flight this
+instant: cascade it away and the provider's answer arrives with nowhere to record the machine it
+describes. Being certain nothing is running is exactly what `released` means, and it is the only
+state that means it.
+
+The test forces the window — the fake holds its provision open, the deletion is attempted while
+the handle is still null, and the dispatch is then allowed to finish and record its machine.
+
+*With the guard back at "holds a handle":* the delete succeeded and the test failed at the
+assertion that it must not.
+
+A narrower window sits just before that one: the request is read, and is gone by the time the
+dispatch acts on it. The `requested -> provisioning` update is therefore the *permission* to call
+the provider, and its `rows_affected` is checked rather than assumed.
+
+*With the claim's result assumed:* the provider was asked to build a machine for a request that no
+longer existed.
+
+### 10. An unknown outcome is not recorded as a failure
+
+`CapacityError::Unavailable` promises nothing about side effects. A provider can build the machine
+and lose the reply, and after enough attempts the old code marked the request `failed` — a claim
+that nothing exists, made about the one case where nobody knows.
+
+The distinction is now part of the provider contract rather than an inference: `Refused` is a
+promise that nothing was created, and an implementation must use `Unavailable` for anything it
+cannot promise that about. An exhausted provision that ended in a refusal becomes `failed`; one
+that ended in anything else becomes `unreconciled`, stays in the open-request index, and appears
+in `ambiguous_provisions`.
+
+Such a request has two resolutions, and both are tested. `reconcile_provision` asks the provider
+the same question again — the entire reason the idempotency key is derived rather than random — and
+the machine's lost name comes back, leaving ordinary `ready` capacity that can be released
+properly. `resolve_unreconciled` is a person asserting there is no machine, which is never reached
+by any automatic path and whose reason is kept, because it is a judgement rather than an
+observation.
+
+Cancelling the job does *not* settle it: converging an unreconciled request to `released` would
+record the one thing nobody knows.
+
+*With the outcome inferred to be harmless:* `an unknown outcome must not be recorded as a failure —
+status: "failed", external_id: None`, while the fake provider held a machine built under that
+request's key.
+
+*With cancellation allowed to settle it:* `cancelling must not assert that an unknown machine does
+not exist — left: "released", right: "unreconciled"`.
+
+The opposite error is tested too: a provision refused eight times is still recorded as `failed`,
+so "we cannot be sure" does not swallow the cases where we can be.
+
+### 11. The last attempt commits as one transaction
+
+Advancing the dispatch, recording the request's error and moving the request to its terminal state
+are one decision. Applied separately, a crash after the dispatch reaches its final attempt leaves
+it permanently past the due query's cutoff while the request still looks live and appears on no
+operator surface — stuck in a way nothing would ever notice.
+
+The test makes the terminal statement, and only the terminal statement, fail, then checks the
+dispatch is still retryable rather than spent.
+
+*With the bookkeeping split across separate commits:* `a give-up that could not be completed must
+leave the dispatch retryable, not spent — left: 8, right: 7`. Eight is the cutoff: that dispatch
+would never have been selected again.
+
 ## Failure handling
 
 A refused dispatch records its reason and is retried with exponential backoff, stored as a
@@ -129,12 +196,14 @@ provider stops being called rather than being asked forever.
 
 What is left behind depends on what was being attempted.
 
-A **provision** that never obtained a handle made nothing, so the request is marked `failed` and
-left for a person. A **release** is different: the obligation outlives its retries and the machine
-is presumed alive, so the request stays `releasing` — inside the open-request index — and is
-surfaced by `outstanding_releases`, the operator view for the one failure this boundary cannot
-resolve by itself. Marking it `failed` would drop it out of the index and hide exactly the machine
-someone needs to go and deal with.
+A **provision** that was positively refused made nothing, so the request is marked `failed`. A
+provision that ended any other way is `unreconciled`, because the machine may exist. A **release**
+is different again: the obligation outlives its retries and the machine is presumed alive, so the
+request stays `releasing` and is surfaced by `outstanding_releases`.
+
+All three stay inside the open-request index, whose predicate is now `released_at IS NULL` and
+nothing else. Excluding terminal-*looking* statuses was how a machine could stop being anybody's
+problem: `released` is the only state that means nothing is held.
 
 *With the attempts cutoff removed:* `the provider must be asked exactly as many times as the limit
 says, then left alone — left: 12, right: 8`.

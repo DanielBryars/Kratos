@@ -31,6 +31,9 @@ struct State {
     released: Vec<String>,
     calls: Vec<Call>,
     fail_next_provision: Option<String>,
+    /// When set, the next provision builds the machine and *then* fails, as a provider whose
+    /// reply is lost does. The machine exists; Kratos never hears its name.
+    lose_next_response: bool,
     fail_next_release: Option<String>,
     /// When set, the next provision waits here after announcing it has started. That is what lets
     /// a test cancel a request while the provider is mid-answer, which is the race the
@@ -91,6 +94,18 @@ impl FakeProvider {
         self.state.lock().unwrap().fail_next_provision = Some(reason.to_owned());
     }
 
+    /// Make the next provision build its machine and then lose the reply.
+    ///
+    /// The failure a boundary cannot see through: the call returns `Unavailable`, which promises
+    /// nothing about side effects, and on the other side a machine is running under the request's
+    /// idempotency key. Asking the same question again is the only way to learn its name.
+    ///
+    /// # Panics
+    /// Panics if the lock is poisoned, which can only happen if a test has already failed.
+    pub fn lose_next_provision_response(&self) {
+        self.state.lock().unwrap().lose_next_response = true;
+    }
+
     /// Make the next release fail.
     ///
     /// # Panics
@@ -144,6 +159,11 @@ impl CapacityProvider for FakeProvider {
             .entry(spec.idempotency_key.clone())
             .or_insert_with(|| format!("fake-{}", Uuid::new_v4()))
             .clone();
+        if std::mem::take(&mut state.lose_next_response) {
+            // Built, then the reply went missing. `Unavailable` rather than `Refused`, because a
+            // refusal would be a promise that nothing was made -- and something was.
+            return Err(CapacityError::Unavailable);
+        }
         Ok(ProvisionedCapacity { external_id })
     }
 

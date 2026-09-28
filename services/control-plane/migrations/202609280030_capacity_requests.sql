@@ -25,8 +25,13 @@ CREATE TABLE capacity_requests (
     -- Derived from the attempt, so a replay after a restart asks the provider the same question
     -- and is answered with the same machine rather than a second one.
     idempotency_key text NOT NULL UNIQUE CHECK (length(idempotency_key) BETWEEN 1 AND 200),
+    -- `unreconciled` is the honest answer to a question nobody can answer from here: the provider
+    -- was asked, it never gave a usable reply, and it may or may not have built the machine. A
+    -- provider error that is not a positive refusal promises nothing about side effects, so
+    -- calling that state `failed` would be asserting something unknown.
     status text NOT NULL DEFAULT 'requested'
-        CHECK (status IN ('requested', 'provisioning', 'ready', 'releasing', 'released', 'failed')),
+        CHECK (status IN ('requested', 'provisioning', 'ready', 'releasing', 'released',
+                          'unreconciled', 'failed')),
     -- What the provider calls the machine. Null until the provider has answered, and never
     -- overwritten once set: it is the only handle by which capacity can be released.
     external_id text CHECK (external_id IS NULL OR length(external_id) BETWEEN 1 AND 200),
@@ -46,9 +51,12 @@ CREATE TABLE capacity_requests (
 );
 
 CREATE INDEX capacity_requests_job_idx ON capacity_requests (job_id);
+-- Open means not released, and nothing else. Excluding terminal-looking statuses as well would
+-- hide precisely the requests a person needs to see: one that failed without a positive refusal
+-- may still have a machine behind it. `released` is the only state that means nothing is held.
 CREATE INDEX capacity_requests_open_idx
     ON capacity_requests (project_id, created_at)
-    WHERE status NOT IN ('released', 'failed');
+    WHERE released_at IS NULL;
 
 -- The outbox. A row is an intention to tell the provider something, and it survives a restart in
 -- the middle of telling it.
@@ -77,19 +85,24 @@ CREATE INDEX capacity_dispatches_pending_idx
 
 -- Deleting the parent job or attempt would cascade away `external_id` -- the only handle by which
 -- the machine can ever be released -- and the pending release dispatch with it, leaving a paid
--- machine running with nothing in the database pointing at it. So deletion is refused while the
--- request still holds capacity.
+-- machine running with nothing in the database pointing at it.
+--
+-- The test is `released_at IS NULL`, not "holds a handle". A request that is merely `requested` or
+-- `provisioning` has no handle yet and may have a provider call in flight this instant: cascade it
+-- away and the provider's answer arrives with nowhere durable to record the machine it describes.
+-- Being certain nothing is running is exactly what `released` means, and it is the only state that
+-- means it.
 --
 -- A trigger rather than ON DELETE RESTRICT because the rule is conditional on the row's state: a
--- settled request holds nothing and should not stand in the way of retention tidying a finished
+-- released request holds nothing and should not stand in the way of retention tidying a finished
 -- job away. Cascaded deletes fire row triggers, so this guards the parents too.
 CREATE FUNCTION capacity_requests_refuse_open_delete() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF OLD.external_id IS NOT NULL AND OLD.released_at IS NULL THEN
+    IF OLD.released_at IS NULL THEN
         RAISE EXCEPTION
-            'capacity request % still holds provider capacity %; release it before deleting',
-            OLD.id, OLD.external_id
+            'capacity request % is not released (status %, handle %); settle it before deleting',
+            OLD.id, OLD.status, coalesce(OLD.external_id, 'none')
             USING ERRCODE = 'restrict_violation';
     END IF;
     RETURN OLD;
