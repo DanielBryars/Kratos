@@ -46,16 +46,23 @@ A job cancelled while `queued` never had an attempt, and the foreign key means t
 derive a request from. No controller logic decides this, so no later change of mind in the
 scheduler can get it wrong.
 
-### 3. Provisioning cancellation converges to released
+### 3. Cancellation converges, but only one case converges immediately
 
-Two cases, and the second is the one that costs money:
+Three cases, distinguished by what is actually known rather than by whether a handle has been
+recorded. Getting this distinction wrong is the subject of sections 10 and 12, and it took three
+review rounds to remove from the code, so it is worth stating precisely here.
 
-- Cancelled before the provider answered: nothing was made, so the request converges straight to
-  `released` and the pending dispatch is cancelled. A late dispatch finds the request already
-  terminal and never asks for a machine.
-- **Cancelled while the provider was answering:** the machine exists by the time we hear back. It
-  must be handed back rather than forgotten. The test forces exactly this race — the fake holds
-  its provision open until the test has released the request.
+- **Cancelled before the provider was called.** Not "before it answered" — before it was *called*,
+  which is a state the code can check: the request is still `requested`, because the claim in
+  `provision` moves it out of that state before any provider call. Nothing was made, so the
+  request converges straight to `released` and the pending dispatch is cancelled. A late dispatch
+  finds the request terminal and never asks for a machine.
+- **Cancelled while the provider was answering.** The machine exists by the time we hear back, so
+  it must be handed back rather than forgotten. The test forces the race — the fake holds its
+  provision open until the test has released the request.
+- **Cancelled while the outcome is unknown.** The provider was called and did not answer usably,
+  so nobody knows whether a machine exists. This does *not* converge: it cannot, without asserting
+  the one thing nobody knows. See section 12.
 
 *With the post-provision reconciliation disabled:* the released request came back as
 `status: "ready", external_id: Some("fake-…"), released_at: None` — a live machine with nothing
@@ -261,7 +268,17 @@ recorded here rather than presented as a protection that has been proved.
 
 No real provider exists, so none of this says anything about a cloud API's actual idempotency
 semantics — which is the single most important thing a real implementation must get right, and
-the first thing to test against a live provider behind a spend limit.
+the first thing to test against a live provider behind a spend limit. The contract this boundary
+leans on hardest is the honesty of `Refused` versus `Unavailable`: a real provider that reports a
+timeout as a refusal would defeat section 10 entirely.
+
+**The operator surfaces are functions, not a console.** `ambiguous_provisions` and
+`outstanding_releases` are the two states the boundary cannot resolve by itself, and both currently
+require somebody to call them from code. Nothing routes them to a person, and neither has an alert.
+A first real provider must not be switched on before that exists, because both states mean "a
+machine may be running and Kratos has stopped trying" — which is precisely the situation that costs
+money quietly. `resolve_unreconciled` also has no caller: settling an open question is, by design,
+a deliberate human act, and there is currently no way for a human to perform it.
 
 The feature has never been switched on, and switching it on with only the fake registered does
 nothing.

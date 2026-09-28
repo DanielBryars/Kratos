@@ -212,12 +212,15 @@ async fn cancelling_a_queued_job_creates_no_capacity_request(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn cancelling_while_provisioning_converges_to_released(pool: PgPool) {
-    // The dangerous case: the provider is mid-answer when the job is cancelled. The machine will
-    // exist, so forgetting the request would leave capacity running that nobody is watching.
+    // The one case that converges immediately, and it is the safe one: the request is still
+    // `requested`, which is the state the claim in `provision` moves it out of *before* any
+    // provider call, so the provider has provably never been asked. The dangerous cases -- called
+    // and mid-answer, or called with the answer lost -- are covered separately, and confusing
+    // "before it answered" with "before it was called" is what those tests exist for.
     let attempt_id = seed_attempt(&pool).await;
     request_capacity(&pool, attempt_id, "fake").await.unwrap();
 
-    // Cancelled after the request was made but before the provider answered.
+    // Cancelled after the request was made but before the provider was ever called.
     release_capacity(&pool, attempt_id).await.unwrap();
     let snapshot = snapshot(&pool, attempt_id).await.unwrap().unwrap();
     assert_eq!(
