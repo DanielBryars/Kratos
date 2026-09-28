@@ -72,6 +72,11 @@ def emit_selection_parameters(selection: DatasetSelection) -> None:
     emit_param("dataset.name", selection.dataset_name)
     emit_param("dataset.version_id", str(selection.dataset_version_id))
     emit_param("dataset.version_number", selection.version_number)
+    emit_param("dataset.source_kind", selection.source_kind)
+    if selection.source_repository is not None:
+        emit_param("dataset.source_repository", selection.source_repository)
+    if selection.resolved_revision is not None:
+        emit_param("dataset.resolved_revision", selection.resolved_revision)
     emit_param("dataset.manifest_sha256", selection.manifest_sha256)
     emit_param("dataset.selection_sha256", selection.selection_sha256)
     emit_param("dataset.included_episode_count", len(selection.included_episodes))
@@ -110,6 +115,9 @@ class DatasetSelection:
     dataset_name: str
     dataset_version_id: UUID
     version_number: int
+    source_kind: str
+    source_repository: str | None
+    resolved_revision: str | None
     manifest_sha256: str
     dataset_view_id: UUID | None
     dataset_view_name: str | None
@@ -125,6 +133,9 @@ class DatasetSelection:
             "name": self.dataset_name,
             "dataset_version_id": str(self.dataset_version_id),
             "version_number": self.version_number,
+            "source_kind": self.source_kind,
+            "source_repository": self.source_repository,
+            "resolved_revision": self.resolved_revision,
             "manifest_sha256": self.manifest_sha256,
             "dataset_view_id": str(self.dataset_view_id) if self.dataset_view_id else None,
             "dataset_view_name": self.dataset_view_name,
@@ -204,6 +215,15 @@ def load_dataset_selection(
         dataset_id = UUID(str(raw["dataset_id"]))
         dataset_version_id = UUID(str(raw["dataset_version_id"]))
         version_number = int(raw["version_number"])
+        source_kind = str(raw["source_kind"])
+        source_repository_raw = raw.get("source_repository")
+        source_repository = (
+            str(source_repository_raw) if source_repository_raw is not None else None
+        )
+        resolved_revision_raw = raw.get("resolved_revision")
+        resolved_revision = (
+            str(resolved_revision_raw) if resolved_revision_raw is not None else None
+        )
         manifest_sha256 = str(raw["manifest_sha256"])
         dataset_name = str(raw["dataset_name"])
         view_id_raw = raw.get("dataset_view_id")
@@ -226,6 +246,18 @@ def load_dataset_selection(
         raise RuntimeError("dataset selection fields are invalid") from error
     if version_number < 1 or not dataset_name:
         raise RuntimeError("dataset selection identity is invalid")
+    if source_kind == "hugging_face":
+        if (
+            not source_repository
+            or resolved_revision is None
+            or re.fullmatch(r"[0-9a-f]{40}", resolved_revision) is None
+        ):
+            raise RuntimeError("Hugging Face source identity is invalid")
+    elif source_kind == "upload":
+        if source_repository is not None or resolved_revision is not None:
+            raise RuntimeError("uploaded dataset source identity is invalid")
+    else:
+        raise RuntimeError("dataset source kind is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
         raise RuntimeError("dataset manifest digest is invalid")
     if len(set(included_episodes)) != len(included_episodes):
@@ -246,6 +278,9 @@ def load_dataset_selection(
         dataset_name=dataset_name,
         dataset_version_id=dataset_version_id,
         version_number=version_number,
+        source_kind=source_kind,
+        source_repository=source_repository,
+        resolved_revision=resolved_revision,
         manifest_sha256=manifest_sha256,
         dataset_view_id=dataset_view_id,
         dataset_view_name=dataset_view_name,

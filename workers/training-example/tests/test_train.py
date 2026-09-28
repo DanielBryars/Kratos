@@ -31,6 +31,9 @@ def write_selection(
                 "dataset_name": "Robot reaches",
                 "dataset_version_id": "22222222-2222-4222-8222-222222222222",
                 "version_number": 3,
+                "source_kind": "upload",
+                "source_repository": None,
+                "resolved_revision": None,
                 "manifest_sha256": "a" * 64,
                 "dataset_view_id": (
                     None if selects_every_episode else "33333333-3333-4333-8333-333333333333"
@@ -135,6 +138,9 @@ def test_dataset_selection_emits_mlflow_lineage(capsys: pytest.CaptureFixture[st
         dataset_name="Robot reaches",
         dataset_version_id=UUID("22222222-2222-4222-8222-222222222222"),
         version_number=3,
+        source_kind="hugging_face",
+        source_repository="huggingface/robot-reaches",
+        resolved_revision="d" * 40,
         manifest_sha256="a" * 64,
         dataset_view_id=UUID("33333333-3333-4333-8333-333333333333"),
         dataset_view_name="Good reaches",
@@ -152,6 +158,9 @@ def test_dataset_selection_emits_mlflow_lineage(capsys: pytest.CaptureFixture[st
     assert all(record["record"] == "param" for record in records)
     assert params["dataset.version_id"] == "22222222-2222-4222-8222-222222222222"
     assert params["dataset.view_id"] == "33333333-3333-4333-8333-333333333333"
+    assert params["dataset.source_kind"] == "hugging_face"
+    assert params["dataset.source_repository"] == "huggingface/robot-reaches"
+    assert params["dataset.resolved_revision"] == "d" * 40
     assert params["dataset.included_episodes"] == "[7, 2]"
     assert params["dataset.included_episode_count"] == 2
     assert params["dataset.selection_sha256"] == "c" * 64
@@ -166,6 +175,9 @@ def test_large_dataset_selection_omits_oversized_episode_list(
         dataset_name="Robot reaches",
         dataset_version_id=UUID("22222222-2222-4222-8222-222222222222"),
         version_number=3,
+        source_kind="upload",
+        source_repository=None,
+        resolved_revision=None,
         manifest_sha256="a" * 64,
         dataset_view_id=UUID("33333333-3333-4333-8333-333333333333"),
         dataset_view_name="Good reaches",
