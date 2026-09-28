@@ -382,9 +382,13 @@ def test_dot_kratos_can_never_be_an_alias(candidate: str) -> None:
         )
 
 
-def test_the_selection_directory_is_not_writable_by_the_workload(tmp_path: Path) -> None:
-    # A workload able to add or replace a selection could rewrite the record of what it was
-    # allowed to train on.
+def test_the_selection_directory_stays_writable_to_the_agent(tmp_path: Path) -> None:
+    """The workload is kept out by the read-only mount, not by the host-side mode.
+
+    Sealing this directory against the agent itself protected nothing the mount did not already
+    protect, and stopped cleanup unlinking the manifest inside it. The test that matters for the
+    workload is the live mount one; this only pins that the agent can still manage its own tree.
+    """
     state_root = tmp_path / "state"
     attempt_root = state_root / "attempts" / "one"
     payload = b"x"
@@ -392,7 +396,9 @@ def test_the_selection_directory_is_not_writable_by_the_workload(tmp_path: Path)
     staged = stage_input(
         state_root, attempt_root, client, manifest((dataset_file("meta/info.json", payload),))
     )
-    assert not staged.selection_path.parent.stat().st_mode & 0o222
+    assert staged.selection_path.parent.stat().st_mode & 0o200
+    assert not staged.selection_path.stat().st_mode & 0o222, "the record itself is read-only"
+    assert discard_attempt_inputs(attempt_root) is True, "and cleanup can still remove it"
 
 
 def test_the_selection_manifest_never_carries_a_download_url(tmp_path: Path) -> None:

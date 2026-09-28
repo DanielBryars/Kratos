@@ -43,9 +43,11 @@ CACHE_DIRECTORY = "dataset-cache"
 # can ever be named `.kratos`.
 SELECTION_DIRECTORY = ".kratos"
 SELECTION_SUFFIX = ".json"
-# The directory is traversable and readable but not writable: a workload that could add or replace
-# a selection could rewrite the record of what it was allowed to train on.
-SELECTION_DIRECTORY_MODE = 0o555
+# Writable by the agent, like every other directory it owns. The workload cannot alter a selection
+# because the whole of /kratos/inputs is mounted read-only -- that mount is the isolation boundary,
+# not this mode. Making it 0555 host-side protected nothing the mount did not already protect and
+# stopped the agent unlinking its own manifest during cleanup, which is what the live suite caught.
+SELECTION_DIRECTORY_MODE = 0o755
 
 # Read-only to the workload's user, and the agent owns the directories. The workload runs as an
 # arbitrary user, so the tree has to be readable by it; nothing in it needs to be writable.
@@ -351,14 +353,13 @@ def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest)
             for dataset_file in manifest.files
         ],
     }
-    # The directory is made writable to replace the manifest and sealed again afterwards, so a
-    # restaged attempt can rewrite its own selection while a workload never can.
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.parent.chmod(INPUT_DIRECTORY_MODE)
+    destination.parent.chmod(SELECTION_DIRECTORY_MODE)
     _force_remove(destination)
     destination.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
+    # The file itself stays read-only. It is its own inode rather than a link into the cache, so
+    # this costs nothing, and it says plainly that a selection is a record and not a scratch file.
     destination.chmod(READ_ONLY_FILE_MODE)
-    destination.parent.chmod(SELECTION_DIRECTORY_MODE)
     return destination
 
 
