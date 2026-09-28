@@ -20,6 +20,9 @@ use crate::{
 
 const DOWNLOAD_SECONDS: u32 = 3_600;
 pub(crate) const MAX_JOB_DATASET_INPUTS: usize = 8;
+const MAX_DATASET_INPUT_FILES: i64 = 10_000;
+const MAX_DATASET_INPUT_FILE_BYTES: i64 = 20 * 1024 * 1024 * 1024;
+const MAX_DATASET_INPUT_TOTAL_BYTES: i64 = 200 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -128,7 +131,14 @@ pub(crate) async fn insert_job_dataset_inputs(
              FROM dataset_versions dv \
              LEFT JOIN dataset_views view ON view.version_id = dv.id AND view.id = $6 \
              WHERE dv.id = $4 AND dv.project_id = $5 AND dv.status = 'ready' \
-               AND ($6::uuid IS NULL OR view.id IS NOT NULL)",
+               AND ($6::uuid IS NULL OR view.id IS NOT NULL) \
+               AND (SELECT count(*) FROM dataset_files file \
+                    WHERE file.version_id = dv.id AND file.status = 'verified') <= $7 \
+               AND NOT EXISTS (SELECT 1 FROM dataset_files file \
+                    WHERE file.version_id = dv.id AND file.status = 'verified' \
+                      AND file.byte_length > $8) \
+               AND COALESCE((SELECT sum(file.byte_length) FROM dataset_files file \
+                    WHERE file.version_id = dv.id AND file.status = 'verified'), 0) <= $9",
         )
         .bind(Uuid::new_v4())
         .bind(job_id)
@@ -136,6 +146,9 @@ pub(crate) async fn insert_job_dataset_inputs(
         .bind(input.dataset_version_id)
         .bind(project_id)
         .bind(input.dataset_view_id)
+        .bind(MAX_DATASET_INPUT_FILES)
+        .bind(MAX_DATASET_INPUT_FILE_BYTES)
+        .bind(MAX_DATASET_INPUT_TOTAL_BYTES)
         .execute(&mut **transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
@@ -394,7 +407,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        JobDatasetInputRequest, insert_job_dataset_inputs, load_job_dataset_inputs, valid_alias,
+        JobDatasetInputRequest, MAX_DATASET_INPUT_FILE_BYTES, insert_job_dataset_inputs,
+        load_job_dataset_inputs, valid_alias,
     };
     use crate::projects::DEFAULT_PROJECT_ID;
 
@@ -462,6 +476,20 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "INSERT INTO dataset_files \
+             (id, version_id, project_id, logical_path, media_type, byte_length, sha256, \
+              storage_bucket, storage_object_key, storage_generation, status, verified_at) \
+             VALUES ($1, $2, $3, 'meta/info.json', 'application/json', 1, $4, \
+                     'datasets', 'svla/meta/info.json', 1, 'verified', now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(version_id)
+        .bind(DEFAULT_PROJECT_ID)
+        .bind("e".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO dataset_views \
              (id, dataset_id, version_id, project_id, name, manifest_sha256, \
               included_episode_count, created_by_identity_id) \
@@ -515,5 +543,40 @@ mod tests {
         assert_eq!(input.alias, "training_data");
         assert_eq!(input.dataset_manifest_sha256, "b".repeat(64));
         assert_eq!(input.dataset_view_manifest_sha256, Some("c".repeat(64)));
+
+        // A catalogue version may exist for review or archival even when it is too large for the
+        // first worker execution profile. Reject it at job creation so a worker never receives an
+        // assignment its strict protocol model cannot parse.
+        let oversized_job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO jobs (id, owner_identity_id, project_id, name, image_reference, timeout_seconds) \
+             VALUES ($1, $2, $3, 'Oversized training', $4, 120)",
+        )
+        .bind(oversized_job_id)
+        .bind(owner_id)
+        .bind(DEFAULT_PROJECT_ID)
+        .bind(format!("example.test/work@sha256:{}", "f".repeat(64)))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE dataset_files SET byte_length = $2 WHERE version_id = $1")
+            .bind(version_id)
+            .bind(MAX_DATASET_INPUT_FILE_BYTES + 1)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut transaction = pool.begin().await.unwrap();
+        let rejected = insert_job_dataset_inputs(
+            &mut transaction,
+            oversized_job_id,
+            DEFAULT_PROJECT_ID,
+            &[JobDatasetInputRequest {
+                alias: "training_data".to_owned(),
+                dataset_version_id: version_id,
+                dataset_view_id: None,
+            }],
+        )
+        .await;
+        assert!(rejected.is_err());
     }
 }

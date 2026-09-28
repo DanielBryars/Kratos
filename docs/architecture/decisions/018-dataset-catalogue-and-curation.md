@@ -93,6 +93,13 @@ its digest, and mounts each selected input read-only at `/kratos/inputs/{alias}`
 container receives no object-store credential and retains no network access. A cache entry is usable
 only after complete digest verification; partial transfers are never mounted.
 
+The same read-only mount contains one Kratos-owned selection description at
+`/kratos/inputs/.kratos/{alias}.json`. It records the exact version and optional view identity,
+their manifest hashes, and the ordered `included_episodes` returned by the attempt-scoped manifest.
+The `.kratos` name cannot be an input alias. The agent refuses an alias, version, view or manifest
+identity mismatch before writing this file or starting the workload. Training adapters use this
+description when a view is selected; silently training on the complete version is an attempt failure.
+
 The first catalogue and curation change may ship before agent staging. Until staging is released,
 the console SHALL identify dataset-backed scheduling as unavailable and the job API SHALL reject a
 dataset reference rather than silently run without it.
@@ -118,6 +125,7 @@ not rely on parameters printed by the workload.
 
 - A dataset has at most 10,000 files in the first upload profile.
 - A job has at most eight dataset inputs; aliases match `^[a-z][a-z0-9_-]{0,31}$`.
+- A schedulable input has at most 10,000 verified files, 20 GiB per file and 200 GiB in total.
 - A relative path is valid UTF-8, at most 512 bytes, and contains no empty, `.` or `..` segment.
 - Upload declarations include a positive byte length and a lowercase 64-character SHA-256.
 - `meta/info.json` is mandatory before a LeRobot version can become ready.
