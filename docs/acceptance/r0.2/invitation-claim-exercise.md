@@ -32,7 +32,7 @@ exercise meaningful rather than ceremonial.
 3. Record the deployed control-plane revision before starting, so the evidence names what ran:
 
    ```shell
-   gcloud run services describe kratos-control-plane \
+   gcloud run services describe kratos \
      --project=kratos-dev-509011 --region=europe-west2 \
      --format="value(status.latestReadyRevisionName)"
    ```
@@ -93,7 +93,7 @@ a predicate was missed, which is precisely what the project-scoping work was for
 
 ### 5. Confirm the guest holds real authority
 
-Have the **guest** quarantine a worker, then return it to service.
+Confirm the selected worker is idle and no jobs are queued. Record its approval and group membership before starting. Have the **guest** quarantine that worker, then return it to service and verify that its original approval and group membership are restored. Do not revoke or re-enrol it.
 
 **Expected:** it works, and the founder's console reflects it. A read-only invitee would be a
 different feature from the one that was asked for.
