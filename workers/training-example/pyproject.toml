@@ -5,6 +5,7 @@ description = "Reproducible CUDA training workload for Kratos"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy==2.3.3",
+    "pyarrow==21.0.0",
     "torch==2.8.0",
 ]
 
@@ -33,5 +34,5 @@ strict = true
 pythonpath = ["."]
 
 [[tool.mypy.overrides]]
-module = "torch.*"
+module = ["pyarrow.*", "torch.*"]
 ignore_missing_imports = true

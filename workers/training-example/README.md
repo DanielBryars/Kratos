@@ -4,6 +4,17 @@ This image is Kratos' first complete training workload. It trains a small neural
 on an exact, bundled version of the synthetic **Kratos Shapes** dataset. The workload requires CUDA
 and fails rather than falling back to CPU execution.
 
+When Kratos mounts a dataset input named `training`, the same image switches to a bounded LeRobot
+selection smoke run. It reads `/kratos/inputs/.kratos/training.json`, validates the immutable dataset
+and view identity, preserves the exact `included_episodes` order, and reads only those episodes from
+`/kratos/inputs/training/data/**/*.parquet`. It trains a small state-to-action regressor on at most
+4,096 rows. This is an end-to-end dataset-selection acceptance workload, not a replacement for a
+full SmolVLA training recipe.
+
+The mounted selection identity and ordered episode list are written into both the structured result
+and the durable checkpoint. A missing episode, malformed selection, unsupported Parquet schema, CPU
+fallback, or a training loop that does not reduce loss fails the attempt explicitly.
+
 The committed CSV is dataset version `kratos-shapes-v1`, containing 384 labelled, four-feature
 samples. Its required content digest is
 `sha256:c338e2ffabc1a0470ad2d4c0b9efa3ab53a82135aaca54845b3a3ebafd746451`.

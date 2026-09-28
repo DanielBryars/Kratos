@@ -5,9 +5,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import platform
 import random
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -17,6 +19,7 @@ from time import perf_counter
 from typing import Any, cast
 from uuid import UUID
 
+import pyarrow.parquet as parquet
 import torch
 from torch import Tensor, nn
 
@@ -25,6 +28,10 @@ WORKLOAD_VERSION = "kratos-training-example-v1"
 DATASET_VERSION = "kratos-shapes-v1"
 DATASET_SHA256 = "c338e2ffabc1a0470ad2d4c0b9efa3ab53a82135aaca54845b3a3ebafd746451"
 DATASET_PATH = Path(__file__).parent / "data" / "kratos_shapes_v1.csv"
+INPUT_DIRECTORY = Path("/kratos/inputs")
+DATASET_INPUT_ALIAS = "training"
+SELECTION_DIRECTORY = ".kratos"
+LEROBOT_MAX_ROWS = 4_096
 OUTPUT_DIRECTORY = Path("/kratos/outputs")
 CHECKPOINT_PATH = OUTPUT_DIRECTORY / "model.pt"
 SEED = 20260920
@@ -45,6 +52,40 @@ class RunIdentity:
         return {
             "kratos.job.id": str(self.job_id),
             "kratos.attempt.id": str(self.attempt_id),
+        }
+
+
+@dataclass(frozen=True)
+class DatasetSelection:
+    """Immutable dataset identity and ordered episode selection supplied by Kratos."""
+
+    alias: str
+    dataset_id: UUID
+    dataset_name: str
+    dataset_version_id: UUID
+    version_number: int
+    manifest_sha256: str
+    dataset_view_id: UUID | None
+    dataset_view_name: str | None
+    dataset_view_manifest_sha256: str | None
+    included_episodes: tuple[int, ...]
+    selects_every_episode: bool
+    selection_sha256: str
+
+    def result_fields(self) -> dict[str, Any]:
+        return {
+            "alias": self.alias,
+            "dataset_id": str(self.dataset_id),
+            "name": self.dataset_name,
+            "dataset_version_id": str(self.dataset_version_id),
+            "version_number": self.version_number,
+            "manifest_sha256": self.manifest_sha256,
+            "dataset_view_id": str(self.dataset_view_id) if self.dataset_view_id else None,
+            "dataset_view_name": self.dataset_view_name,
+            "dataset_view_manifest_sha256": self.dataset_view_manifest_sha256,
+            "included_episodes": list(self.included_episodes),
+            "selects_every_episode": self.selects_every_episode,
+            "selection_sha256": self.selection_sha256,
         }
 
 
@@ -71,12 +112,108 @@ class Classifier(nn.Module):
         return cast(Tensor, self.layers(features))
 
 
+class ActionRegressor(nn.Module):
+    """A small bounded model for proving that mounted LeRobot rows reach CUDA training."""
+
+    def __init__(self, feature_count: int, action_count: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(feature_count, 64), nn.Tanh(), nn.Linear(64, action_count)
+        )
+
+    def forward(self, features: Tensor) -> Tensor:
+        return cast(Tensor, self.layers(features))
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(64 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def selection_path(
+    alias: str = DATASET_INPUT_ALIAS, input_directory: Path = INPUT_DIRECTORY
+) -> Path:
+    if re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", alias) is None:
+        raise RuntimeError(f"dataset input alias is invalid: {alias!r}")
+    return input_directory / SELECTION_DIRECTORY / f"{alias}.json"
+
+
+def load_dataset_selection(
+    alias: str = DATASET_INPUT_ALIAS, input_directory: Path = INPUT_DIRECTORY
+) -> DatasetSelection:
+    """Load the agent-authored selection and reject ambiguous view semantics."""
+    path = selection_path(alias, input_directory)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"dataset selection is unavailable or invalid: {path}") from error
+    if not isinstance(raw, dict) or raw.get("schema_version") != "1.0":
+        raise RuntimeError("dataset selection schema is not supported")
+    if raw.get("alias") != alias:
+        raise RuntimeError("dataset selection alias does not match the workload input")
+    try:
+        dataset_id = UUID(str(raw["dataset_id"]))
+        dataset_version_id = UUID(str(raw["dataset_version_id"]))
+        version_number = int(raw["version_number"])
+        manifest_sha256 = str(raw["manifest_sha256"])
+        dataset_name = str(raw["dataset_name"])
+        view_id_raw = raw.get("dataset_view_id")
+        dataset_view_id = UUID(str(view_id_raw)) if view_id_raw is not None else None
+        view_name_raw = raw.get("dataset_view_name")
+        dataset_view_name = str(view_name_raw) if view_name_raw is not None else None
+        view_hash_raw = raw.get("dataset_view_manifest_sha256")
+        dataset_view_manifest_sha256 = str(view_hash_raw) if view_hash_raw is not None else None
+        episodes_raw = raw["included_episodes"]
+        if not isinstance(episodes_raw, list) or any(
+            not isinstance(episode, int) or isinstance(episode, bool) or episode < 0
+            for episode in episodes_raw
+        ):
+            raise ValueError("included_episodes must be non-negative integers")
+        included_episodes = tuple(episodes_raw)
+        selects_every_episode = raw["selects_every_episode"]
+        if not isinstance(selects_every_episode, bool):
+            raise ValueError("selects_every_episode must be boolean")
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("dataset selection fields are invalid") from error
+    if version_number < 1 or not dataset_name:
+        raise RuntimeError("dataset selection identity is invalid")
+    if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
+        raise RuntimeError("dataset manifest digest is invalid")
+    if len(set(included_episodes)) != len(included_episodes):
+        raise RuntimeError("dataset selection repeats an episode")
+    if selects_every_episode:
+        if dataset_view_id is not None or included_episodes:
+            raise RuntimeError("complete-version selection has contradictory view fields")
+    elif (
+        dataset_view_id is None
+        or not included_episodes
+        or dataset_view_manifest_sha256 is None
+        or re.fullmatch(r"[0-9a-f]{64}", dataset_view_manifest_sha256) is None
+    ):
+        raise RuntimeError("curated dataset selection is incomplete")
+    return DatasetSelection(
+        alias=alias,
+        dataset_id=dataset_id,
+        dataset_name=dataset_name,
+        dataset_version_id=dataset_version_id,
+        version_number=version_number,
+        manifest_sha256=manifest_sha256,
+        dataset_view_id=dataset_view_id,
+        dataset_view_name=dataset_view_name,
+        dataset_view_manifest_sha256=dataset_view_manifest_sha256,
+        included_episodes=included_episodes,
+        selects_every_episode=selects_every_episode,
+        selection_sha256=sha256_file(path),
+    )
+
+
+def mounted_selection_exists(
+    alias: str = DATASET_INPUT_ALIAS, input_directory: Path = INPUT_DIRECTORY
+) -> bool:
+    return selection_path(alias, input_directory).is_file()
 
 
 def save_checkpoint(checkpoint: dict[str, Any], path: Path = CHECKPOINT_PATH) -> str:
@@ -110,6 +247,67 @@ def load_dataset(path: Path = DATASET_PATH) -> tuple[Tensor, Tensor]:
     if len(rows) != 384:
         raise RuntimeError(f"dataset row count is {len(rows)}; expected 384")
     return torch.tensor(rows, dtype=torch.float32), torch.tensor(labels, dtype=torch.long)
+
+
+def _numeric_vector(value: object, column: str) -> list[float]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"LeRobot column {column!r} is not a non-empty numeric vector")
+    try:
+        vector = [float(item) for item in value]
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"LeRobot column {column!r} contains non-numeric data") from error
+    if any(not math.isfinite(item) for item in vector):
+        raise RuntimeError(f"LeRobot column {column!r} contains a non-finite value")
+    return vector
+
+
+def load_lerobot_rows(
+    selection: DatasetSelection,
+    input_directory: Path = INPUT_DIRECTORY,
+    max_rows: int = LEROBOT_MAX_ROWS,
+) -> tuple[Tensor, Tensor, tuple[int, ...]]:
+    """Read a bounded, ordered set of state/action rows from mounted LeRobot parquet files."""
+    if max_rows < 5:
+        raise ValueError("a LeRobot smoke run needs room for at least five rows")
+    root = input_directory / selection.alias
+    files = sorted((root / "data").glob("**/*.parquet"))
+    if not files:
+        raise RuntimeError(f"dataset input {selection.alias!r} has no data parquet files")
+    selected = None if selection.selects_every_episode else set(selection.included_episodes)
+    by_episode: dict[int, list[tuple[list[float], list[float]]]] = {}
+    encountered: list[int] = []
+    for path in files:
+        table = parquet.read_table(path, columns=["episode_index", "observation.state", "action"])
+        episodes = table.column("episode_index").to_pylist()
+        states = table.column("observation.state").to_pylist()
+        actions = table.column("action").to_pylist()
+        for raw_episode, raw_state, raw_action in zip(episodes, states, actions, strict=True):
+            episode = int(raw_episode)
+            if selected is not None and episode not in selected:
+                continue
+            if episode not in by_episode:
+                by_episode[episode] = []
+                encountered.append(episode)
+            by_episode[episode].append(
+                (
+                    _numeric_vector(raw_state, "observation.state"),
+                    _numeric_vector(raw_action, "action"),
+                )
+            )
+    order = list(selection.included_episodes) if selected is not None else encountered
+    missing = [episode for episode in order if episode not in by_episode]
+    if missing:
+        raise RuntimeError(f"selected LeRobot episodes are absent from parquet data: {missing}")
+    rows = [row for episode in order for row in by_episode[episode]][:max_rows]
+    if len(rows) < 5:
+        raise RuntimeError("selected LeRobot episodes contain fewer than five usable rows")
+    feature_count = len(rows[0][0])
+    action_count = len(rows[0][1])
+    if any(len(state) != feature_count or len(action) != action_count for state, action in rows):
+        raise RuntimeError("LeRobot state/action vector widths are inconsistent")
+    features = torch.tensor([state for state, _ in rows], dtype=torch.float32)
+    actions_tensor = torch.tensor([action for _, action in rows], dtype=torch.float32)
+    return features, actions_tensor, tuple(order)
 
 
 def configure_determinism() -> None:
@@ -149,8 +347,116 @@ def accuracy(logits: Tensor, labels: Tensor) -> float:
     return float((logits.argmax(dim=1) == labels).float().mean().item())
 
 
+def run_lerobot_training(
+    run_identity: RunIdentity,
+    selection: DatasetSelection,
+    input_directory: Path = INPUT_DIRECTORY,
+) -> dict[str, Any]:
+    """Run a bounded CUDA regression using only the episodes named by the immutable view."""
+    configure_determinism()
+    device = require_cuda()
+    features, actions, episode_order = load_lerobot_rows(selection, input_directory)
+    validation_mask = torch.arange(actions.shape[0]) % 5 == 0
+    train_features = features[~validation_mask]
+    train_actions = actions[~validation_mask]
+    validation_features = features[validation_mask]
+    validation_actions = actions[validation_mask]
+    feature_mean = train_features.mean(dim=0)
+    feature_scale = train_features.std(dim=0).clamp_min(1e-6)
+    action_mean = train_actions.mean(dim=0)
+    action_scale = train_actions.std(dim=0).clamp_min(1e-6)
+    train_features = ((train_features - feature_mean) / feature_scale).to(device)
+    validation_features = ((validation_features - feature_mean) / feature_scale).to(device)
+    train_actions = ((train_actions - action_mean) / action_scale).to(device)
+    validation_actions = ((validation_actions - action_mean) / action_scale).to(device)
+    model = ActionRegressor(features.shape[1], actions.shape[1]).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    loss_function = nn.MSELoss()
+    started = perf_counter()
+    initial_loss: float | None = None
+    model.train()
+    for _ in range(120):
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_function(model(train_features), train_actions)
+        if initial_loss is None:
+            initial_loss = float(loss.item())
+        loss.backward()
+        optimizer.step()
+    torch.cuda.synchronize(device)
+    duration_ms = (perf_counter() - started) * 1000
+    model.eval()
+    with torch.no_grad():
+        final_train_loss = float(loss_function(model(train_features), train_actions).item())
+        validation_loss = float(
+            loss_function(model(validation_features), validation_actions).item()
+        )
+    if initial_loss is None or final_train_loss >= initial_loss:
+        raise RuntimeError("LeRobot smoke training did not reduce loss")
+    checkpoint = {
+        "workload_version": WORKLOAD_VERSION,
+        "dataset_selection": selection.result_fields(),
+        "episode_order": episode_order,
+        "seed": SEED,
+        "model_state_dict": model.state_dict(),
+        "feature_mean": feature_mean,
+        "feature_scale": feature_scale,
+        "action_mean": action_mean,
+        "action_scale": action_scale,
+    }
+    checkpoint_hash = save_checkpoint(checkpoint)
+    properties = torch.cuda.get_device_properties(device)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": "succeeded",
+        "completed_at": datetime.now(UTC).isoformat(),
+        "workload": {
+            "name": "Kratos LeRobot dataset selection smoke training",
+            "version": WORKLOAD_VERSION,
+        },
+        "run": run_identity.result_fields(),
+        "telemetry": {"resource_attributes": run_identity.otel_resource_attributes()},
+        "dataset": selection.result_fields()
+        | {
+            "rows": int(actions.shape[0]),
+            "state_width": int(features.shape[1]),
+            "action_width": int(actions.shape[1]),
+            "episode_order": list(episode_order),
+        },
+        "configuration": {
+            "seed": SEED,
+            "epochs": 120,
+            "learning_rate": 0.01,
+            "max_rows": LEROBOT_MAX_ROWS,
+            "deterministic_algorithms": True,
+            "cpu_fallback": False,
+        },
+        "metrics": {
+            "initial_train_loss": round(initial_loss, 6),
+            "final_train_loss": round(final_train_loss, 6),
+            "validation_loss": round(validation_loss, 6),
+            "training_duration_ms": round(duration_ms, 3),
+        },
+        "model": {
+            "architecture": (f"Linear({features.shape[1]},64)-Tanh-Linear(64,{actions.shape[1]})"),
+            "state_sha256": model_state_sha256(model),
+            "checkpoint_sha256": checkpoint_hash,
+            "checkpoint_location": str(CHECKPOINT_PATH),
+            "checkpoint_staged": True,
+        },
+        "environment": {
+            "python": platform.python_version(),
+            "pytorch": torch.__version__,
+            "cuda_runtime": torch.version.cuda,
+            "gpu_name": properties.name,
+            "gpu_compute_capability": f"{properties.major}.{properties.minor}",
+        },
+    }
+
+
 def run_training() -> dict[str, Any]:
     run_identity = load_run_identity()
+    if mounted_selection_exists():
+        return run_lerobot_training(run_identity, load_dataset_selection())
     dataset_hash = verify_dataset()
     configure_determinism()
     device = require_cuda()
