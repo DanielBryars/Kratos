@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
+from uuid import UUID
 
 import httpx
 import pytest
@@ -40,9 +42,9 @@ def dataset_file(path: str, payload: bytes, *, sha256: str | None = None) -> Dat
 def manifest(files: tuple[DatasetInputFile, ...], alias: str = "training") -> DatasetInputManifest:
     return DatasetInputManifest(
         alias=alias,
-        dataset_id="11111111-1111-4111-8111-111111111111",
+        dataset_id=UUID("11111111-1111-4111-8111-111111111111"),
         dataset_name="SVLA pick and place",
-        dataset_version_id="22222222-2222-4222-8222-222222222222",
+        dataset_version_id=UUID("22222222-2222-4222-8222-222222222222"),
         version_number=1,
         source_kind="upload",
         manifest_sha256="a" * 64,
@@ -295,3 +297,125 @@ def test_a_manifest_cannot_repeat_a_path() -> None:
     payload = b"x"
     with pytest.raises(ValidationError, match="repeats a path"):
         manifest((dataset_file("meta/info.json", payload), dataset_file("meta/info.json", payload)))
+
+
+def test_the_workload_receives_the_exact_ordered_episode_selection(tmp_path: Path) -> None:
+    # Without this the workload gets every file of the version and no way to know which episodes a
+    # curated view chose. It would train on the whole dataset while the run's lineage claimed a
+    # view: a wrong result that looks like a correct one.
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b'{"codebase_version":"v2.1"}'
+    client = serving({"meta/info.json": payload})
+    curated = manifest((dataset_file("meta/info.json", payload),)).model_copy(
+        update={
+            "dataset_view_id": UUID("55555555-5555-4555-8555-555555555555"),
+            "dataset_view_name": "First cut",
+            "dataset_view_manifest_sha256": "d" * 64,
+            "included_episodes": (7, 2, 11),
+        }
+    )
+
+    staged = stage_input(state_root, attempt_root, client, curated)
+
+    document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
+    # Order is preserved exactly: a workload iterating episodes should not have to guess whether
+    # the order it was handed means anything.
+    assert document["included_episodes"] == [7, 2, 11]
+    assert document["dataset_view_id"] == "55555555-5555-4555-8555-555555555555"
+    assert document["dataset_view_name"] == "First cut"
+    assert document["selects_every_episode"] is False
+
+
+def test_a_complete_version_says_so_rather_than_listing_nothing(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    whole = manifest((dataset_file("meta/info.json", payload),)).model_copy(
+        update={"included_episodes": ()}
+    )
+
+    staged = stage_input(state_root, state_root / "attempts" / "one", client, whole)
+
+    document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
+    # An empty list and "everything" are not the same instruction, so the manifest says which.
+    assert document["selects_every_episode"] is True
+    assert document["dataset_view_id"] is None
+    assert document["included_episodes"] == []
+
+
+def test_the_selection_manifest_sits_beside_the_alias_and_cannot_collide(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b"x"
+    # A dataset is free to declare a path called "selection.json"; the manifest must not be it.
+    client = serving({"meta/info.json": payload, "selection.json": payload})
+    entries = manifest(
+        (dataset_file("meta/info.json", payload), dataset_file("selection.json", payload))
+    )
+
+    staged = stage_input(state_root, attempt_root, client, entries)
+
+    assert staged.selection_path.parent == attempt_input_root(attempt_root)
+    assert staged.selection_path.name == "training.selection.json"
+    dataset_copy = attempt_input_root(attempt_root) / "training" / "selection.json"
+    assert dataset_copy.read_bytes() == payload
+    assert staged.selection_path != dataset_copy
+
+
+def test_the_selection_manifest_never_carries_a_download_url(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+
+    staged = stage_input(
+        state_root,
+        state_root / "attempts" / "one",
+        client,
+        manifest((dataset_file("meta/info.json", payload),)),
+    )
+
+    text = staged.selection_path.read_text(encoding="utf-8")
+    # A signed URL is a short-lived capability, and a file the workload can read is the last place
+    # to leave one.
+    assert "storage.example.test" not in text
+    assert "download_url" not in text
+    document = json.loads(text)
+    assert document["files"] == [
+        {
+            "path": "meta/info.json",
+            "media_type": "application/octet-stream",
+            "byte_length": len(payload),
+            "sha256": digest_of(payload),
+        }
+    ]
+
+
+def test_the_selection_manifest_is_not_writable_by_the_workload(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    staged = stage_input(
+        state_root,
+        state_root / "attempts" / "one",
+        client,
+        manifest((dataset_file("meta/info.json", payload),)),
+    )
+    assert not staged.selection_path.stat().st_mode & 0o222
+
+
+def test_restaging_replaces_the_selection_manifest(tmp_path: Path) -> None:
+    # The manifest is read-only, so rewriting it has to undo that first; otherwise a retry would
+    # leave the previous attempt's selection in place.
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    entries = manifest((dataset_file("meta/info.json", payload),))
+    stage_input(state_root, attempt_root, client, entries)
+
+    curated = entries.model_copy(update={"included_episodes": (4,)})
+    staged = stage_input(state_root, attempt_root, client, curated)
+
+    document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
+    assert document["included_episodes"] == [4]

@@ -15,9 +15,12 @@ that digest, so a file that fails verification can never be mistaken for one tha
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import os
 import shutil
+import stat
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -34,6 +37,10 @@ INPUT_MOUNT_TARGET = "/kratos/inputs"
 INPUT_DIRECTORY = "inputs"
 # Beside "attempts" rather than inside one, because it is shared across attempts.
 CACHE_DIRECTORY = "dataset-cache"
+# The selection manifest sits beside the alias directory rather than inside it, so it can never
+# collide with a path the dataset itself declares. An alias cannot contain a dot, so this name
+# cannot collide with another alias either.
+SELECTION_SUFFIX = ".selection.json"
 
 # Read-only to the workload's user, and the agent owns the directories. The workload runs as an
 # arbitrary user, so the tree has to be readable by it; nothing in it needs to be writable.
@@ -60,6 +67,7 @@ class StagedInput:
     file_count: int
     byte_length: int
     cache_hits: int
+    selection_path: Path
 
 
 def cache_root(state_root: Path) -> Path:
@@ -169,6 +177,28 @@ def ensure_cached(
     return target, False
 
 
+def _force_remove(path: Path) -> None:
+    """Remove a file that may be read-only.
+
+    Cache entries and their hard links are mode 0444 so a workload cannot alter them. On Linux the
+    directory's write bit is what permits unlinking and the file's own mode is irrelevant, but on
+    Windows a read-only file cannot be unlinked at all. Making the file writable first keeps
+    restaging and cleanup working on both, rather than leaving the test suite platform-dependent.
+    """
+    with contextlib.suppress(OSError):
+        path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    path.unlink(missing_ok=True)
+
+
+def _remove_tree(root: Path) -> None:
+    """Remove a staged tree whose files are deliberately read-only."""
+
+    def clear(function: object, path: str, error: BaseException) -> None:
+        _force_remove(Path(path))
+
+    shutil.rmtree(root, onexc=clear)
+
+
 def _link_into_place(cached: Path, destination: Path) -> None:
     """Hard link the cache entry into the attempt tree, copying only if that is impossible.
 
@@ -177,7 +207,7 @@ def _link_into_place(cached: Path, destination: Path) -> None:
     filesystem that refuses links should degrade rather than fail the job.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.unlink(missing_ok=True)
+    _force_remove(destination)
     try:
         os.link(cached, destination)
     except OSError:
@@ -197,7 +227,7 @@ def stage_input(
     # A previous attempt of this job may have left a partial tree. The cache is what is worth
     # keeping; this tree is rebuilt from it.
     if alias_root.exists():
-        shutil.rmtree(alias_root, ignore_errors=True)
+        _remove_tree(alias_root)
     alias_root.mkdir(parents=True, exist_ok=True)
 
     cache_hits = 0
@@ -222,13 +252,70 @@ def stage_input(
     ):
         parent.chmod(INPUT_DIRECTORY_MODE)
 
+    write_selection_manifest(attempt_root, manifest)
+
     return StagedInput(
         alias=manifest.alias,
         root=alias_root,
         file_count=len(manifest.files),
         byte_length=byte_length,
         cache_hits=cache_hits,
+        selection_path=selection_manifest_path(attempt_root, manifest.alias),
     )
+
+
+def selection_manifest_path(attempt_root: Path, alias: str) -> Path:
+    return attempt_input_root(attempt_root) / f"{alias}{SELECTION_SUFFIX}"
+
+
+def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest) -> Path:
+    """Record what this input *is*, and which episodes the job may train on.
+
+    Without this the workload receives every file of the version and no way to tell which episodes
+    a curated view selected. It would then train on the whole dataset while the run's lineage
+    claimed a view -- a wrong result that looks like a correct one, which is the failure this whole
+    seam exists to prevent.
+
+    Immutable once written, and deliberately free of `download_url`: those are short-lived
+    capabilities, and a file the workload can read is the last place to put one.
+    """
+    destination = selection_manifest_path(attempt_root, manifest.alias)
+    document = {
+        "schema_version": "1.0",
+        "alias": manifest.alias,
+        "dataset_id": str(manifest.dataset_id),
+        "dataset_name": manifest.dataset_name,
+        "dataset_version_id": str(manifest.dataset_version_id),
+        "version_number": manifest.version_number,
+        "source_kind": manifest.source_kind,
+        "source_repository": manifest.source_repository,
+        "resolved_revision": manifest.resolved_revision,
+        "manifest_sha256": manifest.manifest_sha256,
+        "dataset_view_id": (
+            str(manifest.dataset_view_id) if manifest.dataset_view_id is not None else None
+        ),
+        "dataset_view_name": manifest.dataset_view_name,
+        "dataset_view_manifest_sha256": manifest.dataset_view_manifest_sha256,
+        # Ordered, because a workload iterating episodes should not have to guess whether the
+        # order it was given means anything. A null view is the complete version, which is
+        # recorded as the empty selection being absent rather than as an empty list.
+        "included_episodes": list(manifest.included_episodes),
+        "selects_every_episode": manifest.dataset_view_id is None,
+        "files": [
+            {
+                "path": dataset_file.path,
+                "media_type": dataset_file.media_type,
+                "byte_length": dataset_file.byte_length,
+                "sha256": dataset_file.sha256,
+            }
+            for dataset_file in manifest.files
+        ],
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _force_remove(destination)
+    destination.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
+    destination.chmod(CACHE_FILE_MODE)
+    return destination
 
 
 def create_attempt_input_tree(attempt_root: Path) -> Path:
@@ -251,7 +338,7 @@ def discard_attempt_inputs(attempt_root: Path) -> bool:
     root = attempt_input_root(attempt_root)
     if not root.exists():
         return True
-    shutil.rmtree(root, ignore_errors=True)
+    _remove_tree(root)
     return not root.exists()
 
 

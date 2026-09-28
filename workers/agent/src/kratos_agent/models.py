@@ -232,7 +232,9 @@ class DatasetInputAssignment(StrictModel):
     are fetched separately and verified against their own digests.
     """
 
-    alias: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9_-]*$")
+    # Exactly the server's bound, so an alias the control plane accepts is never one this
+    # agent refuses -- a job that could be scheduled and never staged is the worst of both.
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     dataset_version_id: UUID
     dataset_view_id: UUID | None = None
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -270,7 +272,7 @@ class DatasetInputFile(StrictModel):
 class DatasetInputManifest(StrictModel):
     """What the control plane says one alias contains, for one attempt."""
 
-    alias: str = Field(min_length=1, max_length=64)
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
     dataset_id: UUID
     dataset_name: str = Field(min_length=1, max_length=200)
     dataset_version_id: UUID

@@ -336,6 +336,25 @@ class AgentRunner:
             clock=time.monotonic,
         )
 
+    def _staging_tick(
+        self, state_holder: list[AgentState], assignment: JobAssignment
+    ) -> Callable[[], bool]:
+        """Keep heartbeating while staging, and say whether staging may continue.
+
+        Two conditions, not one. The control plane must still hold this attempt -- that is the
+        delivery tick's question and it is the same question here. And the execution lease must
+        not have passed: staging happens under that lease and nothing extends it, so a download
+        still running after it expires is work for an attempt this agent no longer owns.
+        """
+        held = self._delivery_tick(state_holder, assignment)
+
+        def tick() -> bool:
+            if self._clock() >= assignment.lease_expires_at:
+                return False
+            return held()
+
+        return tick
+
     def _stage_dataset_inputs(
         self,
         assignment: JobAssignment,
@@ -360,6 +379,16 @@ class AgentRunner:
                     # what the server is serving now. If they disagree the job would train on
                     # something other than the version it selected, which is the one thing dataset
                     # lineage exists to prevent.
+                    # Four things must agree, not two. The alias, because a manifest for a
+                    # different input would be staged under this one's name. The version and its
+                    # manifest digest, because a job must train on what it selected. And the
+                    # view, because a full-version answer for the right version is still the
+                    # wrong set of episodes -- the failure that would look like success.
+                    if manifest.alias != dataset_input.alias:
+                        raise DatasetInputError(
+                            f"input {dataset_input.alias} resolved to a manifest for "
+                            f"{manifest.alias!r}"
+                        )
                     if manifest.manifest_sha256 != dataset_input.manifest_sha256:
                         raise DatasetInputError(
                             f"input {dataset_input.alias} resolved to a different manifest "
@@ -368,6 +397,11 @@ class AgentRunner:
                     if manifest.dataset_version_id != dataset_input.dataset_version_id:
                         raise DatasetInputError(
                             f"input {dataset_input.alias} resolved to a different dataset version "
+                            "than the assignment selected"
+                        )
+                    if manifest.dataset_view_id != dataset_input.dataset_view_id:
+                        raise DatasetInputError(
+                            f"input {dataset_input.alias} resolved to a different curated view "
                             "than the assignment selected"
                         )
                     staged = stage_input(
@@ -387,6 +421,7 @@ class AgentRunner:
                                 "files": staged.file_count,
                                 "bytes": staged.byte_length,
                                 "from_cache": staged.cache_hits,
+                                "selection": staged.selection_path.name,
                             }
                         ),
                         flush=True,
@@ -627,9 +662,19 @@ class AgentRunner:
                     # consequence if it fails: there is nothing to mount. A failure here fails the
                     # attempt rather than running a workload with inputs that are absent or wrong,
                     # which would train on the wrong data and look like it worked.
+                    #
+                    # Heartbeats throughout, like the image pull above, and for the same reason:
+                    # a multi-gigabyte dataset can outlast several intervals, and a download that
+                    # continued past a withdrawal would be using signed URLs after the authority
+                    # for them had ended.
+                    staging_state = [state]
                     result = self._stage_dataset_inputs(
-                        assignment, worker_id, worker_credential, lambda: True
+                        assignment,
+                        worker_id,
+                        worker_credential,
+                        self._staging_tick(staging_state, assignment),
                     )
+                    state = staging_state[0]
                 state = replace(
                     state, started_attempt_id=assignment.attempt_id, started_assignment=assignment
                 )
