@@ -213,22 +213,27 @@ class AgentRunner:
             capabilities = self._collect()
         except Exception as error:
             raise CapabilityCollectionError(f"capability collection failed: {error}") from error
+
+        # Reserve the sequence durably before sending anything. The control plane may commit the
+        # heartbeat and the response may still be lost; replaying that sequence after a crash is
+        # unsafe because capabilities include volatile values such as available disk space, and
+        # the server only accepts an exact replay. Sequence gaps are valid, so consuming one for
+        # an unacknowledged request is the only crash-safe ordering.
+        sequence = state.next_sequence
+        reserved = replace(state, next_sequence=sequence + 1)
+        save_state(self._state_path, reserved)
         response = self._client.heartbeat(
             state.worker_id,
             state.worker_credential,
-            state.next_sequence,
+            sequence,
             capabilities,
         )
-        if (
-            response.worker_id != state.worker_id
-            or response.accepted_sequence != state.next_sequence
-        ):
+        if response.worker_id != state.worker_id or response.accepted_sequence != sequence:
             raise ControlPlaneError(
                 200, "invalid_response", "heartbeat acknowledgement is inconsistent"
             )
         updated = replace(
-            state,
-            next_sequence=response.accepted_sequence + 1,
+            reserved,
             heartbeat_interval_seconds=response.next_heartbeat_seconds,
         )
         save_state(self._state_path, updated)
