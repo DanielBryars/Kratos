@@ -16,13 +16,19 @@ from kratos_agent.inputs import (
     CACHE_DIRECTORY,
     INPUT_DIRECTORY,
     DatasetInputError,
+    _force_remove,
     attempt_input_root,
     create_attempt_input_tree,
     discard_attempt_inputs,
     ensure_cached,
+    selection_manifest_path,
     stage_input,
 )
-from kratos_agent.models import DatasetInputFile, DatasetInputManifest
+from kratos_agent.models import (
+    DatasetInputAssignment,
+    DatasetInputFile,
+    DatasetInputManifest,
+)
 
 
 def digest_of(payload: bytes) -> str:
@@ -344,11 +350,12 @@ def test_a_complete_version_says_so_rather_than_listing_nothing(tmp_path: Path) 
     assert document["included_episodes"] == []
 
 
-def test_the_selection_manifest_sits_beside_the_alias_and_cannot_collide(tmp_path: Path) -> None:
+def test_the_selection_manifest_uses_the_documented_path(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     attempt_root = state_root / "attempts" / "one"
     payload = b"x"
-    # A dataset is free to declare a path called "selection.json"; the manifest must not be it.
+    # A dataset is free to declare a path called "selection.json" or even ".kratos/training.json";
+    # neither may be mistaken for the selection manifest.
     client = serving({"meta/info.json": payload, "selection.json": payload})
     entries = manifest(
         (dataset_file("meta/info.json", payload), dataset_file("selection.json", payload))
@@ -356,11 +363,36 @@ def test_the_selection_manifest_sits_beside_the_alias_and_cannot_collide(tmp_pat
 
     staged = stage_input(state_root, attempt_root, client, entries)
 
-    assert staged.selection_path.parent == attempt_input_root(attempt_root)
-    assert staged.selection_path.name == "training.selection.json"
+    # The path PR #96 and ADR-018 document, so the workload has one stable place to look.
+    assert staged.selection_path == attempt_input_root(attempt_root) / ".kratos" / "training.json"
     dataset_copy = attempt_input_root(attempt_root) / "training" / "selection.json"
     assert dataset_copy.read_bytes() == payload
     assert staged.selection_path != dataset_copy
+
+
+@pytest.mark.parametrize("candidate", [".kratos", ".Kratos", "-kratos", "0kratos", "a" * 33])
+def test_dot_kratos_can_never_be_an_alias(candidate: str) -> None:
+    # The selection directory shares the inputs root with the alias directories, so "no alias can
+    # be called .kratos" has to be a property of the shared regex rather than a convention.
+    with pytest.raises(ValidationError):
+        DatasetInputAssignment(
+            alias=candidate,
+            dataset_version_id=UUID("22222222-2222-4222-8222-222222222222"),
+            manifest_sha256="a" * 64,
+        )
+
+
+def test_the_selection_directory_is_not_writable_by_the_workload(tmp_path: Path) -> None:
+    # A workload able to add or replace a selection could rewrite the record of what it was
+    # allowed to train on.
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    staged = stage_input(
+        state_root, attempt_root, client, manifest((dataset_file("meta/info.json", payload),))
+    )
+    assert not staged.selection_path.parent.stat().st_mode & 0o222
 
 
 def test_the_selection_manifest_never_carries_a_download_url(tmp_path: Path) -> None:
@@ -419,3 +451,132 @@ def test_restaging_replaces_the_selection_manifest(tmp_path: Path) -> None:
 
     document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
     assert document["included_episodes"] == [4]
+
+
+def test_a_fully_cached_input_still_observes_withdrawal(tmp_path: Path) -> None:
+    """The case a download-only check cannot catch.
+
+    Ten thousand cached files perform no downloads at all, so authority checked inside fetching
+    would never be consulted: the tree would be materialised, the selection written, and the
+    container started, all after the assignment had been withdrawn.
+    """
+    state_root = tmp_path / "state"
+    payload = b"already here"
+    client = serving({"meta/info.json": payload, "data/a": payload, "data/b": payload})
+    entries = manifest(
+        (
+            dataset_file("meta/info.json", payload),
+            dataset_file("data/a", payload),
+            dataset_file("data/b", payload),
+        )
+    )
+    # Warm the cache, so the second staging downloads nothing whatsoever.
+    stage_input(state_root, state_root / "attempts" / "one", client, entries)
+
+    attempt_root = state_root / "attempts" / "two"
+    with pytest.raises(DatasetInputError, match="no longer this agent"):
+        stage_input(state_root, attempt_root, client, entries, lambda: False)
+
+    # Nothing runnable may be left: no selection for the agent to publish, and no staged tree.
+    assert not selection_manifest_path(attempt_root, "training").exists()
+    assert not (attempt_input_root(attempt_root) / "training").exists()
+
+
+def test_withdrawal_between_cached_files_stops_part_way(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    payload = b"cached"
+    client = serving({"meta/info.json": payload, "data/a": payload, "data/b": payload})
+    entries = manifest(
+        (
+            dataset_file("meta/info.json", payload),
+            dataset_file("data/a", payload),
+            dataset_file("data/b", payload),
+        )
+    )
+    stage_input(state_root, state_root / "attempts" / "one", client, entries)
+
+    checks = {"n": 0}
+
+    def withdrawn_after_two() -> bool:
+        checks["n"] += 1
+        return checks["n"] <= 2
+
+    attempt_root = state_root / "attempts" / "two"
+    with pytest.raises(DatasetInputError, match="no longer this agent"):
+        stage_input(state_root, attempt_root, client, entries, withdrawn_after_two)
+
+    assert checks["n"] > 2, "authority must be checked per file, not once"
+    assert not selection_manifest_path(attempt_root, "training").exists()
+
+
+def test_withdrawal_just_before_publishing_the_selection_is_caught(tmp_path: Path) -> None:
+    # Writing the selection is what makes an input look complete to the rest of the agent, so it
+    # is the last boundary at which a withdrawal can still be acted on cheaply.
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    entries = manifest((dataset_file("meta/info.json", payload),))
+
+    checks = {"n": 0}
+
+    def withdrawn_at_the_end() -> bool:
+        checks["n"] += 1
+        # Authorised for the pre-flight check and the one file; withdrawn at the publish boundary.
+        return checks["n"] <= 2
+
+    with pytest.raises(DatasetInputError, match="no longer this agent"):
+        stage_input(state_root, attempt_root, client, entries, withdrawn_at_the_end)
+
+    assert not selection_manifest_path(attempt_root, "training").exists()
+
+
+def test_cleanup_and_restaging_leave_the_cache_entry_read_only_and_valid(tmp_path: Path) -> None:
+    """Permissions belong to the inode, not to the name.
+
+    A staged file is a hard link to its cache entry, so making the link writable in order to
+    remove it would leave the *cache* writable after an ordinary cleanup -- breaking the invariant
+    that a verified entry is immutable, on Linux as well as Windows.
+    """
+    state_root = tmp_path / "state"
+    attempt_root = state_root / "attempts" / "one"
+    payload = b"immutable bytes"
+    client = serving({"meta/info.json": payload})
+    entries = manifest((dataset_file("meta/info.json", payload),))
+    stage_input(state_root, attempt_root, client, entries)
+
+    cached = next(path for path in (state_root / CACHE_DIRECTORY).rglob("*") if path.is_file())
+    assert not cached.stat().st_mode & 0o222, "a freshly verified entry is read-only"
+
+    # Ordinary restaging, then ordinary cleanup.
+    stage_input(state_root, attempt_root, client, entries)
+    assert not cached.stat().st_mode & 0o222, "restaging must not make the cache writable"
+
+    assert discard_attempt_inputs(attempt_root) is True
+    assert not cached.stat().st_mode & 0o222, "cleanup must not make the cache writable"
+    assert cached.read_bytes() == payload
+    assert digest_of(cached.read_bytes()) == digest_of(payload)
+
+    # And the entry is still usable as a cache hit, which is the point of keeping it.
+    _, hit = ensure_cached(state_root, client, dataset_file("meta/info.json", payload))
+    assert hit is True
+
+
+def test_removing_a_staged_link_never_changes_the_cache_entry(tmp_path: Path) -> None:
+    """The narrow unit where the defect lived.
+
+    A staged file is a hard link, and permissions belong to the inode rather than the name. Making
+    the link writable in order to remove it therefore leaves the surviving cache entry writable,
+    which is exactly the invariant the cache depends on.
+    """
+    cached = tmp_path / "cached"
+    cached.write_bytes(b"verified bytes")
+    cached.chmod(0o444)
+    link = tmp_path / "staged"
+    os.link(cached, link)
+
+    _force_remove(link)
+
+    assert not link.exists()
+    assert not cached.stat().st_mode & 0o222, "the surviving cache entry must still be read-only"
+    assert cached.read_bytes() == b"verified bytes"

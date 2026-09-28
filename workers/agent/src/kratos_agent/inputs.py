@@ -37,14 +37,21 @@ INPUT_MOUNT_TARGET = "/kratos/inputs"
 INPUT_DIRECTORY = "inputs"
 # Beside "attempts" rather than inside one, because it is shared across attempts.
 CACHE_DIRECTORY = "dataset-cache"
-# The selection manifest sits beside the alias directory rather than inside it, so it can never
-# collide with a path the dataset itself declares. An alias cannot contain a dot, so this name
-# cannot collide with another alias either.
-SELECTION_SUFFIX = ".selection.json"
+# Selection manifests live in their own directory beside the alias directories, as ADR-018 and
+# PR #96 define. It can never collide with an alias: the shared alias regex is
+# `^[a-z][a-z0-9_-]{0,31}$`, which permits neither a leading dot nor a dot anywhere, so no alias
+# can ever be named `.kratos`.
+SELECTION_DIRECTORY = ".kratos"
+SELECTION_SUFFIX = ".json"
+# The directory is traversable and readable but not writable: a workload that could add or replace
+# a selection could rewrite the record of what it was allowed to train on.
+SELECTION_DIRECTORY_MODE = 0o555
 
 # Read-only to the workload's user, and the agent owns the directories. The workload runs as an
 # arbitrary user, so the tree has to be readable by it; nothing in it needs to be writable.
-CACHE_FILE_MODE = 0o444
+READ_ONLY_FILE_MODE = 0o444
+# Kept as the old name for the cache specifically, so the invariant reads where it is enforced.
+CACHE_FILE_MODE = READ_ONLY_FILE_MODE
 INPUT_DIRECTORY_MODE = 0o755
 ATTEMPT_INPUT_ROOT_MODE = 0o755
 
@@ -177,16 +184,25 @@ def ensure_cached(
     return target, False
 
 
-def _force_remove(path: Path) -> None:
-    """Remove a file that may be read-only.
+# Hard links share an inode, and so share its permissions. Linking is what makes a hundred
+# attempts on one dataset cost one copy of the bytes, and it is safe on POSIX because unlinking a
+# read-only file needs only the directory's write bit. Windows will not unlink a read-only file at
+# all, and making one writable first would change the *shared* inode -- quietly leaving the cache
+# entry writable after an ordinary cleanup. So Windows gets copies instead: slower, and the only
+# way to keep "a cache entry is immutable once verified" true on both.
+_LINKS_ARE_SAFE_TO_UNLINK = os.name != "nt"
 
-    Cache entries and their hard links are mode 0444 so a workload cannot alter them. On Linux the
-    directory's write bit is what permits unlinking and the file's own mode is irrelevant, but on
-    Windows a read-only file cannot be unlinked at all. Making the file writable first keeps
-    restaging and cleanup working on both, rather than leaving the test suite platform-dependent.
+
+def _force_remove(path: Path) -> None:
+    """Remove a staged file, without ever altering a cache entry's permissions.
+
+    On POSIX this is a plain unlink: the file may be a hard link to a cache entry, and chmod here
+    would change that entry too, because permissions belong to the inode rather than to the name.
+    On Windows a staged file is a copy of its own, so making it writable touches nothing shared.
     """
-    with contextlib.suppress(OSError):
-        path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    if not _LINKS_ARE_SAFE_TO_UNLINK:
+        with contextlib.suppress(OSError):
+            path.chmod(stat.S_IWRITE | stat.S_IREAD)
     path.unlink(missing_ok=True)
 
 
@@ -208,11 +224,27 @@ def _link_into_place(cached: Path, destination: Path) -> None:
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     _force_remove(destination)
-    try:
-        os.link(cached, destination)
-    except OSError:
-        shutil.copyfile(cached, destination)
-        destination.chmod(CACHE_FILE_MODE)
+    if _LINKS_ARE_SAFE_TO_UNLINK:
+        try:
+            os.link(cached, destination)
+            return
+        except OSError:
+            # A filesystem that refuses links should degrade rather than fail the job.
+            pass
+    shutil.copyfile(cached, destination)
+    destination.chmod(READ_ONLY_FILE_MODE)
+
+
+def _require_authority(still_authorised: Callable[[], bool] | None) -> None:
+    """Stop unless this attempt is still this agent's to stage.
+
+    Called on every file rather than only around downloads. A wholly cached input performs no
+    downloads at all, so a check that lived inside fetching would let ten thousand cached files be
+    materialised, a selection be written and a container be started, all after the assignment had
+    been withdrawn.
+    """
+    if still_authorised is not None and not still_authorised():
+        raise DatasetInputError("the attempt is no longer this agent's to run")
 
 
 def stage_input(
@@ -223,6 +255,8 @@ def stage_input(
     still_authorised: Callable[[], bool] | None = None,
 ) -> StagedInput:
     """Materialise one alias under the attempt, fetching what the cache does not already hold."""
+    # Before anything is written, so a withdrawal already known about costs nothing.
+    _require_authority(still_authorised)
     alias_root = attempt_input_root(attempt_root) / manifest.alias
     # A previous attempt of this job may have left a partial tree. The cache is what is worth
     # keeping; this tree is rebuilt from it.
@@ -233,6 +267,8 @@ def stage_input(
     cache_hits = 0
     byte_length = 0
     for dataset_file in manifest.files:
+        # Every file, hit or miss. This is the check a cached materialisation would otherwise skip.
+        _require_authority(still_authorised)
         destination = alias_root / dataset_file.path
         resolved = destination.resolve()
         # Belt and braces over the model's own check: whatever the manifest said, nothing is
@@ -252,6 +288,9 @@ def stage_input(
     ):
         parent.chmod(INPUT_DIRECTORY_MODE)
 
+    # The publish boundary. Writing the selection is what makes this input look complete to the
+    # rest of the agent, so it is the last place a withdrawal can still be acted on cheaply.
+    _require_authority(still_authorised)
     write_selection_manifest(attempt_root, manifest)
 
     return StagedInput(
@@ -265,7 +304,8 @@ def stage_input(
 
 
 def selection_manifest_path(attempt_root: Path, alias: str) -> Path:
-    return attempt_input_root(attempt_root) / f"{alias}{SELECTION_SUFFIX}"
+    """`/kratos/inputs/.kratos/<alias>.json`, the path PR #96 and ADR-018 document."""
+    return attempt_input_root(attempt_root) / SELECTION_DIRECTORY / f"{alias}{SELECTION_SUFFIX}"
 
 
 def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest) -> Path:
@@ -311,10 +351,14 @@ def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest)
             for dataset_file in manifest.files
         ],
     }
+    # The directory is made writable to replace the manifest and sealed again afterwards, so a
+    # restaged attempt can rewrite its own selection while a workload never can.
     destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.chmod(INPUT_DIRECTORY_MODE)
     _force_remove(destination)
     destination.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
-    destination.chmod(CACHE_FILE_MODE)
+    destination.chmod(READ_ONLY_FILE_MODE)
+    destination.parent.chmod(SELECTION_DIRECTORY_MODE)
     return destination
 
 
