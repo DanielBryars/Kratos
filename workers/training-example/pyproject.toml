@@ -5,7 +5,7 @@ description = "Reproducible CUDA training workload for Kratos"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "numpy==2.3.3",
-    "pyarrow==21.0.0",
+    "pyarrow==23.0.1",
     "torch==2.8.0",
 ]
 
