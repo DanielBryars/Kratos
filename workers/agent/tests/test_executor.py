@@ -19,6 +19,7 @@ from kratos_agent.executor import (
     ExecutorError,
 )
 from kratos_agent.models import (
+    DatasetInputAssignment,
     GpuHealthStatus,
     JobAssignment,
     JobExecutionResult,
@@ -849,3 +850,78 @@ def test_a_pull_of_a_mutable_reference_is_refused_before_any_thread_starts() -> 
         job_executor(clock, client).prepare_job(mutable)
 
     assert client.images.pulled == []
+
+
+def dataset_input_assignment(*, with_outputs: bool = False) -> JobAssignment:
+    base = output_assignment() if with_outputs else job_assignment()
+    return base.model_copy(
+        update={
+            "dataset_inputs": (
+                DatasetInputAssignment(
+                    alias="training",
+                    dataset_version_id=UUID("33333333-3333-4333-8333-333333333333"),
+                    manifest_sha256="c" * 64,
+                ),
+            )
+        }
+    )
+
+
+def test_only_this_attempts_inputs_subpath_is_exposed_to_the_job() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+    assignment = dataset_input_assignment()
+
+    DockerExecutor(
+        client, clock=clock, sleep=clock.sleep, state_volume="kratos-agent-state"
+    ).run_job(assignment)
+
+    options = client.containers.options
+    assert options is not None
+    (mount,) = options["mounts"]
+    assert mount["Target"] == "/kratos/inputs"
+    assert mount["Source"] == "kratos-agent-state"
+    # A dataset version is immutable, and the staged tree is hard links into a shared cache: a
+    # writable mount would let one workload edit what the next attempt reads.
+    assert mount["ReadOnly"] is True
+    # The volume root holds the worker credential and the cache itself; neither is the job's.
+    assert mount["VolumeOptions"]["Subpath"] == f"attempts/{assignment.attempt_id}/inputs"
+
+
+def test_inputs_and_outputs_are_separate_mounts() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+    assignment = dataset_input_assignment(with_outputs=True)
+
+    DockerExecutor(
+        client, clock=clock, sleep=clock.sleep, state_volume="kratos-agent-state"
+    ).run_job(assignment)
+
+    options = client.containers.options
+    assert options is not None
+    targets = {mount["Target"]: mount["ReadOnly"] for mount in options["mounts"]}
+    assert targets == {"/kratos/outputs": False, "/kratos/inputs": True}
+
+
+def test_a_job_without_dataset_inputs_mounts_nothing_new() -> None:
+    clock = FakeClock()
+    client = JobClient(clock)
+
+    DockerExecutor(
+        client, clock=clock, sleep=clock.sleep, state_volume="kratos-agent-state"
+    ).run_job(job_assignment())
+
+    options = client.containers.options
+    assert options is not None
+    assert options["mounts"] == []
+
+
+def test_dataset_inputs_need_the_state_volume_name() -> None:
+    # Without it the agent would silently run the workload with no inputs mounted, and the job
+    # would fail somewhere inside the workload rather than here, with a useless message.
+    clock = FakeClock()
+    client = JobClient(clock)
+    executor = DockerExecutor(client, clock=clock, sleep=clock.sleep)
+
+    with pytest.raises(ExecutorError, match="state volume"):
+        executor.run_job(dataset_input_assignment())

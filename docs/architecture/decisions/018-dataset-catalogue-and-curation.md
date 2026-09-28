@@ -79,11 +79,26 @@ A job references an exact `dataset_version_id` and optional `dataset_view_id`. J
 non-ready version, a view from another version, or any input outside the caller's projects. These
 references are copied into each attempt and do not follow later catalogue state.
 
+Protocol 1.3 carries a bounded list of named inputs in the assignment. Each descriptor contains the
+mount alias, version identifier, optional view identifier and the version manifest SHA-256. The
+agent exchanges its existing attempt credential for a download manifest at
+`GET /api/v1/workers/{worker_id}/job-attempts/{attempt_id}/dataset-inputs/{alias}`. That manifest
+contains only verified files in the selected version, short-lived file-scoped read URLs and the
+published episode set. It can be refreshed while the attempt lease is current; it is unavailable as
+soon as execution authority ends.
+
 The scheduler assigns the job only to a worker in the same project, as required by ADR-017. Before
 starting the workload, the agent stages every selected file into a content-addressed cache, verifies
-its digest, and mounts the selected input read-only at `/kratos/inputs/training`. The workload
+its digest, and mounts each selected input read-only at `/kratos/inputs/{alias}`. The workload
 container receives no object-store credential and retains no network access. A cache entry is usable
 only after complete digest verification; partial transfers are never mounted.
+
+The same read-only mount contains one Kratos-owned selection description at
+`/kratos/inputs/.kratos/{alias}.json`. It records the exact version and optional view identity,
+their manifest hashes, and the ordered `included_episodes` returned by the attempt-scoped manifest.
+The `.kratos` name cannot be an input alias. The agent refuses an alias, version, view or manifest
+identity mismatch before writing this file or starting the workload. Training adapters use this
+description when a view is selected; silently training on the complete version is an attempt failure.
 
 The first catalogue and curation change may ship before agent staging. Until staging is released,
 the console SHALL identify dataset-backed scheduling as unavailable and the job API SHALL reject a
@@ -102,9 +117,15 @@ The job and MLflow run record:
 The catalogue is authoritative. MLflow presents the lineage but does not grant access or define
 dataset retention.
 
+The control plane snapshots this trusted lineage onto the attempt's observation stream when the
+attempt is created. MLflow run creation consumes that snapshot as platform-owned metadata; it does
+not rely on parameters printed by the workload.
+
 ## Initial limits
 
 - A dataset has at most 10,000 files in the first upload profile.
+- A job has at most eight dataset inputs; aliases match `^[a-z][a-z0-9_-]{0,31}$`.
+- A schedulable input has at most 10,000 verified files, 20 GiB per file and 200 GiB in total.
 - A relative path is valid UTF-8, at most 512 bytes, and contains no empty, `.` or `..` segment.
 - Upload declarations include a positive byte length and a lowercase 64-character SHA-256.
 - `meta/info.json` is mandatory before a LeRobot version can become ready.

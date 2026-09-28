@@ -89,6 +89,7 @@ pub(crate) struct DatasetVersionResponse {
     ready_at: Option<DateTime<Utc>>,
     files: Vec<DatasetFileResponse>,
     curations: BTreeMap<i32, String>,
+    views: Vec<DatasetViewResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1433,6 +1434,28 @@ async fn version_response(
     .map_err(|_| OperatorError::internal())?
     .into_iter()
     .collect();
+    let views = sqlx::query_as::<_, (Uuid, Uuid, String, String, i32, DateTime<Utc>)>(
+        "SELECT id, version_id, name, manifest_sha256, included_episode_count, created_at \
+         FROM dataset_views WHERE version_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(version.id)
+    .fetch_all(database)
+    .await
+    .map_err(|_| OperatorError::internal())?
+    .into_iter()
+    .map(
+        |(id, version_id, name, manifest_sha256, included_episode_count, created_at)| {
+            DatasetViewResponse {
+                id,
+                version_id,
+                name,
+                manifest_sha256,
+                included_episode_count,
+                created_at,
+            }
+        },
+    )
+    .collect();
     Ok(DatasetVersionResponse {
         id: version.id,
         version_number: version.version_number,
@@ -1450,6 +1473,7 @@ async fn version_response(
         ready_at: version.ready_at,
         files,
         curations,
+        views,
     })
 }
 

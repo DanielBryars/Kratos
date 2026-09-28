@@ -5,6 +5,13 @@ export type JobSubmission = {
   image_reference: string;
   timeout_seconds: number;
   output_requirements: OutputRequirement[];
+  dataset_inputs: JobDatasetInputDraft[];
+};
+
+export type JobDatasetInputDraft = {
+  alias: string;
+  dataset_version_id: string;
+  dataset_view_id: string | null;
 };
 
 export type DurableOutputDraft = {
@@ -33,6 +40,7 @@ export function buildJobSubmission(
   imageReference: string,
   timeoutSeconds: number,
   output: DurableOutputDraft,
+  datasetInputs: JobDatasetInputDraft[] = [],
 ): JobSubmission {
   const outputRequirements = output.enabled
     ? [{
@@ -48,5 +56,10 @@ export function buildJobSubmission(
     image_reference: imageReference.trim(),
     timeout_seconds: timeoutSeconds,
     output_requirements: outputRequirements,
+    dataset_inputs: datasetInputs.map((input) => ({
+      alias: input.alias.trim(),
+      dataset_version_id: input.dataset_version_id,
+      dataset_view_id: input.dataset_view_id,
+    })),
   };
 }
