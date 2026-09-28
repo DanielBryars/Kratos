@@ -164,6 +164,12 @@ the console-managed client without copying its secret into state.
 `iap_member` names the single principal allowed through IAP, as an IAM member string such as
 `user:someone@example.com`.
 
+The control plane reaches only the MLflow backend with its own short-lived IAP ID token. Set
+`control_plane_service_account` on this root to its runtime service-account email, then set the
+non-secret `KRATOS_MLFLOW_IAP_AUDIENCE` GitHub environment variable to the OAuth client ID shown on
+the MLflow IAP backend. The application deployment passes that audience to the projector. Neither
+the OAuth client secret nor a static bearer token is stored by Kratos.
+
 Kratos itself authenticates humans through **Cloud Identity Platform**, while Grafana and MLflow sit
 behind **Identity-Aware Proxy**. Those are different mechanisms, which is worth being precise about
 — but the principal is the same Google account, so whoever signs in to the Kratos console signs in
@@ -189,6 +195,7 @@ terraform -chdir=infrastructure/observability apply \
   -var project_id=YOUR_PROJECT \
   -var domain_name=kratos.bryars.com \
   -var 'iap_member=user:you@example.com' \
+  -var control_plane_service_account=kratos-control-plane@YOUR_PROJECT.iam.gserviceaccount.com \
   -var billing_account=012345-6789AB-CDEF01 \
   -var enable_observability=true
 ```

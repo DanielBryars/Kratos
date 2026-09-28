@@ -65,6 +65,23 @@ variable "iap_member" {
   type        = string
 }
 
+variable "control_plane_service_account" {
+  description = <<-EOT
+    Service account email used by the Kratos control plane. When set, it receives IAP access to
+    the MLflow backend only, allowing the durable observation projector to call the tracking API.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.control_plane_service_account == "" ||
+      can(regex("^[a-z0-9-]+@[a-z0-9-]+\\.iam\\.gserviceaccount\\.com$", var.control_plane_service_account))
+    )
+    error_message = "control_plane_service_account must be empty or a service account email."
+  }
+}
+
 
 variable "enable_otlp_ingress" {
   description = <<-EOT
