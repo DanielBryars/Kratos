@@ -13,6 +13,7 @@ from uuid import UUID
 import docker
 from pydantic import ValidationError
 
+from kratos_agent.inputs import INPUT_DIRECTORY, INPUT_MOUNT_TARGET
 from kratos_agent.logs import LineAssembler, split_timestamp
 from kratos_agent.models import (
     GpuHealthEvidence,
@@ -347,7 +348,7 @@ class DockerExecutor:
                     pids_limit=512,
                     tmpfs={"/tmp": "rw,noexec,nosuid,size=1g"},
                     log_config=JOB_LOG_CONFIG,
-                    mounts=self._output_mounts(assignment),
+                    mounts=self._output_mounts(assignment) + self._input_mounts(assignment),
                     environment={
                         "KRATOS_JOB_ID": job_id,
                         "KRATOS_ATTEMPT_ID": attempt_id,
@@ -490,6 +491,33 @@ class DockerExecutor:
             except Exception as error:
                 return f"the cleanup image could not be prefetched: {type(error).__name__}"
         return None
+
+    def _input_mounts(self, assignment: JobAssignment) -> list[Any]:
+        """Expose this attempt's staged dataset inputs, read-only, at /kratos/inputs.
+
+        Read-only is the contract, not a precaution: a dataset version is immutable, and a
+        workload that could write here would be editing what the next attempt reads out of the
+        shared cache through its hard links.
+
+        One mount for every alias. Each alias is a subdirectory, so the workload sees
+        /kratos/inputs/<alias>/... and cannot reach another attempt's inputs or the cache itself.
+        """
+        if not assignment.dataset_inputs:
+            return []
+        if self._state_volume is None:
+            raise ExecutorError(
+                "a job with dataset inputs needs the agent state volume name; "
+                "reinstall the agent so it can pass --state-volume"
+            )
+        return [
+            docker.types.Mount(
+                target=INPUT_MOUNT_TARGET,
+                source=self._state_volume,
+                type="volume",
+                read_only=True,
+                subpath=f"{ATTEMPT_DIRECTORY}/{assignment.attempt_id}/{INPUT_DIRECTORY}",
+            )
+        ]
 
     def _output_mounts(self, assignment: JobAssignment) -> list[Any]:
         """Expose only this attempt's outputs subdirectory, writable, at /kratos/outputs."""

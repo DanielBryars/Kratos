@@ -19,6 +19,7 @@ from kratos_agent.models import (
     BeginArtifactUploadResponse,
     ClaimRegistrationRequest,
     CompleteArtifactUploadRequest,
+    DatasetInputManifest,
     DeclareArtifactManifestRequest,
     EnrolmentRequest,
     EnrolmentResponse,
@@ -46,6 +47,7 @@ ResponseModel = TypeVar(
     ArtifactManifestResponse,
     BeginArtifactUploadResponse,
     ObservationBatchResponse,
+    DatasetInputManifest,
 )
 
 
@@ -197,6 +199,20 @@ class WorkerProtocolClient:
             json=request.model_dump(mode="json"),
         )
         return self._parse(response, ObservationBatchResponse)
+
+    def fetch_dataset_input_manifest(
+        self, worker_id: UUID, credential: str, attempt_id: UUID, alias: str
+    ) -> DatasetInputManifest:
+        """Ask what one named input contains for this attempt.
+
+        Attempt-scoped on purpose: the signed read URLs inside are short lived and belong to this
+        attempt, so a manifest is fetched when it is about to be used rather than kept.
+        """
+        response = self._client.get(
+            f"/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/dataset-inputs/{alias}",
+            headers={"Authorization": f"Bearer {credential}"},
+        )
+        return self._parse(response, DatasetInputManifest)
 
     def declare_artifact_manifest(
         self,

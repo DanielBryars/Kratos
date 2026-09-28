@@ -26,6 +26,13 @@ from kratos_agent.executor import (
     EnforcementError,
     ExecutorError,
 )
+from kratos_agent.inputs import (
+    DatasetInputError,
+    create_attempt_input_tree,
+    discard_attempt_inputs,
+    new_download_client,
+    stage_input,
+)
 from kratos_agent.models import (
     MAX_STRUCTURED_RESULT_BYTES,
     ArtifactResponse,
@@ -329,6 +336,74 @@ class AgentRunner:
             clock=time.monotonic,
         )
 
+    def _stage_dataset_inputs(
+        self,
+        assignment: JobAssignment,
+        worker_id: UUID,
+        credential: str,
+        still_authorised: Callable[[], bool],
+    ) -> JobExecutionResult | None:
+        """Materialise every named input, or return the failure that should end the attempt.
+
+        Returns None on success, which is what lets the caller treat staging as one more way an
+        attempt can fail before it starts.
+        """
+        attempt_root = self._attempt_directory(assignment)
+        create_attempt_input_tree(attempt_root)
+        try:
+            with new_download_client() as downloads:
+                for dataset_input in assignment.dataset_inputs:
+                    manifest = self._client.fetch_dataset_input_manifest(
+                        worker_id, credential, assignment.attempt_id, dataset_input.alias
+                    )
+                    # The assignment names what the job was scheduled against; the manifest says
+                    # what the server is serving now. If they disagree the job would train on
+                    # something other than the version it selected, which is the one thing dataset
+                    # lineage exists to prevent.
+                    if manifest.manifest_sha256 != dataset_input.manifest_sha256:
+                        raise DatasetInputError(
+                            f"input {dataset_input.alias} resolved to a different manifest "
+                            "than the assignment selected"
+                        )
+                    if manifest.dataset_version_id != dataset_input.dataset_version_id:
+                        raise DatasetInputError(
+                            f"input {dataset_input.alias} resolved to a different dataset version "
+                            "than the assignment selected"
+                        )
+                    staged = stage_input(
+                        self._state_path.parent,
+                        attempt_root,
+                        downloads,
+                        manifest,
+                        still_authorised,
+                    )
+                    # The agent reports status as JSON on stdout rather than through logging,
+                    # so staging says what it did the same way everything else here does.
+                    print(
+                        json.dumps(
+                            {
+                                "status": "dataset_input_staged",
+                                "alias": staged.alias,
+                                "files": staged.file_count,
+                                "bytes": staged.byte_length,
+                                "from_cache": staged.cache_hits,
+                            }
+                        ),
+                        flush=True,
+                    )
+        except (DatasetInputError, ControlPlaneError) as error:
+            discard_attempt_inputs(attempt_root)
+            # 125 is what this agent already uses for a failure that is the agent's doing rather
+            # than the workload's, and there is no execution interval because nothing ran.
+            return JobExecutionResult(
+                exit_code=125,
+                timed_out=False,
+                stdout="",
+                stderr="",
+                failure_message=f"dataset inputs could not be staged: {error}"[:1000],
+            )
+        return None
+
     def _attempt_directory_for(self, attempt_id: UUID) -> Path:
         return self._state_path.parent / ATTEMPT_DIRECTORY / str(attempt_id)
 
@@ -547,6 +622,14 @@ class AgentRunner:
                 if assignment.output_requirements:
                     # Docker needs the subpath to exist before it creates the container.
                     create_attempt_tree(self._attempt_directory(assignment))
+                if assignment.dataset_inputs:
+                    # Staged before the container exists, for the same reason and with the same
+                    # consequence if it fails: there is nothing to mount. A failure here fails the
+                    # attempt rather than running a workload with inputs that are absent or wrong,
+                    # which would train on the wrong data and look like it worked.
+                    result = self._stage_dataset_inputs(
+                        assignment, worker_id, worker_credential, lambda: True
+                    )
                 state = replace(
                     state, started_attempt_id=assignment.attempt_id, started_assignment=assignment
                 )
