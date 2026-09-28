@@ -452,11 +452,20 @@ def test_restaging_replaces_the_selection_manifest(tmp_path: Path) -> None:
     entries = manifest((dataset_file("meta/info.json", payload),))
     stage_input(state_root, attempt_root, client, entries)
 
-    curated = entries.model_copy(update={"included_episodes": (4,)})
+    # A curated view, because an episode list beside a null view is a contradiction the consumer
+    # refuses: for a complete version the instruction is the flag, not a list.
+    curated = entries.model_copy(
+        update={
+            "dataset_view_id": UUID("55555555-5555-4555-8555-555555555555"),
+            "dataset_view_manifest_sha256": "d" * 64,
+            "included_episodes": (4,),
+        }
+    )
     staged = stage_input(state_root, attempt_root, client, curated)
 
     document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
     assert document["included_episodes"] == [4]
+    assert document["selects_every_episode"] is False
 
 
 def test_a_fully_cached_input_still_observes_withdrawal(tmp_path: Path) -> None:
@@ -586,3 +595,50 @@ def test_removing_a_staged_link_never_changes_the_cache_entry(tmp_path: Path) ->
     assert not link.exists()
     assert not cached.stat().st_mode & 0o222, "the surviving cache entry must still be read-only"
     assert cached.read_bytes() == b"verified bytes"
+
+
+def test_a_complete_version_selection_carries_no_episode_list(tmp_path: Path) -> None:
+    """`selects_every_episode` and an episode list are contradictory instructions.
+
+    The control plane returns every index for a null view -- `(0..total_episodes)` -- so passing
+    that list through alongside `selects_every_episode: true` produces a selection the workload
+    in PR #98 rejects outright: "complete-version selection has contradictory view fields". A job
+    on a complete version would fail at the workload every time.
+
+    The instruction for a complete version is "everything", so the list is absent rather than
+    exhaustive.
+    """
+    state_root = tmp_path / "state"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    # Exactly what the server sends for a null view: the complete range.
+    whole = manifest((dataset_file("meta/info.json", payload),)).model_copy(
+        update={"dataset_view_id": None, "included_episodes": (0, 1, 2, 3)}
+    )
+
+    staged = stage_input(state_root, state_root / "attempts" / "one", client, whole)
+    document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
+
+    assert document["selects_every_episode"] is True
+    assert document["included_episodes"] == [], document
+    assert document["dataset_view_id"] is None
+    assert document["dataset_view_manifest_sha256"] is None
+
+
+def test_a_curated_selection_still_carries_its_episodes(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    payload = b"x"
+    client = serving({"meta/info.json": payload})
+    curated = manifest((dataset_file("meta/info.json", payload),)).model_copy(
+        update={
+            "dataset_view_id": UUID("55555555-5555-4555-8555-555555555555"),
+            "dataset_view_manifest_sha256": "d" * 64,
+            "included_episodes": (5, 1),
+        }
+    )
+
+    staged = stage_input(state_root, state_root / "attempts" / "one", client, curated)
+    document = json.loads(staged.selection_path.read_text(encoding="utf-8"))
+
+    assert document["selects_every_episode"] is False
+    assert document["included_episodes"] == [5, 1]
