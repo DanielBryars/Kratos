@@ -71,11 +71,82 @@ The test undoes only what the controller recorded, leaving the provider's world 
 is exactly what that crash leaves behind. A companion test proves `external_id` is never
 overwritten, since it is the only handle by which a machine can be released.
 
+### 5. A stale give-up cannot overwrite another controller's success
+
+The overlap that hides a live machine: controller A reads a due dispatch, is slow talking to the
+provider and fails; meanwhile B provisions successfully. Failure bookkeeping is therefore done
+while the advisory lock is still held, and is a compare-and-set against the `completed_at` and
+`attempts` the controller actually read. The re-check under the lock covers `next_attempt_at` and
+`attempts` too, not just completion, so a dispatch another controller has already failed and
+backed off is no longer treated as due.
+
+*With the compare-and-set removed:* `nor report a failure against a request that succeeded — left:
+Some("provider unreachable"), right: None`.
+
+A second, independent guard: **a request holding an `external_id` is never marked `failed`**,
+whatever the attempt count says. `failed` is excluded from the open-request index, so filing a
+request that holds a machine under it would make the machine both unreleased and invisible.
+
+*With the external-id guard removed:* `capacity that exists must stay visible, not be filed as
+failed — status: "failed", external_id: Some("fake-held")`.
+
+### 6. A dispatch only goes to the provider that owns it
+
+`capacity_requests.provider` is the authority, not whichever provider object a caller constructed.
+The due query filters on it and the controller re-checks it under the lock. An `external_id` means
+nothing to a provider that did not issue it, and asking the wrong one to release it either errors
+or — worse — succeeds against something else.
+
+*With the filter and the check removed:* the test's deliberately panicking provider was reached —
+`a request recorded against another provider must never reach this one`.
+
+### 7. The schema constrains attempt, job and project together
+
+Three independent foreign keys are each satisfied by an attempt belonging to one job and a job
+belonging to another project: capacity billed to a project that never asked for it. Composite keys
+against `job_attempts(id, job_id)` and `jobs(id, project_id)` make the database prove the pairs,
+the same trick `job_artifacts` already uses.
+
+*With the independent keys restored:* `an attempt belonging to another job must be refused`.
+
+### 8. A parent delete cannot take the release handle with it
+
+Cascading a job or attempt away would delete `external_id` — the only handle the machine can ever
+be released by — and the pending release dispatch with it, leaving a paid machine running with
+nothing pointing at it. A `BEFORE DELETE` trigger refuses while the request still holds capacity.
+A trigger rather than `ON DELETE RESTRICT` because the rule is conditional on row state: a settled
+request holds nothing and should not obstruct retention tidying a finished job away, which the
+test also checks.
+
+*With the trigger removed:* `deleting a job that still holds capacity must be refused`.
+
 ## Failure handling
 
 A refused dispatch records its reason and is retried with exponential backoff, stored as a
-timestamp rather than a sleep so it survives a restart. After eight attempts the request is marked
-`failed` and left for a person: failing quietly forever is how a stuck request becomes invisible.
+timestamp rather than a sleep so it survives a restart. Eight attempts is the stated limit and is
+now also the enforced one: the due query will not select a dispatch that has reached it, so the
+provider stops being called rather than being asked forever.
+
+What is left behind depends on what was being attempted.
+
+A **provision** that never obtained a handle made nothing, so the request is marked `failed` and
+left for a person. A **release** is different: the obligation outlives its retries and the machine
+is presumed alive, so the request stays `releasing` — inside the open-request index — and is
+surfaced by `outstanding_releases`, the operator view for the one failure this boundary cannot
+resolve by itself. Marking it `failed` would drop it out of the index and hide exactly the machine
+someone needs to go and deal with.
+
+*With the attempts cutoff removed:* `the provider must be asked exactly as many times as the limit
+says, then left alone — left: 12, right: 8`.
+
+### One inversion that did not fire, and what it means
+
+Removing the release-specific branch in `record_failure` did **not** fail its test. That branch is
+not what keeps an exhausted release out of `failed`: the `external_id IS NULL` condition on the
+terminal update already does, because a releasing request always holds a handle. The branch is
+kept because it stops an exhausted release being logged as "given up" — which would tell an
+operator the opposite of the truth — but it is not load-bearing for the state invariant, and is
+recorded here rather than presented as a protection that has been proved.
 
 ## What is not proved here
 

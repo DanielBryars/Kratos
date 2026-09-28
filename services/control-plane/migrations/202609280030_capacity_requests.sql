@@ -8,14 +8,19 @@
 -- Nothing here starts any capacity. The boundary and a fake provider are all that exist at this
 -- point, and the feature is off unless explicitly enabled.
 
+-- Lets a child carry (job, project) and have the database prove the pair is the one the job
+-- actually has, rather than trusting whoever wrote the row. The same trick job_artifacts uses for
+-- (attempt, job).
+ALTER TABLE jobs ADD CONSTRAINT jobs_id_project_unique UNIQUE (id, project_id);
+
 CREATE TABLE capacity_requests (
     id uuid PRIMARY KEY,
     -- One request per attempt, which is what makes the request replayable rather than repeatable.
     -- It also means a job cancelled while queued can have no request at all: there is no attempt
     -- to derive one from, so the constraint decides it rather than any controller logic.
-    attempt_id uuid NOT NULL UNIQUE REFERENCES job_attempts(id) ON DELETE CASCADE,
-    job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    project_id uuid NOT NULL REFERENCES projects(id),
+    attempt_id uuid NOT NULL UNIQUE,
+    job_id uuid NOT NULL,
+    project_id uuid NOT NULL,
     provider text NOT NULL CHECK (length(provider) BETWEEN 1 AND 40),
     -- Derived from the attempt, so a replay after a restart asks the provider the same question
     -- and is answered with the same machine rather than a second one.
@@ -32,7 +37,12 @@ CREATE TABLE capacity_requests (
     -- A released request has finished with its machine; anything else has not.
     CHECK ((status = 'released') = (released_at IS NOT NULL)),
     -- Capacity cannot be ready without something to point at.
-    CHECK (status NOT IN ('ready', 'releasing') OR external_id IS NOT NULL)
+    CHECK (status NOT IN ('ready', 'releasing') OR external_id IS NOT NULL),
+    -- Composite rather than three independent keys. Separate references would each be satisfied
+    -- while still permitting a request whose attempt belongs to one job and whose job belongs to
+    -- another project -- capacity billed to a project that never asked for it.
+    FOREIGN KEY (attempt_id, job_id) REFERENCES job_attempts(id, job_id) ON DELETE CASCADE,
+    FOREIGN KEY (job_id, project_id) REFERENCES jobs(id, project_id) ON DELETE CASCADE
 );
 
 CREATE INDEX capacity_requests_job_idx ON capacity_requests (job_id);
@@ -64,6 +74,31 @@ CREATE TABLE capacity_dispatches (
 CREATE INDEX capacity_dispatches_pending_idx
     ON capacity_dispatches (next_attempt_at)
     WHERE completed_at IS NULL;
+
+-- Deleting the parent job or attempt would cascade away `external_id` -- the only handle by which
+-- the machine can ever be released -- and the pending release dispatch with it, leaving a paid
+-- machine running with nothing in the database pointing at it. So deletion is refused while the
+-- request still holds capacity.
+--
+-- A trigger rather than ON DELETE RESTRICT because the rule is conditional on the row's state: a
+-- settled request holds nothing and should not stand in the way of retention tidying a finished
+-- job away. Cascaded deletes fire row triggers, so this guards the parents too.
+CREATE FUNCTION capacity_requests_refuse_open_delete() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.external_id IS NOT NULL AND OLD.released_at IS NULL THEN
+        RAISE EXCEPTION
+            'capacity request % still holds provider capacity %; release it before deleting',
+            OLD.id, OLD.external_id
+            USING ERRCODE = 'restrict_violation';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER capacity_requests_open_delete_guard
+    BEFORE DELETE ON capacity_requests
+    FOR EACH ROW EXECUTE FUNCTION capacity_requests_refuse_open_delete();
 
 COMMENT ON TABLE capacity_requests IS
     'One bounded capacity request per job attempt. Kratos remains the authoritative queue; a '

@@ -142,6 +142,7 @@ struct RequestRow {
     status: String,
     external_id: Option<String>,
     idempotency_key: String,
+    provider: String,
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -234,7 +235,7 @@ pub async fn release_capacity(pool: &PgPool, attempt_id: Uuid) -> Result<(), Cap
         .await
         .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
     let request = sqlx::query_as::<_, RequestRow>(
-        "SELECT id, attempt_id, job_id, status, external_id, idempotency_key \
+        "SELECT id, attempt_id, job_id, status, external_id, idempotency_key, provider \
          FROM capacity_requests WHERE attempt_id = $1 FOR UPDATE",
     )
     .bind(attempt_id)
@@ -299,11 +300,19 @@ pub async fn release_capacity(pool: &PgPool, attempt_id: Uuid) -> Result<(), Cap
 /// `MLflow` projector takes it, because the control plane runs as more than one instance and two
 /// of them sending the same provision is the failure this whole design exists to prevent.
 pub async fn dispatch_once(pool: &PgPool, provider: &dyn CapacityProvider) -> u64 {
+    // Only this provider's requests, and only dispatches with attempts left. The provider is
+    // persisted on the request because a machine can only be released by the provider that made
+    // it; dispatching whichever provider object the caller happened to pass would send one
+    // provider another's identifiers.
     let due = match sqlx::query_as::<_, DispatchRow>(
-        "SELECT id, request_id, action, attempts FROM capacity_dispatches \
-         WHERE completed_at IS NULL AND next_attempt_at <= now() \
-         ORDER BY next_attempt_at LIMIT 100",
+        "SELECT d.id, d.request_id, d.action, d.attempts \
+         FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
+         WHERE d.completed_at IS NULL AND d.next_attempt_at <= now() \
+           AND d.attempts < $2 AND r.provider = $1 \
+         ORDER BY d.next_attempt_at LIMIT 100",
     )
+    .bind(provider.name())
+    .bind(MAX_DISPATCH_ATTEMPTS)
     .fetch_all(pool)
     .await
     {
@@ -316,13 +325,9 @@ pub async fn dispatch_once(pool: &PgPool, provider: &dyn CapacityProvider) -> u6
 
     let mut completed = 0;
     for dispatch in due {
-        match run_locked(pool, provider, &dispatch).await {
-            Ok(true) => completed += 1,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(dispatch = %dispatch.id, %error, "capacity dispatch failed");
-                record_failure(pool, &dispatch, &error.to_string()).await;
-            }
+        // Failures are recorded inside `run_locked`, while authority is still held.
+        if matches!(run_locked(pool, provider, &dispatch).await, Ok(true)) {
+            completed += 1;
         }
     }
     completed
@@ -351,6 +356,14 @@ async fn run_locked(
     }
 
     let outcome = run_dispatch(pool, provider, dispatch).await;
+    // Bookkeeping belongs inside the lock, not after it. Released first, this controller's give-up
+    // can land after another has already provisioned successfully -- marking `failed` a request
+    // that holds a live machine. `failed` is excluded from the open-request index, so the machine
+    // would be both unreleased and invisible.
+    if let Err(error) = &outcome {
+        warn!(dispatch = %dispatch.id, %error, "capacity dispatch failed");
+        record_failure(pool, dispatch, &error.to_string()).await;
+    }
 
     let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
         .bind(CONTROLLER_LOCK_NAMESPACE)
@@ -365,12 +378,17 @@ async fn run_dispatch(
     provider: &dyn CapacityProvider,
     dispatch: &DispatchRow,
 ) -> Result<bool, CapacityError> {
-    // Re-read under the lock: another controller may have completed this between the listing and
-    // the lock being granted, and re-sending a completed provision is a second machine.
+    // Re-read under the lock: another controller may have moved this on between the listing and
+    // the lock being granted, and re-sending a completed provision is a second machine. The whole
+    // read is re-checked, not just completion -- a dispatch another controller has failed and
+    // backed off is no longer due, and acting on the stale `attempts` read would let this
+    // controller's bookkeeping overwrite theirs.
     let still_due: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM capacity_dispatches WHERE id = $1 AND completed_at IS NULL",
+        "SELECT id FROM capacity_dispatches \
+         WHERE id = $1 AND completed_at IS NULL AND next_attempt_at <= now() AND attempts = $2",
     )
     .bind(dispatch.id)
+    .bind(dispatch.attempts)
     .fetch_optional(pool)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
@@ -379,13 +397,27 @@ async fn run_dispatch(
     }
 
     let request = sqlx::query_as::<_, RequestRow>(
-        "SELECT id, attempt_id, job_id, status, external_id, idempotency_key \
+        "SELECT id, attempt_id, job_id, status, external_id, idempotency_key, provider \
          FROM capacity_requests WHERE id = $1",
     )
     .bind(dispatch.request_id)
     .fetch_one(pool)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+
+    // The persisted provider is the authority, not whichever provider object the caller supplied.
+    // Belt and braces with the filter in the due query: an `external_id` means nothing to a
+    // provider that did not issue it, and asking the wrong one to release it either errors or --
+    // worse -- succeeds against something else entirely.
+    if request.provider != provider.name() {
+        warn!(
+            request = %request.id,
+            persisted = %request.provider,
+            dispatching = %provider.name(),
+            "refusing to dispatch capacity through a different provider"
+        );
+        return Ok(false);
+    }
 
     match dispatch.action.as_str() {
         "provision" => provision(pool, provider, dispatch, &request).await,
@@ -486,7 +518,9 @@ async fn release(
     request: &RequestRow,
 ) -> Result<bool, CapacityError> {
     let Some(external_id) = &request.external_id else {
-        // Nothing was ever made. Converge rather than wait for a handle that will never arrive.
+        // Nothing was ever made -- including the case of a request that failed before the provider
+        // answered. Converge rather than wait for a handle that will never arrive, and do not ask
+        // the provider to release something that does not exist.
         mark_released(pool, dispatch.id, request.id).await?;
         return Ok(true);
     };
@@ -505,10 +539,13 @@ async fn mark_released(
         .begin()
         .await
         .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    // `failed` is left alone: it is a state a person is meant to see, and a request that failed
+    // before the provider answered holds nothing, so there is no machine being hidden by leaving
+    // it. The dispatch below completes either way, so the release stops being retried.
     sqlx::query(
         "UPDATE capacity_requests \
          SET status = 'released', released_at = now(), last_error = NULL, updated_at = now() \
-         WHERE id = $1 AND status <> 'released'",
+         WHERE id = $1 AND status NOT IN ('released', 'failed')",
     )
     .bind(request_id)
     .execute(&mut *transaction)
@@ -535,39 +572,120 @@ async fn complete(pool: &PgPool, dispatch_id: Uuid) -> Result<(), CapacityError>
 }
 
 /// Record a failed attempt and schedule the next one, or give up and say so.
+///
+/// Called with the request's advisory lock held, and conditional on the dispatch still being in
+/// the state it was read in, so that a slow controller's give-up cannot overwrite a faster one's
+/// success.
 async fn record_failure(pool: &PgPool, dispatch: &DispatchRow, reason: &str) {
     let attempts = dispatch.attempts + 1;
     // Exponential, capped, and stored as a time rather than a sleep so it survives a restart.
     let backoff_seconds = f64::from(2_i32.saturating_pow(attempts.min(6).unsigned_abs())) * 5.0;
-    let _ = sqlx::query(
+    let message = truncate(reason, MAX_ERROR_BYTES);
+    // `attempts = $5` and `completed_at IS NULL` make this a compare-and-set against the row this
+    // controller actually read. If another controller has completed or advanced the dispatch in
+    // the meantime, nothing matches and their outcome stands untouched.
+    let advanced = sqlx::query_scalar::<_, i32>(
         "UPDATE capacity_dispatches \
          SET attempts = $2, last_error = $3, next_attempt_at = now() + make_interval(secs => $4) \
-         WHERE id = $1",
+         WHERE id = $1 AND completed_at IS NULL AND attempts = $5 \
+         RETURNING attempts",
     )
     .bind(dispatch.id)
     .bind(attempts)
-    .bind(truncate(reason, MAX_ERROR_BYTES))
+    .bind(&message)
     .bind(backoff_seconds)
-    .execute(pool)
+    .bind(dispatch.attempts)
+    .fetch_optional(pool)
     .await;
+    let advanced = match advanced {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(dispatch = %dispatch.id, %error, "could not record capacity dispatch failure");
+            return;
+        }
+    };
+    if advanced.is_none() {
+        // Somebody else moved this dispatch on. Recording anything further would be reporting on
+        // a state that no longer exists.
+        return;
+    }
+
     let _ = sqlx::query(
         "UPDATE capacity_requests SET last_error = $2, updated_at = now() WHERE id = $1",
     )
     .bind(dispatch.request_id)
-    .bind(truncate(reason, MAX_ERROR_BYTES))
+    .bind(&message)
     .execute(pool)
     .await;
-    if attempts >= MAX_DISPATCH_ATTEMPTS {
-        // Left for a person. Failing quietly forever is how a stuck request becomes invisible.
-        let _ = sqlx::query(
-            "UPDATE capacity_requests SET status = 'failed', updated_at = now() \
-             WHERE id = $1 AND status NOT IN ('released', 'failed')",
-        )
-        .bind(dispatch.request_id)
-        .execute(pool)
-        .await;
-        warn!(dispatch = %dispatch.id, attempts, "capacity dispatch given up");
+
+    if attempts < MAX_DISPATCH_ATTEMPTS {
+        return;
     }
+
+    // Out of attempts. The due query will not select this dispatch again, so the provider stops
+    // being called; what remains is making sure the right thing is left behind for a person.
+    if dispatch.action == "release" {
+        // A release obligation outlives its retries. Marking the request `failed` would drop it
+        // out of the open-request index and so hide a machine that is very possibly still
+        // running and still being paid for. It stays `releasing`, and `outstanding_releases`
+        // is where it surfaces.
+        warn!(
+            dispatch = %dispatch.id,
+            request = %dispatch.request_id,
+            attempts,
+            "capacity release exhausted its attempts; the machine may still exist"
+        );
+        return;
+    }
+
+    // A provision that never obtained a handle made nothing, so failing it strands nothing. One
+    // that did obtain a handle holds a machine, and must stay visible rather than be marked
+    // `failed` -- which is exactly the state the open-request index excludes.
+    let _ = sqlx::query(
+        "UPDATE capacity_requests SET status = 'failed', updated_at = now() \
+         WHERE id = $1 AND status NOT IN ('released', 'failed') AND external_id IS NULL",
+    )
+    .bind(dispatch.request_id)
+    .execute(pool)
+    .await;
+    warn!(dispatch = %dispatch.id, attempts, "capacity dispatch given up");
+}
+
+/// Requests whose release ran out of attempts and may still be holding a machine.
+///
+/// The operator surface for the one failure this boundary cannot resolve by itself: Kratos has
+/// decided the capacity should go, the provider has refused often enough that asking again is no
+/// longer useful, and the machine is presumed alive until a person says otherwise. Bounded and
+/// cheap to poll, unlike the retries it replaces.
+///
+/// # Errors
+/// Returns an error when the database cannot be reached.
+pub async fn outstanding_releases(pool: &PgPool) -> Result<Vec<OutstandingRelease>, CapacityError> {
+    sqlx::query_as::<_, OutstandingRelease>(
+        "SELECT r.id AS request_id, r.attempt_id, r.project_id, r.provider, \
+                r.external_id, d.attempts, d.last_error \
+         FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
+         WHERE d.action = 'release' AND d.completed_at IS NULL AND d.attempts >= $1 \
+           AND r.external_id IS NOT NULL AND r.released_at IS NULL \
+         ORDER BY r.created_at",
+    )
+    .bind(MAX_DISPATCH_ATTEMPTS)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| CapacityError::Inconsistent(error.to_string()))
+}
+
+/// Capacity that Kratos has given up releasing and that a person now owns.
+#[derive(Debug, sqlx::FromRow)]
+pub struct OutstandingRelease {
+    pub request_id: Uuid,
+    pub attempt_id: Uuid,
+    pub project_id: Uuid,
+    pub provider: String,
+    /// Never null here: the query only returns requests that still hold a handle.
+    pub external_id: Option<String>,
+    pub attempts: i32,
+    pub last_error: Option<String>,
 }
 
 /// Whether the capacity feature is switched on.

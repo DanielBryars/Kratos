@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -431,6 +432,268 @@ async fn a_refused_provision_is_retried_later_and_recorded(pool: PgPool) {
         snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
         "ready"
     );
+}
+
+/// Reads one dispatch, as a controller does before it starts work.
+async fn read_dispatch(pool: &PgPool, request_id: Uuid, action: &str) -> DispatchRow {
+    sqlx::query_as::<_, DispatchRow>(
+        "SELECT id, request_id, action, attempts FROM capacity_dispatches \
+         WHERE request_id = $1 AND action = $2",
+    )
+    .bind(request_id)
+    .bind(action)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn request_id_of(pool: &PgPool, attempt_id: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM capacity_requests WHERE attempt_id = $1")
+        .bind(attempt_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stale_give_up_cannot_overwrite_another_controllers_success(pool: PgPool) {
+    // The overlap that hides a live machine: controller A reads a due dispatch, is slow talking to
+    // the provider, and fails. Meanwhile controller B provisions successfully. If A's give-up is
+    // then written, the request is marked `failed` -- which the open-request index excludes -- and
+    // a machine nobody is pointing at runs on being paid for.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let request_id = request_id_of(&pool, attempt_id).await;
+
+    // What the slow controller read before it started, near the end of its patience.
+    let stale = read_dispatch(&pool, request_id, "provision").await;
+    let stale = DispatchRow {
+        attempts: MAX_DISPATCH_ATTEMPTS - 1,
+        ..stale
+    };
+
+    // The other controller gets there first.
+    let provider = FakeProvider::new();
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+    let won = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(won.status, "ready");
+    let machine = won.external_id.clone().unwrap();
+
+    // Now the slow one gives up, against the state it read a moment ago.
+    record_failure(&pool, &stale, "provider unreachable").await;
+
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "ready",
+        "a stale give-up must not overwrite a successful provision: {after:?}"
+    );
+    assert_eq!(after.external_id.as_deref(), Some(machine.as_str()));
+    assert_eq!(
+        after.last_error, None,
+        "nor report a failure against a request that succeeded"
+    );
+    let dispatch: (Option<DateTime<Utc>>, i32) =
+        sqlx::query_as("SELECT completed_at, attempts FROM capacity_dispatches WHERE id = $1")
+            .bind(stale.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(dispatch.0.is_some(), "the dispatch stays completed");
+    assert_eq!(dispatch.1, 0, "and its attempts are not rewritten");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_request_holding_a_machine_is_never_marked_failed(pool: PgPool) {
+    // The second guard, for the case where the compare-and-set does match: whatever the attempt
+    // count says, a request with an external id has a machine, and `failed` would hide it.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let request_id = request_id_of(&pool, attempt_id).await;
+
+    // A machine exists, but the dispatch that recorded it is still open and out of patience.
+    sqlx::query(
+        "UPDATE capacity_requests SET status = 'ready', external_id = 'fake-held' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE capacity_dispatches SET attempts = $2 WHERE request_id = $1")
+        .bind(request_id)
+        .bind(MAX_DISPATCH_ATTEMPTS - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let dispatch = read_dispatch(&pool, request_id, "provision").await;
+    record_failure(&pool, &dispatch, "provider unreachable").await;
+
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_ne!(
+        after.status, "failed",
+        "capacity that exists must stay visible, not be filed as failed: {after:?}"
+    );
+    assert_eq!(after.external_id.as_deref(), Some("fake-held"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_release_stops_calling_the_provider_but_stays_outstanding(pool: PgPool) {
+    // A release that keeps failing must stop somewhere: the stated limit is eight attempts, and
+    // before this the due query had no cutoff, so the provider was called forever. It must also
+    // not be marked `failed`, because the machine is presumed alive and `failed` is exactly the
+    // state the open-request index leaves out.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+    release_capacity(&pool, attempt_id).await.unwrap();
+
+    // Refuse every release, bringing the stored backoff forward each time rather than sleeping.
+    for _ in 0..MAX_DISPATCH_ATTEMPTS + 4 {
+        provider.fail_next_release("the provider is having a bad day");
+        sqlx::query(
+            "UPDATE capacity_dispatches SET next_attempt_at = now() WHERE completed_at IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        dispatch_once(&pool, &provider).await;
+    }
+
+    let releases = provider
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::Release(_)))
+        .count();
+    assert_eq!(
+        releases,
+        usize::try_from(MAX_DISPATCH_ATTEMPTS).unwrap(),
+        "the provider must be asked exactly as many times as the limit says, then left alone"
+    );
+
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.status, "releasing",
+        "an unreleased machine stays open, not filed as failed: {after:?}"
+    );
+    assert!(after.external_id.is_some(), "the handle is kept");
+
+    // And it is surfaced for a person, which is the whole point of not retrying forever.
+    let outstanding = outstanding_releases(&pool).await.unwrap();
+    assert_eq!(outstanding.len(), 1, "{outstanding:?}");
+    assert_eq!(outstanding[0].attempt_id, attempt_id);
+    assert_eq!(outstanding[0].external_id, after.external_id);
+    assert_eq!(outstanding[0].provider, "fake");
+}
+
+/// A provider that is never meant to be asked anything, because it did not make the machine.
+struct WrongProvider;
+
+#[async_trait]
+impl CapacityProvider for WrongProvider {
+    fn name(&self) -> &'static str {
+        "not-fake"
+    }
+
+    async fn provision(&self, _spec: &CapacitySpec) -> Result<ProvisionedCapacity, CapacityError> {
+        panic!("a request recorded against another provider must never reach this one");
+    }
+
+    async fn release(&self, _external_id: &str) -> Result<(), CapacityError> {
+        panic!("a request recorded against another provider must never reach this one");
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_dispatch_only_goes_to_the_provider_that_owns_it(pool: PgPool) {
+    // `capacity_requests.provider` is the authority, not whichever provider object a caller
+    // happened to construct. An external id means nothing to a provider that did not issue it,
+    // and asking the wrong one to release it either errors or succeeds against something else.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+
+    assert_eq!(
+        dispatch_once(&pool, &WrongProvider).await,
+        0,
+        "a provider that did not own this request has nothing to do"
+    );
+    let untouched = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(untouched.status, "requested");
+
+    // The owner still finds it, so the dispatch was skipped rather than consumed.
+    let provider = FakeProvider::new();
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "ready"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the schema refuses
+// ---------------------------------------------------------------------------------------------
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_request_cannot_be_filed_against_another_jobs_attempt(pool: PgPool) {
+    // Three independent foreign keys would each be satisfied by an attempt from one job and a job
+    // from another project, which is capacity billed to a project that never asked for it.
+    let attempt_id = seed_attempt(&pool).await;
+    let other_job_id = seed_queued_job(&pool).await;
+
+    let mismatched = sqlx::query(
+        "INSERT INTO capacity_requests \
+         (id, attempt_id, job_id, project_id, provider, idempotency_key) \
+         VALUES ($1, $2, $3, $4, 'fake', 'kratos-mismatched')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(attempt_id)
+    .bind(other_job_id)
+    .bind(crate::projects::DEFAULT_PROJECT_ID)
+    .execute(&pool)
+    .await;
+    assert!(
+        mismatched.is_err(),
+        "an attempt belonging to another job must be refused"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_job_holding_capacity_cannot_be_deleted(pool: PgPool) {
+    // Cascading the parent away would take `external_id` -- the only handle the machine can ever
+    // be released by -- and the pending release dispatch with it, leaving a paid machine running
+    // with nothing in the database pointing at it.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT job_id FROM capacity_requests WHERE attempt_id = $1")
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let blocked = sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await;
+    assert!(
+        blocked.is_err(),
+        "deleting a job that still holds capacity must be refused"
+    );
+
+    // Once the machine is genuinely gone, the row is settled and no longer stands in the way.
+    release_capacity(&pool, attempt_id).await.unwrap();
+    assert_eq!(dispatch_once(&pool, &provider).await, 1);
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "released"
+    );
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("a released request must not block ordinary cleanup");
 }
 
 #[test]
