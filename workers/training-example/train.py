@@ -210,10 +210,20 @@ def load_dataset_selection(
     )
 
 
-def mounted_selection_exists(
+def resolve_dataset_selection(
     alias: str = DATASET_INPUT_ALIAS, input_directory: Path = INPUT_DIRECTORY
-) -> bool:
-    return selection_path(alias, input_directory).is_file()
+) -> DatasetSelection | None:
+    """Resolve this workload's input without silently ignoring a differently named dataset."""
+    expected = selection_path(alias, input_directory)
+    if expected.is_file():
+        return load_dataset_selection(alias, input_directory)
+    available = sorted((input_directory / SELECTION_DIRECTORY).glob("*.json"))
+    if available:
+        aliases = ", ".join(path.stem for path in available)
+        raise RuntimeError(
+            f"dataset input alias {alias!r} is required; mounted selection aliases: {aliases}"
+        )
+    return None
 
 
 def save_checkpoint(checkpoint: dict[str, Any], path: Path = CHECKPOINT_PATH) -> str:
@@ -274,31 +284,68 @@ def load_lerobot_rows(
     if not files:
         raise RuntimeError(f"dataset input {selection.alias!r} has no data parquet files")
     selected = None if selection.selects_every_episode else set(selection.included_episodes)
+    requested_order = list(selection.included_episodes)
+    if selected is not None and len(requested_order) > max_rows:
+        raise RuntimeError("curated selection has more episodes than the bounded smoke row limit")
+    quotas: dict[int, int] | None = None
+    if selected is not None:
+        rows_per_episode, extra_rows = divmod(max_rows, len(requested_order))
+        quotas = {
+            episode: rows_per_episode + int(index < extra_rows)
+            for index, episode in enumerate(requested_order)
+        }
     by_episode: dict[int, list[tuple[list[float], list[float]]]] = {}
     encountered: list[int] = []
+    encountered_set: set[int] = set()
+    row_count = 0
+    complete = False
     for path in files:
-        table = parquet.read_table(path, columns=["episode_index", "observation.state", "action"])
-        episodes = table.column("episode_index").to_pylist()
-        states = table.column("observation.state").to_pylist()
-        actions = table.column("action").to_pylist()
-        for raw_episode, raw_state, raw_action in zip(episodes, states, actions, strict=True):
-            episode = int(raw_episode)
-            if selected is not None and episode not in selected:
-                continue
-            if episode not in by_episode:
-                by_episode[episode] = []
-                encountered.append(episode)
-            by_episode[episode].append(
-                (
-                    _numeric_vector(raw_state, "observation.state"),
-                    _numeric_vector(raw_action, "action"),
+        batches = parquet.ParquetFile(path).iter_batches(
+            batch_size=min(max_rows, 1_024),
+            columns=["episode_index", "observation.state", "action"],
+        )
+        for batch in batches:
+            columns = batch.to_pydict()
+            for raw_episode, raw_state, raw_action in zip(
+                columns["episode_index"],
+                columns["observation.state"],
+                columns["action"],
+                strict=True,
+            ):
+                episode = int(raw_episode)
+                if selected is not None and episode not in selected:
+                    continue
+                if episode not in encountered_set:
+                    encountered_set.add(episode)
+                    encountered.append(episode)
+                episode_rows = by_episode.setdefault(episode, [])
+                if quotas is not None and len(episode_rows) >= quotas[episode]:
+                    continue
+                episode_rows.append(
+                    (
+                        _numeric_vector(raw_state, "observation.state"),
+                        _numeric_vector(raw_action, "action"),
+                    )
                 )
-            )
-    order = list(selection.included_episodes) if selected is not None else encountered
-    missing = [episode for episode in order if episode not in by_episode]
+                row_count += 1
+                if selected is None and row_count >= max_rows:
+                    complete = True
+                    break
+            if selected is not None and quotas is not None:
+                complete = all(
+                    episode in encountered_set
+                    and len(by_episode.get(episode, ())) >= quotas[episode]
+                    for episode in requested_order
+                )
+            if complete:
+                break
+        if complete:
+            break
+    order = requested_order if selected is not None else encountered
+    missing = [episode for episode in order if episode not in encountered_set]
     if missing:
         raise RuntimeError(f"selected LeRobot episodes are absent from parquet data: {missing}")
-    rows = [row for episode in order for row in by_episode[episode]][:max_rows]
+    rows = [row for episode in order for row in by_episode[episode]]
     if len(rows) < 5:
         raise RuntimeError("selected LeRobot episodes contain fewer than five usable rows")
     feature_count = len(rows[0][0])
@@ -455,8 +502,9 @@ def run_lerobot_training(
 
 def run_training() -> dict[str, Any]:
     run_identity = load_run_identity()
-    if mounted_selection_exists():
-        return run_lerobot_training(run_identity, load_dataset_selection())
+    selection = resolve_dataset_selection()
+    if selection is not None:
+        return run_lerobot_training(run_identity, selection)
     dataset_hash = verify_dataset()
     configure_determinism()
     device = require_cuda()

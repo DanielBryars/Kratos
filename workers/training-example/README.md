@@ -11,6 +11,10 @@ and view identity, preserves the exact `included_episodes` order, and reads only
 4,096 rows. This is an end-to-end dataset-selection acceptance workload, not a replacement for a
 full SmolVLA training recipe.
 
+The alias is intentional: if the workload receives dataset selections but none is named `training`,
+it fails instead of silently running the bundled Shapes fallback. Parquet input is streamed in bounded
+record batches, and a curated selection shares the row budget across its ordered episodes.
+
 The mounted selection identity and ordered episode list are written into both the structured result
 and the durable checkpoint. A missing episode, malformed selection, unsupported Parquet schema, CPU
 fallback, or a training loop that does not reduce loss fails the attempt explicitly.

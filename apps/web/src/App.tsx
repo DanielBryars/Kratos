@@ -232,7 +232,7 @@ export function App() {
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
-  const [jobDatasetAlias, setJobDatasetAlias] = useState("dataset");
+  const [jobDatasetAlias, setJobDatasetAlias] = useState("training");
   const [jobDatasetVersionId, setJobDatasetVersionId] = useState("");
   const [jobDatasetViewId, setJobDatasetViewId] = useState("");
   const [durableOutputEnabled, setDurableOutputEnabled] = useState(false);

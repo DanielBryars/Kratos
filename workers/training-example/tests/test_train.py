@@ -167,6 +167,16 @@ def test_selection_refuses_a_complete_version_with_episode_subset(tmp_path: Path
         train.load_dataset_selection(input_directory=tmp_path)
 
 
+def test_a_differently_named_dataset_cannot_silently_use_the_bundled_fallback(
+    tmp_path: Path,
+) -> None:
+    path = write_selection(tmp_path)
+    path.rename(path.with_name("dataset.json"))
+
+    with pytest.raises(RuntimeError, match="alias 'training' is required"):
+        train.resolve_dataset_selection(input_directory=tmp_path)
+
+
 def test_lerobot_rows_follow_curated_episode_order_and_ignore_other_episodes(
     tmp_path: Path,
 ) -> None:
@@ -199,3 +209,27 @@ def test_lerobot_rows_follow_curated_episode_order_and_ignore_other_episodes(
     assert order == (7, 2)
     assert features[:, 0].tolist() == pytest.approx([7.0, 7.1, 7.2, 2.0, 2.1, 2.2])
     assert actions[:, 0].tolist() == pytest.approx([7.0, 7.1, 7.2, 2.0, 2.1, 2.2])
+
+
+def test_lerobot_row_cap_is_shared_across_the_ordered_episode_selection(
+    tmp_path: Path,
+) -> None:
+    write_selection(tmp_path, episodes=[7, 2])
+    data = tmp_path / "training" / "data"
+    data.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "episode_index": [2, 7, 2, 7, 2, 7, 2, 7],
+                "observation.state": [[float(value)] for value in range(8)],
+                "action": [[float(value)] for value in range(8)],
+            }
+        ),
+        data / "rows.parquet",
+    )
+    selection = train.load_dataset_selection(input_directory=tmp_path)
+
+    features, _, order = train.load_lerobot_rows(selection, tmp_path, max_rows=5)
+
+    assert order == (7, 2)
+    assert features[:, 0].tolist() == [1.0, 3.0, 5.0, 0.0, 2.0]
