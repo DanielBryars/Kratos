@@ -23,7 +23,7 @@ This is the current operating handover for manual work.
 - [ ] Decide whether to retain or purge incomplete upload rows after reference tracking and a retention policy exist.
 - [ ] Finish review of the disabled, cost-free capacity-provider boundary in PR #105. A real SkyPilot provider, pre-attempt provisioning, Terraform, and any cloud spend remain later work requiring a separate design and explicit spend decision. Kratos remains authoritative for fairness, budgets, job state, and result identity.
 - [ ] Choose the first useful model objective and authorised dataset. The deployed CUDA workload proves reproducible dataset selection, execution, lineage and storage; it is still a bounded smoke model.
-- [ ] Revisit the preview file endpoint's missing identity check, deferred by Daniel on 2026-09-27 and detailed under "Marked for revisit" in [dataset-catalogue-handover.md](dataset-catalogue-handover.md). The trigger is any dataset holding material that is not ours to lose. The code carries the same note at `services/control-plane/src/datasets.rs`.
+- [ ] Bind preview reads to caller identity, deferred by Daniel on 2026-09-27 and detailed under "Marked for revisit" in [dataset-catalogue-handover.md](dataset-catalogue-handover.md). A preview read authorises on the short-lived capability alone, so it proves the caller holds a valid session but not who they are. The viewer frame does already hold an identity token and uses it for curation; the work is carrying an identity alongside the capability on each read. The trigger is any dataset holding material that is not ours to lose. The code carries the same note at `services/control-plane/src/datasets.rs`.
 
 ## Guardrails
 
