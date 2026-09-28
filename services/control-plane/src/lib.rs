@@ -24,6 +24,7 @@ mod dataset_inputs;
 mod datasets;
 pub mod human_auth;
 pub mod migration;
+pub mod mlflow;
 mod observations;
 mod operator;
 pub mod projects;
