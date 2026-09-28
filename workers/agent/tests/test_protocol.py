@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from test_executor import T0, FakeClock, JobClient, JobContainer, job_assignment
 
+import kratos_agent.state as agent_state
 from kratos_agent.executor import DockerExecutor, LogObserver
 from kratos_agent.models import (
     GpuHealth,
@@ -101,6 +102,57 @@ def test_enrols_and_sends_scoped_heartbeat_without_logging_secret(tmp_path: Path
     assert worker_secret not in repr(updated)
 
 
+def test_lost_heartbeat_response_consumes_sequence_before_capabilities_change(
+    tmp_path: Path,
+) -> None:
+    sent: list[tuple[int, int]] = []
+    available_bytes = 2049
+
+    def changing_capabilities() -> WorkerCapabilities:
+        nonlocal available_bytes
+        available_bytes -= 1
+        return capabilities().model_copy(update={"storage_available_bytes": available_bytes})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        sent.append((payload["sequence"], payload["capabilities"]["storage_available_bytes"]))
+        if len(sent) == 1:
+            # Model the server committing sequence 0 before its response is lost in transit.
+            raise httpx.ReadError("response was lost", request=request)
+        return heartbeat_response(request, assigned=False)
+
+    state_path = tmp_path / "agent.json"
+    state = enrolled_state(state_path)
+    with WorkerProtocolClient(
+        "https://control.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        runner = AgentRunner(
+            client,
+            "GPU host",
+            state_path,
+            None,
+            capability_collector=changing_capabilities,
+        )
+        after_loss = runner.step(state)
+        assert after_loss.next_sequence == 1
+        assert load_state(state_path) == after_loss
+
+        restarted = load_state(state_path)
+        assert restarted is not None
+        assert restarted == after_loss
+        recovered = AgentRunner(
+            client,
+            "GPU host",
+            state_path,
+            None,
+            capability_collector=changing_capabilities,
+        ).step(restarted)
+
+    assert sent == [(0, 2048), (1, 2047)]
+    assert recovered.next_sequence == 2
+    assert load_state(state_path) == recovered
+
+
 def test_structured_error_does_not_include_supplied_credential() -> None:
     supplied = "ken_identifier_do-not-print-this"
 
@@ -184,8 +236,12 @@ def test_radio_in_registration_proves_key_possession(tmp_path: Path) -> None:
     assert enrolled.private_key not in repr(enrolled)
 
 
-def test_state_is_written_atomically_and_credential_repr_is_redacted(tmp_path: Path) -> None:
+def test_state_is_written_atomically_and_credential_repr_is_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "state.json"
+    synced: list[Path] = []
+    monkeypatch.setattr(agent_state, "_sync_directory", synced.append)
     state = AgentState(
         agent_instance_id=UUID(int=1),
         worker_id=WORKER_ID,
@@ -197,6 +253,7 @@ def test_state_is_written_atomically_and_credential_repr_is_redacted(tmp_path: P
     assert load_state(path) == state
     assert "kwc_identifier_private" not in repr(state)
     assert not list(tmp_path.glob(".state-*"))
+    assert synced == [tmp_path]
 
 
 @pytest.mark.parametrize(
@@ -490,7 +547,12 @@ def test_temporary_control_plane_failure_does_not_end_the_agent(
     with WorkerProtocolClient(
         "https://control.example", transport=httpx.MockTransport(handler)
     ) as client:
-        assert job_runner(client, state_path, FakeJobExecutor()).step(state) == state
+        updated = job_runner(client, state_path, FakeJobExecutor()).step(state)
+
+    # The request may have reached the server before the error response was observed. A skipped
+    # sequence is safe; replaying a possibly accepted one with newly collected capabilities is not.
+    assert updated.next_sequence == 1
+    assert load_state(state_path) == updated
 
 
 def test_rejected_credential_still_ends_the_agent(tmp_path: Path) -> None:
@@ -506,6 +568,10 @@ def test_rejected_credential_still_ends_the_agent(tmp_path: Path) -> None:
         pytest.raises(ControlPlaneError),
     ):
         job_runner(client, state_path, FakeJobExecutor()).step(state)
+
+    persisted = load_state(state_path)
+    assert persisted is not None
+    assert persisted.next_sequence == 1
 
 
 def test_state_without_an_attempt_journal_remains_readable(tmp_path: Path) -> None:
@@ -598,7 +664,9 @@ def test_only_an_explicit_rejection_withdraws_authority_mid_job(
         updated = job_runner(client, state_path, executor).step(state)
 
     assert executor.authorised == [authorised]
-    assert updated.next_sequence == 1
+    # Sequence 0 was acknowledged and sequence 1 was durably consumed before its response.
+    assert updated.next_sequence == 2
+    assert load_state(state_path) == updated
 
 
 def unreachable(request: httpx.Request) -> httpx.Response:

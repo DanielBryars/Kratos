@@ -31,6 +31,17 @@ class AgentState:
         return self.worker_id is not None and self.worker_credential is not None
 
 
+def _sync_directory(path: Path) -> None:
+    """Make a completed atomic rename durable where directory fsync is supported."""
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def load_state(path: Path) -> AgentState | None:
     if not path.exists():
         return None
@@ -86,6 +97,7 @@ def save_state(path: Path, state: AgentState) -> None:
             os.fsync(stream.fileno())
         temporary_path.replace(path)
         os.chmod(path, 0o600)
+        _sync_directory(path.parent)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
         raise
