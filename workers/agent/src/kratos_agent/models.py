@@ -19,7 +19,11 @@ from pydantic import (
 # 1.2 adds observation streaming. The agent advertises it only when it can collect a job's
 # records and deliver them, because a control plane that allocated a stream for an agent
 # that never sends to it would show a run with telemetry that never arrives.
-PROTOCOL_VERSION = "1.2"
+PROTOCOL_VERSION = "1.3"
+# 1.2 streams observations but cannot receive dataset inputs. The control plane withholds a job
+# with dataset inputs from anything below 1.3, so advertising 1.3 is what makes this agent
+# eligible for one.
+PROTOCOL_VERSION_WITH_OBSERVATIONS = "1.2"
 # 1.1 adds the durable output extension. The control plane withholds jobs with output
 # requirements from 1.0, and a 1.1 worker runs jobs without observation streaming.
 PROTOCOL_VERSION_WITH_OUTPUTS = "1.1"
@@ -37,6 +41,14 @@ MAX_OBSERVATION_BATCH_RECORDS = 100
 MAX_OBSERVATION_BATCH_BYTES = 256 * 1024
 # The first minor version that can stream observations.
 OBSERVATION_MINOR_VERSION = 2
+# The first minor version that can receive dataset inputs.
+DATASET_INPUT_MINOR_VERSION = 3
+# A job names a bounded number of inputs, and each input a bounded number of files.
+MAX_DATASET_INPUTS = 8
+MAX_DATASET_INPUT_FILES = 10_000
+# One dataset file. Larger than any single output because a LeRobot video can be big.
+MAX_DATASET_FILE_BYTES = 20 * 1024**3
+MAX_DATASET_INPUT_TOTAL_BYTES = 200 * 1024**3
 # Matches MAX_STRUCTURED_RESULT_BYTES in the control plane. Checked here as well as there
 # so an over-long workload result is reported without one rather than refused outright.
 MAX_STRUCTURED_RESULT_BYTES = 65_536
@@ -212,6 +224,80 @@ class JobOutputRequirement(StrictModel):
     max_bytes: int = Field(ge=1, le=MAX_OUTPUT_FILE_BYTES)
 
 
+class DatasetInputAssignment(StrictModel):
+    """One named dataset input, as the assignment describes it.
+
+    Only identity, never content: the alias the workload will see, the immutable version and
+    optional view, and the manifest digest that pins what those resolve to. The files themselves
+    are fetched separately and verified against their own digests.
+    """
+
+    # Exactly the server's bound, so an alias the control plane accepts is never one this
+    # agent refuses -- a job that could be scheduled and never staged is the worst of both.
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+    dataset_version_id: UUID
+    dataset_view_id: UUID | None = None
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class DatasetInputFile(StrictModel):
+    """One file inside a dataset input manifest.
+
+    `download_url` is a short-lived signed read. It is never logged and never written to disk:
+    the cache is keyed by `sha256`, which is the only durable name a file has here.
+    """
+
+    path: str = Field(min_length=1, max_length=512)
+    media_type: str = Field(min_length=1, max_length=200)
+    byte_length: int = Field(ge=0, le=MAX_DATASET_FILE_BYTES)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    download_url: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def path_stays_inside_the_input(self) -> "DatasetInputFile":
+        """Refuse a path that could escape the alias directory.
+
+        The control plane validates this too. It is checked again here because this agent is what
+        turns a string into a filesystem write, and a traversal that reached that point would
+        write outside the attempt -- into the agent's own state, at worst.
+        """
+        if self.path.startswith("/") or "\\" in self.path:
+            raise ValueError("dataset input path must be relative with forward slashes")
+        segments = self.path.split("/")
+        if any(segment in ("", ".", "..") for segment in segments):
+            raise ValueError("dataset input path must not contain empty or relative segments")
+        return self
+
+
+class DatasetInputManifest(StrictModel):
+    """What the control plane says one alias contains, for one attempt."""
+
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,31}$")
+    dataset_id: UUID
+    dataset_name: str = Field(min_length=1, max_length=200)
+    dataset_version_id: UUID
+    version_number: int = Field(ge=1)
+    source_kind: str = Field(min_length=1, max_length=40)
+    source_repository: str | None = None
+    resolved_revision: str | None = None
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dataset_view_id: UUID | None = None
+    dataset_view_name: str | None = None
+    dataset_view_manifest_sha256: str | None = None
+    included_episodes: tuple[int, ...] = ()
+    files: tuple[DatasetInputFile, ...] = Field(default=(), max_length=MAX_DATASET_INPUT_FILES)
+
+    @model_validator(mode="after")
+    def files_are_distinct_and_bounded(self) -> "DatasetInputManifest":
+        paths = [file.path for file in self.files]
+        if len(set(paths)) != len(paths):
+            raise ValueError("dataset input manifest repeats a path")
+        total = sum(file.byte_length for file in self.files)
+        if total > MAX_DATASET_INPUT_TOTAL_BYTES:
+            raise ValueError("dataset input manifest exceeds the total byte ceiling")
+        return self
+
+
 class JobAssignment(StrictModel):
     attempt_id: UUID
     job_id: UUID
@@ -229,6 +315,21 @@ class JobAssignment(StrictModel):
     # server ever sends it: the model forbids unknown fields, so an agent that did not know
     # the field would reject the whole assignment and the job would not run.
     observation_stream_id: UUID | None = None
+
+    # Omitted by the server when a job has no dataset inputs, and for agents below 1.3.
+    # Defaulted here for the same reason `observation_stream_id` is: this model forbids
+    # unknown fields, so the field has to exist in the agent before the server sends it.
+    dataset_inputs: tuple[DatasetInputAssignment, ...] = Field(
+        default=(), max_length=MAX_DATASET_INPUTS
+    )
+
+    @model_validator(mode="after")
+    def dataset_input_aliases_are_distinct(self) -> "JobAssignment":
+        """Two inputs cannot share an alias: one would silently shadow the other's directory."""
+        aliases = [dataset_input.alias for dataset_input in self.dataset_inputs]
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("dataset inputs repeat an alias")
+        return self
 
     @model_validator(mode="after")
     def output_requirements_are_consistent(self) -> "JobAssignment":
