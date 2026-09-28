@@ -48,6 +48,22 @@ def test_a_whole_object_is_sent_and_its_generation_returned(tmp_path: Path) -> N
 
 
 @needs_posix
+def test_json_api_completion_returns_generation_and_size(tmp_path: Path) -> None:
+    path, identity, length = written(tmp_path, b"weights")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["Content-Range"] == f"bytes */{length}":
+            return httpx.Response(308)
+        return httpx.Response(200, json={"generation": "23", "size": str(length)})
+
+    with httpx.Client(transport=transport(handler)) as client:
+        completed = upload_object(client, SESSION, path, identity, length)
+
+    assert completed.storage_generation == 23
+    assert completed.byte_length == length
+
+
+@needs_posix
 def test_transfer_resumes_from_the_offset_cloud_storage_acknowledges(tmp_path: Path) -> None:
     path, identity, length = written(tmp_path, b"0123456789")
     ranges: list[str] = []

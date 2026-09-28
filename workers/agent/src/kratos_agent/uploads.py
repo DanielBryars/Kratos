@@ -144,13 +144,25 @@ def _resume_offset(response: httpx.Response) -> int:
 def _generation(response: httpx.Response, byte_length: int) -> CompletedUpload:
     generation = response.headers.get("x-goog-generation")
     stored = response.headers.get("x-goog-stored-content-length")
+    if generation is None or stored is None:
+        # The JSON API returns the completed object resource in the response body. Production
+        # Cloud Storage does not guarantee the XML-style generation and length headers used by
+        # the emulator tests, so accept either representation while still requiring the exact
+        # immutable object generation before the control plane can verify the upload.
+        try:
+            metadata = response.json()
+        except ValueError:
+            metadata = {}
+        if isinstance(metadata, dict):
+            generation = generation or metadata.get("generation")
+            stored = stored or metadata.get("size")
     if generation is None:
         raise UploadError("Cloud Storage did not return an object generation")
     try:
         completed = CompletedUpload(storage_generation=int(generation), byte_length=byte_length)
-    except ValueError:
+    except (TypeError, ValueError):
         raise UploadError("Cloud Storage returned an unusable generation") from None
-    if stored is not None and stored != str(byte_length):
+    if stored is not None and str(stored) != str(byte_length):
         raise UploadError(f"Cloud Storage stored {stored} bytes, not {byte_length}")
     return completed
 
