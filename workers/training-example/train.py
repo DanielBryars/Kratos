@@ -40,6 +40,57 @@ LEARNING_RATE = 0.025
 OUTPUT_LIMIT_BYTES = 8 * 1024
 
 
+def emit_record(record: str, **fields: Any) -> None:
+    """Write one protocol 1.2 observation for the agent to persist and deliver."""
+    payload = {"schema_version": SCHEMA_VERSION, "record": record, **fields}
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True), flush=True)
+
+
+def emit_param(name: str, value: bool | float | int | str) -> None:
+    emit_record("param", name=name, value=value)
+
+
+def emit_metric(name: str, value: float, step: int, unit: str | None = None) -> None:
+    fields: dict[str, Any] = {"name": name, "value": value, "step": step}
+    if unit is not None:
+        fields["unit"] = unit
+    emit_record("metric", **fields)
+
+
+def emit_progress(step: int, total_steps: int) -> None:
+    emit_record("progress", step=step, total_steps=total_steps, unit="epoch")
+
+
+def emit_common_parameters(*, epochs: int, learning_rate: float) -> None:
+    emit_param("workload.version", WORKLOAD_VERSION)
+    emit_param("training.seed", SEED)
+    emit_param("training.epochs", epochs)
+    emit_param("training.learning_rate", learning_rate)
+
+
+def emit_selection_parameters(selection: DatasetSelection) -> None:
+    emit_param("dataset.name", selection.dataset_name)
+    emit_param("dataset.version_id", str(selection.dataset_version_id))
+    emit_param("dataset.version_number", selection.version_number)
+    emit_param("dataset.source_kind", selection.source_kind)
+    if selection.source_repository is not None:
+        emit_param("dataset.source_repository", selection.source_repository)
+    if selection.resolved_revision is not None:
+        emit_param("dataset.resolved_revision", selection.resolved_revision)
+    emit_param("dataset.manifest_sha256", selection.manifest_sha256)
+    emit_param("dataset.selection_sha256", selection.selection_sha256)
+    emit_param("dataset.included_episode_count", len(selection.included_episodes))
+    included_episodes = json.dumps(selection.included_episodes)
+    if len(json.dumps(included_episodes, separators=(",", ":")).encode("utf-8")) <= 512:
+        emit_param("dataset.included_episodes", included_episodes)
+    if selection.dataset_view_id is not None:
+        emit_param("dataset.view_id", str(selection.dataset_view_id))
+    if selection.dataset_view_name is not None:
+        emit_param("dataset.view_name", selection.dataset_view_name)
+    if selection.dataset_view_manifest_sha256 is not None:
+        emit_param("dataset.view_manifest_sha256", selection.dataset_view_manifest_sha256)
+
+
 @dataclass(frozen=True)
 class RunIdentity:
     job_id: UUID
@@ -64,6 +115,9 @@ class DatasetSelection:
     dataset_name: str
     dataset_version_id: UUID
     version_number: int
+    source_kind: str
+    source_repository: str | None
+    resolved_revision: str | None
     manifest_sha256: str
     dataset_view_id: UUID | None
     dataset_view_name: str | None
@@ -79,6 +133,9 @@ class DatasetSelection:
             "name": self.dataset_name,
             "dataset_version_id": str(self.dataset_version_id),
             "version_number": self.version_number,
+            "source_kind": self.source_kind,
+            "source_repository": self.source_repository,
+            "resolved_revision": self.resolved_revision,
             "manifest_sha256": self.manifest_sha256,
             "dataset_view_id": str(self.dataset_view_id) if self.dataset_view_id else None,
             "dataset_view_name": self.dataset_view_name,
@@ -158,6 +215,15 @@ def load_dataset_selection(
         dataset_id = UUID(str(raw["dataset_id"]))
         dataset_version_id = UUID(str(raw["dataset_version_id"]))
         version_number = int(raw["version_number"])
+        source_kind = str(raw["source_kind"])
+        source_repository_raw = raw.get("source_repository")
+        source_repository = (
+            str(source_repository_raw) if source_repository_raw is not None else None
+        )
+        resolved_revision_raw = raw.get("resolved_revision")
+        resolved_revision = (
+            str(resolved_revision_raw) if resolved_revision_raw is not None else None
+        )
         manifest_sha256 = str(raw["manifest_sha256"])
         dataset_name = str(raw["dataset_name"])
         view_id_raw = raw.get("dataset_view_id")
@@ -180,6 +246,18 @@ def load_dataset_selection(
         raise RuntimeError("dataset selection fields are invalid") from error
     if version_number < 1 or not dataset_name:
         raise RuntimeError("dataset selection identity is invalid")
+    if source_kind == "hugging_face":
+        if (
+            not source_repository
+            or resolved_revision is None
+            or re.fullmatch(r"[0-9a-f]{40}", resolved_revision) is None
+        ):
+            raise RuntimeError("Hugging Face source identity is invalid")
+    elif source_kind == "upload":
+        if source_repository is not None or resolved_revision is not None:
+            raise RuntimeError("uploaded dataset source identity is invalid")
+    else:
+        raise RuntimeError("dataset source kind is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None:
         raise RuntimeError("dataset manifest digest is invalid")
     if len(set(included_episodes)) != len(included_episodes):
@@ -200,6 +278,9 @@ def load_dataset_selection(
         dataset_name=dataset_name,
         dataset_version_id=dataset_version_id,
         version_number=version_number,
+        source_kind=source_kind,
+        source_repository=source_repository,
+        resolved_revision=resolved_revision,
         manifest_sha256=manifest_sha256,
         dataset_view_id=dataset_view_id,
         dataset_view_name=dataset_view_name,
@@ -419,6 +500,9 @@ def run_lerobot_training(
     model = ActionRegressor(features.shape[1], actions.shape[1]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     loss_function = nn.MSELoss()
+    emit_common_parameters(epochs=120, learning_rate=0.01)
+    emit_selection_parameters(selection)
+    emit_progress(0, 120)
     started = perf_counter()
     initial_loss: float | None = None
     model.train()
@@ -427,6 +511,7 @@ def run_lerobot_training(
         loss = loss_function(model(train_features), train_actions)
         if initial_loss is None:
             initial_loss = float(loss.item())
+            emit_metric("train.loss", initial_loss, 0)
         loss.backward()
         optimizer.step()
     torch.cuda.synchronize(device)
@@ -439,6 +524,9 @@ def run_lerobot_training(
         )
     if initial_loss is None or final_train_loss >= initial_loss:
         raise RuntimeError("LeRobot smoke training did not reduce loss")
+    emit_metric("train.loss", final_train_loss, 120)
+    emit_metric("validation.loss", validation_loss, 120)
+    emit_progress(120, 120)
     checkpoint = {
         "workload_version": WORKLOAD_VERSION,
         "dataset_selection": selection.result_fields(),
@@ -526,6 +614,11 @@ def run_training() -> dict[str, Any]:
         raise RuntimeError("model was not placed on CUDA; CPU fallback is disabled")
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     loss_function = nn.CrossEntropyLoss()
+    emit_common_parameters(epochs=EPOCHS, learning_rate=LEARNING_RATE)
+    emit_param("dataset.name", "Kratos Shapes")
+    emit_param("dataset.version", DATASET_VERSION)
+    emit_param("dataset.manifest_sha256", dataset_hash)
+    emit_progress(0, EPOCHS)
 
     started = perf_counter()
     initial_loss: float | None = None
@@ -535,6 +628,7 @@ def run_training() -> dict[str, Any]:
         loss = loss_function(model(train_features), train_labels)
         if initial_loss is None:
             initial_loss = float(loss.item())
+            emit_metric("train.loss", initial_loss, 0)
         loss.backward()
         optimizer.step()
     torch.cuda.synchronize(device)
@@ -551,6 +645,10 @@ def run_training() -> dict[str, Any]:
         raise RuntimeError("training did not reduce loss")
     if validation_accuracy < 0.95:
         raise RuntimeError(f"validation accuracy {validation_accuracy:.4f} is below 0.95")
+    emit_metric("train.loss", final_loss, EPOCHS)
+    emit_metric("train.accuracy", train_accuracy, EPOCHS)
+    emit_metric("validation.accuracy", validation_accuracy, EPOCHS)
+    emit_progress(EPOCHS, EPOCHS)
 
     state_hash = model_state_sha256(model)
     checkpoint: dict[str, Any] = {
@@ -617,7 +715,11 @@ def run_training() -> dict[str, Any]:
 
 
 def encode_result(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    encoded = json.dumps(
+        {"schema_version": SCHEMA_VERSION, "record": "result", "result": payload},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     if len(encoded.encode("utf-8")) > OUTPUT_LIMIT_BYTES:
         raise RuntimeError(f"structured result exceeded {OUTPUT_LIMIT_BYTES} bytes")
     return encoded
