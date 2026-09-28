@@ -322,6 +322,7 @@ def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest)
     capabilities, and a file the workload can read is the last place to put one.
     """
     destination = selection_manifest_path(attempt_root, manifest.alias)
+    complete_version = manifest.dataset_view_id is None
     document = {
         "schema_version": "1.0",
         "alias": manifest.alias,
@@ -339,10 +340,15 @@ def write_selection_manifest(attempt_root: Path, manifest: DatasetInputManifest)
         "dataset_view_name": manifest.dataset_view_name,
         "dataset_view_manifest_sha256": manifest.dataset_view_manifest_sha256,
         # Ordered, because a workload iterating episodes should not have to guess whether the
-        # order it was given means anything. A null view is the complete version, which is
-        # recorded as the empty selection being absent rather than as an empty list.
-        "included_episodes": list(manifest.included_episodes),
-        "selects_every_episode": manifest.dataset_view_id is None,
+        # order it was given means anything.
+        #
+        # Empty for a complete version, and that is not the same as "no episodes". The control
+        # plane returns every index for a null view, so passing that through beside
+        # `selects_every_episode` would state two instructions at once -- "train on everything"
+        # and "train on exactly this list" -- and a consumer is right to refuse it. The
+        # instruction for a complete version is the flag; the list belongs to a curated view.
+        "included_episodes": [] if complete_version else list(manifest.included_episodes),
+        "selects_every_episode": complete_version,
         "files": [
             {
                 "path": dataset_file.path,
