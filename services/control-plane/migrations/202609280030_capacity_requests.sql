@@ -38,6 +38,11 @@ CREATE TABLE capacity_requests (
     last_error text CHECK (last_error IS NULL OR length(last_error) <= 500),
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
+    -- That somebody asked for this capacity to go, recorded as a fact in its own right rather
+    -- than as a status. A request whose provider outcome is unknown cannot be moved to
+    -- `releasing` -- there is no handle to release -- but the intent must survive anyway, or the
+    -- machine that turns up later becomes ready capacity for a job that was cancelled.
+    release_requested_at timestamptz,
     released_at timestamptz,
     -- A released request has finished with its machine; anything else has not.
     CHECK ((status = 'released') = (released_at IS NOT NULL)),

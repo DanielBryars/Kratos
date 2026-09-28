@@ -187,6 +187,46 @@ dispatch is still retryable rather than spent.
 leave the dispatch retryable, not spent — left: 8, right: 7`. Eight is the cutoff: that dispatch
 would never have been selected again.
 
+### 12. Cancellation outlives an unknown outcome
+
+The same mistake as section 10, in the other place it lived. Having stopped `record_failure`
+inferring "no handle recorded" means "no machine", the inference was still sitting in
+`release_capacity`: a cancellation with a null handle deleted the provision dispatch and declared
+the request released. After a single create-then-lost-response that threw away the only route back
+to a running machine's name.
+
+Cancellation is now a durable fact — `release_requested_at` — recorded before anything else and
+independently of whether a handle is known. Two states still converge immediately, and only two,
+because they are the only ones where a null handle really does mean no machine: `requested`, which
+the provisioning claim moves a request out of *before* the provider is called and which is read
+under a row lock, and `failed`, which is only ever reached from a positive refusal. Everything else
+keeps its provision dispatch, because that dispatch is the only path back to the handle.
+
+When the handle finally arrives, what it means is decided by `release_requested_at` rather than by
+the status — the status could not have been moved to `releasing` at cancellation time, there being
+nothing to release — so a recovered machine for a cancelled job converges to a release and never to
+ready capacity.
+
+*With the null-handle branch restored:* `a machine of unknown existence must not be declared
+released — status: "released", external_id: None`, with the fake holding a machine built under that
+request's key.
+
+*With release intent read from the status:* `a cancelled job must not regain ready capacity — left:
+"ready", right: "releasing"`.
+
+### 13. The two paths take their locks in one order
+
+`release_capacity` locks the request with `FOR UPDATE` and then touches the outbox. `write_failure`
+did the reverse. A job cancelled at the moment a controller is recording a provider error is an
+overlap to expect rather than to hope against, and taken in opposite orders the two deadlock —
+PostgreSQL aborts one, losing either the failure bookkeeping or the cancellation itself.
+
+Every transaction in this module now takes the request row first and its dispatches second. The
+test forces the overlap: a transaction holds the request row exactly as a cancellation does, and
+the failure bookkeeping is started underneath it.
+
+*With the dispatch locked first:* the cancellation's outbox write aborted rather than completing.
+
 ## Failure handling
 
 A refused dispatch records its reason and is retried with exponential backoff, stored as a

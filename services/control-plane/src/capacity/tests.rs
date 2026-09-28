@@ -1009,6 +1009,190 @@ async fn the_last_attempt_commits_as_one_transaction(pool: PgPool) {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// Cancellation intent outlives an unknown outcome
+// ---------------------------------------------------------------------------------------------
+
+/// Drive the provision dispatch once, ignoring its backoff.
+async fn dispatch_now(pool: &PgPool, provider: &FakeProvider) -> u64 {
+    sqlx::query(
+        "UPDATE capacity_dispatches SET next_attempt_at = now() WHERE completed_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    dispatch_once(pool, provider).await
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cancelling_after_one_lost_response_still_releases_the_machine(pool: PgPool) {
+    // The window that matters most, and the one the exhaustion test missed: the provider builds
+    // the machine and loses its reply on the *first* attempt, and the job is cancelled straight
+    // afterwards. The request has a null handle, so the old null-handle branch would delete the
+    // provision dispatch and declare it released -- throwing away the only route back to the
+    // machine's name while the machine ran on.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+
+    provider.lose_next_provision_response();
+    dispatch_now(&pool, &provider).await;
+    let lost = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(provider.machine_count(), 1, "the machine exists");
+    assert_eq!(lost.external_id, None, "and Kratos does not know its name");
+    assert_eq!(lost.status, "provisioning");
+
+    // Cancelled now, long before the dispatch has exhausted its attempts.
+    release_capacity(&pool, attempt_id).await.unwrap();
+    let cancelled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_ne!(
+        cancelled.status, "released",
+        "a machine of unknown existence must not be declared released: {cancelled:?}"
+    );
+    assert!(
+        cancelled.release_requested_at.is_some(),
+        "but the cancellation itself must be durable: {cancelled:?}"
+    );
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
+         WHERE r.attempt_id = $1 AND d.action = 'provision' AND d.completed_at IS NULL",
+    )
+    .bind(attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pending, 1,
+        "and the only path back to the handle must survive the cancellation"
+    );
+
+    // The dispatch runs again; the idempotent provider hands back the machine it already built.
+    assert_eq!(dispatch_now(&pool, &provider).await, 1);
+    assert_eq!(
+        provider.machine_count(),
+        1,
+        "reconciling recovers the machine rather than building a second"
+    );
+    let recovered = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        recovered.status, "releasing",
+        "a recovered handle for a cancelled job converges to a release, never to ready: \
+         {recovered:?}"
+    );
+
+    // And the release actually happens.
+    assert_eq!(dispatch_now(&pool, &provider).await, 1);
+    let settled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(settled.status, "released");
+    let machine = recovered.external_id.unwrap();
+    assert!(
+        provider.is_released(&machine),
+        "the machine built behind the lost response must be handed back"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cancelling_an_exhausted_ambiguous_request_never_yields_ready_capacity(pool: PgPool) {
+    // The complementary case. Cancelling an `unreconciled` request used to return without
+    // recording anything, so a later reconciliation would find no release intent and hand the
+    // machine over as ready capacity for a job that no longer exists.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+    for _ in 0..MAX_DISPATCH_ATTEMPTS {
+        provider.lose_next_provision_response();
+        dispatch_now(&pool, &provider).await;
+    }
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "unreconciled"
+    );
+
+    release_capacity(&pool, attempt_id).await.unwrap();
+    let cancelled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(cancelled.status, "unreconciled");
+    assert!(
+        cancelled.release_requested_at.is_some(),
+        "cancelling an open question must still record that it was cancelled: {cancelled:?}"
+    );
+    let ambiguous = ambiguous_provisions(&pool).await.unwrap();
+    assert_eq!(ambiguous.len(), 1);
+    assert!(
+        ambiguous[0].release_requested_at.is_some(),
+        "and an operator must be able to see that this one is already cancelled"
+    );
+
+    // An operator reconciles it; the machine comes back with a name.
+    assert!(
+        reconcile_provision(&pool, ambiguous[0].request_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(dispatch_now(&pool, &provider).await, 1);
+    let recovered = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        recovered.status, "releasing",
+        "a cancelled job must not regain ready capacity: {recovered:?}"
+    );
+
+    assert_eq!(dispatch_now(&pool, &provider).await, 1);
+    assert_eq!(
+        snapshot(&pool, attempt_id).await.unwrap().unwrap().status,
+        "released"
+    );
+    assert_eq!(provider.machine_count(), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cancellation_and_failure_bookkeeping_do_not_deadlock(pool: PgPool) {
+    // The overlap the two paths were built to expect: a job is cancelled at the same moment a
+    // controller is recording a provider error. Taken in opposite orders -- request then
+    // dispatch, dispatch then request -- these deadlock, and PostgreSQL aborts one of them,
+    // losing either the failure bookkeeping or the cancellation itself.
+    //
+    // Forced rather than hoped for: a transaction holds the request row exactly as
+    // `release_capacity` does, and the failure bookkeeping is started underneath it.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let request_id = request_id_of(&pool, attempt_id).await;
+    let dispatch = read_dispatch(&pool, request_id, "provision").await;
+
+    let mut canceller = pool.begin().await.unwrap();
+    let locked: Uuid =
+        sqlx::query_scalar("SELECT id FROM capacity_requests WHERE id = $1 FOR UPDATE")
+            .bind(request_id)
+            .fetch_one(&mut *canceller)
+            .await
+            .unwrap();
+    assert_eq!(locked, request_id);
+
+    // The other controller starts its give-up. With one lock order it waits for the request row;
+    // with two it would already be holding the dispatch row and the cancellation below would
+    // block on it.
+    let bookkeeping = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            record_failure(&pool, &dispatch, &CapacityError::Unavailable).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // The cancellation now touches the outbox, as `release_capacity` does.
+    sqlx::query("UPDATE capacity_dispatches SET next_attempt_at = now() WHERE request_id = $1")
+        .bind(request_id)
+        .execute(&mut *canceller)
+        .await
+        .expect("the cancellation must not deadlock against failure bookkeeping");
+    canceller.commit().await.unwrap();
+
+    bookkeeping.await.unwrap();
+    let after = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert!(
+        after.last_error.is_some(),
+        "and the failure bookkeeping must survive the overlap too: {after:?}"
+    );
+}
+
 #[test]
 fn the_feature_is_off_unless_it_is_switched_on() {
     // Off is the state in which nothing can ever be spent, so absent means off and only an
