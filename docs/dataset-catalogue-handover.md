@@ -1,16 +1,21 @@
 # Dataset catalogue handover
 
-This is the working record for the dataset catalogue, upload, review, and training-input path, and
-the evidence [manual-takeover.md](manual-takeover.md) refers to. That document, not this one, is
-the live operating handover: the work below has since merged and deployed, so read the boxes here
-as a record of what was built and proved rather than as outstanding work.
+This is the record of the dataset catalogue, upload, review, and training-input path, and the
+evidence [manual-takeover.md](manual-takeover.md) refers to. **That document, not this one, is the
+live operating handover.** This work has merged and deployed, so an unchecked box here is history
+unless it says otherwise.
 
-**"Marked for revisit" below is still open**, and is the reason this file matters beyond its
-history.
+Two things here are still live and are why this file matters beyond its history:
+
+- **Marked for revisit** — binding preview reads to caller identity, deferred by Daniel.
+- **Garbage collection and retention** — still open, under "Training integration".
+
+One section is deliberately obsolete and labelled as such: the restart procedure at the end
+contains instructions that must **not** be followed.
 
 The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-and-curation.md).
 
-## Ready on `feature/dataset-catalogue`
+## Built on `feature/dataset-catalogue` (merged)
 
 - [x] Embed Leroboscope as `apps/leroboscope` and preserve its source provenance.
 - [x] Build Leroboscope with the control-plane image and serve it at `/leroboscope/`.
@@ -24,7 +29,7 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 - [x] Verify every uploaded object against its declared byte length and SHA-256 before publishing.
 - [x] Delete resumable-session credentials after successful verification.
 
-## Finish before merging the feature
+## Completed before the feature merged
 
 - [x] Add PostgreSQL integration tests proving project isolation, immutable version numbering,
   duplicate-name handling, upload integrity rejection, and curated-view snapshots.
@@ -37,9 +42,9 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 - [x] Add the publish-view action to the console. It publishes the server-side snapshot of included
   episodes and reports the immutable manifest identity and episode count.
 - [x] Declare the private dataset bucket CORS policy for direct browser resumable uploads and
-  signed preview reads from the exact Kratos console origin. Live apply remains deliberately
-  pending until the code review completes.
-- [ ] Prove a real multi-file LeRobot upload, preview and curation flow end to end after apply.
+  signed preview reads from the exact Kratos console origin. Applied and live.
+- [x] Prove a real multi-file LeRobot upload, preview and curation flow end to end. Done live: see
+  "Live acceptance" below.
 - [x] Add the signed-read capability the preview session needs. `ArtifactStorage::signed_read_url`
   mints a V4-signed GET for one object with a caller-chosen lifetime, reusing the IAM signBlob
   path the resumable upload already used. A read signs over the host header alone: every extra
@@ -48,16 +53,18 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
   `dataset_preview_sessions`; `POST /operator/dataset-versions/{id}/preview` opens one over a
   **ready** version only; `GET /dataset-previews/{id}/files/{*path}` validates the hashed token
   and answers 307 to a signed read with `Cache-Control: no-store`. The token travels in the
-  `Authorization` header rather than a query string, so it never reaches an access log, and it is
-  stored only as an Argon2id verifier. Only verified files resolve, only within the session's own
-  version, and an expired, revoked, invented or mistyped session all answer 404 alike. The file
+  `Authorization` header rather than a query string, which keeps it out of the URL and so out of an
+  access log's ordinary URL fields — headers cannot be guaranteed absent from every proxy or
+  application log, and no stronger claim is made here. It is stored only as an Argon2id verifier.
+  Only verified files resolve, only within the session's own version, and an expired, revoked,
+  invented or mistyped session all answer 404 alike. The file
   endpoint can redirect a normal client or return the same short-lived signed read as uncacheable
   JSON for a browser media element. It never exposes bucket-wide credentials or durable object
   locations.
 - [x] Connect the console to Leroboscope with `postMessage`. The mounted viewer announces readiness,
   accepts one validated review-context shape, resolves each private object through the preview
-  capability and assigns only short-lived signed URLs to fetches and media elements. Live proof
-  remains part of the end-to-end acceptance item above.
+  capability and assigns only short-lived signed URLs to fetches and media elements. Proved live:
+  303 frames and two camera streams for episode 0, under "Live acceptance" below.
 - [x] Add `POST /datasets/{dataset_id}/versions`, which adds an immutable version to an existing
   dataset. Separate from the upload endpoint on purpose: that one must keep refusing a
   duplicate name, so it cannot also read a repeated name as a request for the next version.
@@ -73,30 +80,66 @@ The design contract is [ADR-018](architecture/decisions/018-dataset-catalogue-an
 
 ## Marked for revisit
 
-- [ ] **The preview file endpoint requires no identity token.** Accepted by Daniel on 2026-09-27 as
-  good enough for now, on the basis that the session is version-scoped, expires in minutes and is
-  stored only as a verifier. The cost is that a leaked token is usable by whoever holds it until it
-  expires, and the audit trail records which session read a file rather than which person.
-  Requiring the identity token as well would fix both, at the cost of the viewer frame needing one.
-  Revisit before any dataset contains material that is not ours to lose.
+- [ ] **Bind preview reads to caller identity.** A preview read authorises on the short-lived
+  capability in `Authorization` and nothing else, so it establishes that the caller holds a valid
+  session but not who the caller is. The cost is that a leaked token works for whoever holds it
+  until it expires, and the audit trail records which session read a file rather than which person.
 
-## Training integration after the catalogue merges
+  Accepted by Daniel on 2026-09-27 as good enough for now, on the basis that the session is
+  version-scoped, expires in minutes and is stored only as a verifier.
 
-- [ ] Extend a job specification with exact `dataset_version_id` and optional `dataset_view_id`.
-- [ ] Reject scheduling until every selected version is ready and the worker-input protocol is
+  Note this is *not* a matter of the viewer frame lacking an identity token — it already receives
+  one and uses it for curation calls (`apps/leroboscope/src/kratos/review-client.ts`). The work is
+  carrying an authenticated identity alongside the capability on each read, which needs a second
+  transport because one `Authorization` header cannot carry both, plus server-side validation that
+  the identity may see that version.
+
+  **Trigger to revisit: before any dataset contains material that is not ours to lose.** The same
+  note sits beside the code in `services/control-plane/src/datasets.rs`.
+
+## Training integration
+
+Delivered through PRs #96–#104 and proved by the two CUDA acceptance jobs below.
+
+- [x] Extend a job specification with exact `dataset_version_id` and optional `dataset_view_id`.
+- [x] Reject scheduling until every selected version is ready and the worker-input protocol is
   available.
-- [ ] Add agent-side, digest-keyed caching and stage inputs read-only under
-  `/kratos/inputs/<alias>` without mutating the canonical dataset.
-- [ ] Record dataset, version, source revision or manifest hash, and curated view in MLflow.
+- [x] Add agent-side, digest-keyed caching and stage inputs read-only under
+  `/kratos/inputs/<alias>` without mutating the canonical dataset. Worker protocol 1.3.
+- [x] Record dataset, version, source revision or manifest hash, and curated view in MLflow.
 - [ ] Add garbage collection only after reference tracking, active-job leases, and retention policy
-  are implemented.
+  are implemented. **Still open**, and the reason the incomplete upload rows must not yet be
+  deleted.
 
-## Safe restart procedure
+## Live acceptance
 
-1. Work from `feature/dataset-catalogue` in `F:\git\Kratos-datasets`.
-2. Rebase on `origin/main`; PR #87 is already merged and is an ancestor of this branch.
-3. Start with the tests above before adding more endpoints. The migration and API module are the
-   authoritative current implementation; ADR-018 is the contract.
-4. Do not deploy the migration until the console and preview-session path pass end-to-end tests.
-5. Preserve the existing THESHED2 containers, agent state, completed training artifacts, and
-   observation evidence while this feature is under development.
+This is the evidence [manual-takeover.md](manual-takeover.md) refers to.
+
+- A real seven-file LeRobot dataset reached **Ready**, the viewer loaded **303 frames** and two
+  camera streams for episode 0 through the private preview capability, and a **one-episode curated
+  view** was published.
+- Job `576c7e6f-58bc-44d4-8493-1983eb300633` → MLflow run
+  `45e80d588d0640fabb801bfa0914a984`, 13 accepted observation records.
+- Curated-dataset job `0987191d-e07b-47a1-bbff-30487d59ba6a` → MLflow run
+  `2f52db973c6047be95336f11fb00dfdd`, 20 accepted records, recording the immutable
+  dataset/version/view identities, selection hashes, episode 0, and train/validation loss.
+- Both jobs succeeded on 2026-09-28 and both `model.pt` outputs are storage verified.
+
+Both remain bounded smoke models; choosing a first useful objective is open work in
+[manual-takeover.md](manual-takeover.md).
+
+## Historical: the restart procedure used while this was in development
+
+**Do not follow these steps.** They are kept only to explain how the work was carried out. The
+branch and worktree named here are merged and gone, the migrations are deployed, and step 4's
+instruction not to deploy them is now exactly wrong. For live operating instructions use
+[manual-takeover.md](manual-takeover.md).
+
+1. ~~Work from `feature/dataset-catalogue` in `F:\git\Kratos-datasets`.~~
+2. ~~Rebase on `origin/main`; PR #87 is already merged and is an ancestor of this branch.~~
+3. ~~Start with the tests above before adding more endpoints.~~ ADR-018 remains the contract.
+4. ~~Do not deploy the migration until the console and preview-session path pass end-to-end
+   tests.~~ Deployed.
+5. Preserving the existing THESHED2 containers, agent state, completed training artifacts and
+   observation evidence **still applies**, and is a standing guardrail in
+   [manual-takeover.md](manual-takeover.md).
