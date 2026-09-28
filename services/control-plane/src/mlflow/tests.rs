@@ -23,6 +23,11 @@ struct Recorder {
     calls: Mutex<Vec<(String, Value, Option<String>)>>,
     fail_next: Mutex<Option<StatusCode>>,
     created_runs: Mutex<u32>,
+    /// When set, the first run creation waits here until a test releases it. That is what makes
+    /// two projectors genuinely concurrent: without it they run one after the other and the test
+    /// passes whether or not anything is serialised.
+    hold_create: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    create_started: Arc<tokio::sync::Notify>,
 }
 
 impl Recorder {
@@ -74,9 +79,16 @@ async fn handle(
         return (status, Json(json!({"error": "refused"})));
     }
     if path.0.path().ends_with("/runs/create") {
-        let mut created = recorder.created_runs.lock().unwrap();
-        *created += 1;
-        let run_id = format!("run-{created}");
+        let gate = recorder.hold_create.lock().unwrap().take();
+        if let Some(gate) = gate {
+            recorder.create_started.notify_waiters();
+            gate.notified().await;
+        }
+        let run_id = {
+            let mut created = recorder.created_runs.lock().unwrap();
+            *created += 1;
+            format!("run-{created}")
+        };
         return (
             StatusCode::OK,
             Json(json!({"run": {"info": {"run_id": run_id}}})),
@@ -703,4 +715,157 @@ async fn a_stream_with_nothing_pending_is_left_alone(pool: PgPool) {
         recorder.paths().is_empty(),
         "a quiet stream must not create a run it will never use"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two instances
+// ---------------------------------------------------------------------------------------------
+
+/// The control plane runs as more than one instance, and restart safety says nothing about that
+/// because nothing has crashed. Two projectors selecting one pending stream must not create two
+/// runs, split records between them, or apply anything twice.
+///
+/// The overlap is forced rather than hoped for: the stand-in holds the first `runs/create` open
+/// until the second projector has had its turn. Joined futures alone would run one after the
+/// other and prove nothing, which is how the first version of this test would have passed
+/// against the defect it exists to catch.
+#[sqlx::test(migrations = "./migrations")]
+async fn two_projectors_produce_one_run_and_apply_each_record_once(pool: PgPool) {
+    let stream_id = seed_stream(&pool, json!([])).await;
+    for sequence in 1..=4_i64 {
+        seed_observation(
+            &pool,
+            stream_id,
+            sequence,
+            json!({"schema_version": "1.0", "record": "param",
+                   "name": format!("p{sequence}"), "value": "v"}),
+        )
+        .await;
+    }
+
+    let recorder = Arc::new(Recorder::default());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *recorder.hold_create.lock().unwrap() = Some(gate.clone());
+    let started = recorder.create_started.clone();
+    let base = mlflow_server(recorder.clone()).await;
+
+    let first = client_for(&base, MlflowAuth::None, None);
+    let second = client_for(&base, MlflowAuth::None, None);
+    let pool_a = pool.clone();
+    let pool_b = pool.clone();
+
+    let waiting = started.notified();
+    let leader = tokio::spawn(async move { project_once(&pool_a, &first, "0").await });
+    // Only once the leader is inside `runs/create`, holding the stream, does the second start.
+    waiting.await;
+    let follower = project_once(&pool_b, &second, "0").await;
+    gate.notify_waiters();
+    let led = leader.await.unwrap();
+
+    assert_eq!(
+        follower, 0,
+        "the second projector must find the stream held and do nothing"
+    );
+    assert_eq!(led, 4, "the first must apply every record");
+    assert_eq!(
+        recorder.bodies("/api/2.0/mlflow/runs/create").len(),
+        1,
+        "two instances must not create two runs for one stream"
+    );
+    assert_eq!(
+        recorder.bodies("/api/2.0/mlflow/runs/log-parameter").len(),
+        4,
+        "each record must be applied exactly once, not once per instance"
+    );
+    let unapplied: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM observations WHERE stream_id = $1 AND mlflow_applied_at IS NULL",
+    )
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unapplied, 0);
+}
+
+/// Waiting would serialise every instance behind the slowest stream. Skipping leaves it for the
+/// next pass, seconds away.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_stream_held_elsewhere_is_skipped_not_waited_for(pool: PgPool) {
+    let stream_id = seed_stream(&pool, json!([])).await;
+    seed_observation(
+        &pool,
+        stream_id,
+        1,
+        json!({"schema_version": "1.0", "record": "param", "name": "a", "value": "1"}),
+    )
+    .await;
+
+    // Hold the same advisory lock from another connection, as a second instance would.
+    let mut holder = pool.acquire().await.unwrap();
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+        .bind(PROJECTOR_LOCK_NAMESPACE)
+        .bind(stream_id.to_string())
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    assert!(held);
+
+    let recorder = Arc::new(Recorder::default());
+    let client = client_for(
+        &mlflow_server(recorder.clone()).await,
+        MlflowAuth::None,
+        None,
+    );
+    assert_eq!(project_once(&pool, &client, "0").await, 0);
+    assert!(
+        recorder.paths().is_empty(),
+        "a held stream must not even create its run"
+    );
+
+    sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+        .bind(PROJECTOR_LOCK_NAMESPACE)
+        .bind(stream_id.to_string())
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    assert_eq!(project_once(&pool, &client, "0").await, 1);
+}
+
+/// Belt and braces for the defect this fix is about: if the conditional write ever loses, the run
+/// this pass created must be abandoned and the stored one used. Applying to the local value is
+/// exactly how records end up split across two runs.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_loser_adopts_the_winners_run_rather_than_its_own(pool: PgPool) {
+    let stream_id = seed_stream(&pool, json!([])).await;
+    seed_observation(
+        &pool,
+        stream_id,
+        1,
+        json!({"schema_version": "1.0", "record": "param", "name": "a", "value": "1"}),
+    )
+    .await;
+    // Another instance got there first.
+    sqlx::query(
+        "UPDATE observation_streams SET mlflow_run_id = 'run-from-elsewhere', \
+         mlflow_created_at = now() WHERE id = $1",
+    )
+    .bind(stream_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recorder = Arc::new(Recorder::default());
+    let client = client_for(
+        &mlflow_server(recorder.clone()).await,
+        MlflowAuth::None,
+        None,
+    );
+    assert_eq!(project_once(&pool, &client, "0").await, 1);
+
+    assert!(
+        recorder.bodies("/api/2.0/mlflow/runs/create").is_empty(),
+        "an existing run must not be recreated"
+    );
+    let logged = recorder.bodies("/api/2.0/mlflow/runs/log-parameter");
+    assert_eq!(logged[0]["run_id"], "run-from-elsewhere");
 }

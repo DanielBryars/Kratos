@@ -47,8 +47,12 @@ const MAX_BACKOFF_SECONDS: u64 = 300;
 /// to keep a pathological error from filling the column.
 const MAX_ERROR_BYTES: usize = 500;
 /// How many records one pass applies for a single stream before yielding to the next, so one very
-/// long run cannot starve the others.
+/// long run cannot starve the others. It also bounds how long a stream's advisory lock is held,
+/// since each record is a round trip to the tracking server.
 const RECORDS_PER_PASS: i64 = 500;
+/// The first half of the advisory-lock key, so these locks cannot collide with any other use of
+/// the same mechanism elsewhere in the control plane.
+const PROJECTOR_LOCK_NAMESPACE: i32 = 0x4b52_4d46;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MlflowError {
@@ -335,7 +339,6 @@ struct StreamRecord {
     attempt_id: Uuid,
     job_id: Uuid,
     worker_id: Uuid,
-    mlflow_run_id: Option<String>,
     dataset_lineage: Value,
 }
 
@@ -357,7 +360,7 @@ struct PendingObservation {
 /// because one unreachable tracking server must not stop the others or the caller's loop.
 pub async fn project_once(pool: &PgPool, client: &MlflowClient, experiment_id: &str) -> u64 {
     let streams = match sqlx::query_as::<_, StreamRecord>(
-        "SELECT s.id, s.attempt_id, s.job_id, s.worker_id, s.mlflow_run_id, s.dataset_lineage \
+        "SELECT s.id, s.attempt_id, s.job_id, s.worker_id, s.dataset_lineage \
          FROM observation_streams s \
          WHERE EXISTS ( \
              SELECT 1 FROM observations o \
@@ -377,7 +380,7 @@ pub async fn project_once(pool: &PgPool, client: &MlflowClient, experiment_id: &
 
     let mut applied = 0;
     for stream in streams {
-        match project_stream(pool, client, experiment_id, &stream).await {
+        match project_locked(pool, client, experiment_id, &stream).await {
             Ok(count) => {
                 applied += count;
                 if count > 0 {
@@ -408,31 +411,112 @@ pub async fn project_once(pool: &PgPool, client: &MlflowClient, experiment_id: &
     applied
 }
 
+/// Hold one stream's projector authority for the duration of a pass.
+///
+/// The control plane runs as more than one instance. Without this, two of them select the same
+/// pending stream, each creates its own `MLflow` run, one loses the conditional write, and the
+/// loser still applies records to the run it created: two runs, records split between them, and
+/// every record applied twice. Restart safety says nothing about that, because nothing crashed.
+///
+/// An advisory lock rather than `SELECT ... FOR UPDATE` on the stream row, because a pass makes a
+/// round trip to the tracking server for every record: holding a row lock across that would keep
+/// a data lock open for as long as the network takes. This holds one pooled connection instead,
+/// and the writes commit normally on other connections as they go.
+///
+/// A stream already being projected elsewhere is skipped, not waited for. The next pass will take
+/// it if it is still pending, and waiting would serialise every instance behind the slowest.
+async fn project_locked(
+    pool: &PgPool,
+    client: &MlflowClient,
+    experiment_id: &str,
+    stream: &StreamRecord,
+) -> Result<u64, MlflowError> {
+    let mut lock = pool
+        .acquire()
+        .await
+        .map_err(|error| MlflowError::InvalidResponse(error.to_string()))?;
+    let key = stream.id.to_string();
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+        .bind(PROJECTOR_LOCK_NAMESPACE)
+        .bind(&key)
+        .fetch_one(&mut *lock)
+        .await
+        .map_err(|error| MlflowError::InvalidResponse(error.to_string()))?;
+    if !held {
+        return Ok(0);
+    }
+
+    let outcome = project_stream(pool, client, experiment_id, stream).await;
+
+    // Released on every path. An advisory lock is held by the session, and this connection goes
+    // back to the pool, so failing to release one would take a stream out of service until the
+    // process restarted.
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+        .bind(PROJECTOR_LOCK_NAMESPACE)
+        .bind(&key)
+        .execute(&mut *lock)
+        .await;
+    outcome
+}
+
 async fn project_stream(
     pool: &PgPool,
     client: &MlflowClient,
     experiment_id: &str,
     stream: &StreamRecord,
 ) -> Result<u64, MlflowError> {
-    let run_id = if let Some(existing) = &stream.mlflow_run_id {
-        existing.clone()
-    } else {
-        {
-            let created = client.create_run(experiment_id, stream, Utc::now()).await?;
-            // Written before a single record is applied. If this update is lost the next pass
-            // creates a second run, so it is the one write that must land first.
-            sqlx::query(
-                "UPDATE observation_streams \
-                 SET mlflow_run_id = $2, mlflow_created_at = now(), updated_at = now() \
-                 WHERE id = $1 AND mlflow_run_id IS NULL",
-            )
+    // Re-read under the lock rather than trusting the row this pass was listed from: another
+    // instance may have created the run between the listing and the lock being granted.
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT mlflow_run_id FROM observation_streams WHERE id = $1")
             .bind(stream.id)
-            .bind(&created)
-            .execute(pool)
+            .fetch_one(pool)
             .await
             .map_err(|error| MlflowError::InvalidResponse(error.to_string()))?;
-            info!(stream_id = %stream.id, run_id = %created, "created MLflow run");
-            created
+
+    let run_id = if let Some(existing) = existing {
+        existing
+    } else {
+        let created = client.create_run(experiment_id, stream, Utc::now()).await?;
+        // The database decides which run this stream has, not this function. If the conditional
+        // write loses -- which the lock should prevent, and which a future refactor might
+        // reintroduce -- the winner's id is adopted and the run just created is abandoned empty.
+        // Using the local value instead is exactly how records end up split across two runs.
+        let winner: Option<String> = sqlx::query_scalar(
+            "UPDATE observation_streams \
+             SET mlflow_run_id = $2, mlflow_created_at = now(), updated_at = now() \
+             WHERE id = $1 AND mlflow_run_id IS NULL \
+             RETURNING mlflow_run_id",
+        )
+        .bind(stream.id)
+        .bind(&created)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| MlflowError::InvalidResponse(error.to_string()))?
+        .flatten();
+        if let Some(id) = winner {
+            info!(stream_id = %stream.id, run_id = %id, "created MLflow run");
+            id
+        } else {
+            {
+                let adopted: Option<String> = sqlx::query_scalar(
+                    "SELECT mlflow_run_id FROM observation_streams WHERE id = $1",
+                )
+                .bind(stream.id)
+                .fetch_one(pool)
+                .await
+                .map_err(|error| MlflowError::InvalidResponse(error.to_string()))?;
+                let adopted = adopted.ok_or_else(|| {
+                    MlflowError::InvalidResponse("stream lost its run id".to_owned())
+                })?;
+                warn!(
+                    stream_id = %stream.id,
+                    abandoned = %created,
+                    adopted = %adopted,
+                    "another projector created this stream's run first"
+                );
+                adopted
+            }
         }
     };
 
