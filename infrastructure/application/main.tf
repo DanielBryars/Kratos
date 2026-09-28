@@ -45,6 +45,17 @@ resource "google_cloud_run_v2_service" "control_plane" {
         value = "https://mlflow.${var.domain_name}"
       }
 
+      dynamic "env" {
+        for_each = var.mlflow_iap_audience == "" ? {} : {
+          KRATOS_MLFLOW_IAP_AUDIENCE = var.mlflow_iap_audience
+        }
+
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
       env {
         name  = "KRATOS_ARTIFACT_BUCKET"
         value = var.artifact_bucket

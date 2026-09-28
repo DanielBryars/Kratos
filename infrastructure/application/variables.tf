@@ -39,6 +39,24 @@ variable "domain_name" {
   }
 }
 
+variable "mlflow_iap_audience" {
+  description = <<-EOT
+    OAuth client ID used as the audience for the control plane's IAP ID token when it projects
+    durable observations into MLflow. Empty keeps the projector unauthenticated for local stacks.
+    This is a public client identifier, not the OAuth client secret.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition = (
+      var.mlflow_iap_audience == "" ||
+      can(regex("^[0-9]+-[a-z0-9]+\\.apps\\.googleusercontent\\.com$", var.mlflow_iap_audience))
+    )
+    error_message = "mlflow_iap_audience must be empty or a Google OAuth client ID."
+  }
+}
+
 variable "allow_unauthenticated" {
   description = "Allow public requests through the HTTPS load balancer; application authentication is required before worker data is exposed."
   type        = bool

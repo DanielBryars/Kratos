@@ -126,6 +126,7 @@ jobs:
             -var="artifact_bucket=${{ steps.platform.outputs.artifact_bucket }}" \
             -var="artifact_upload_signer_service_account=${{ steps.platform.outputs.artifact_upload_signer_service_account }}" \
             -var="domain_name=${{ vars.KRATOS_DOMAIN_NAME }}" \
+            -var="mlflow_iap_audience=${{ vars.KRATOS_MLFLOW_IAP_AUDIENCE }}" \
             -var="identity_platform_api_key=${{ vars.KRATOS_IDENTITY_PLATFORM_API_KEY }}" \
             -var="bootstrap_operator_email=${{ vars.KRATOS_BOOTSTRAP_OPERATOR_EMAIL }}" \
             -var="database_enabled=${{ steps.platform.outputs.database_enabled }}" \

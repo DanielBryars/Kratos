@@ -638,3 +638,12 @@ resource "google_iap_web_backend_service_iam_member" "human_access" {
   role                = "roles/iap.httpsResourceAccessor"
   member              = var.iap_member
 }
+
+resource "google_iap_web_backend_service_iam_member" "control_plane_mlflow_access" {
+  count = var.enable_observability && var.control_plane_service_account != "" ? 1 : 0
+
+  project             = var.project_id
+  web_backend_service = google_compute_backend_service.human["mlflow"].name
+  role                = "roles/iap.httpsResourceAccessor"
+  member              = "serviceAccount:${var.control_plane_service_account}"
+}
