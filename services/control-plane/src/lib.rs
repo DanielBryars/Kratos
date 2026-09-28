@@ -20,6 +20,7 @@ pub mod artifact_storage;
 mod artifacts;
 pub mod credentials;
 pub mod database;
+mod dataset_inputs;
 mod datasets;
 pub mod human_auth;
 pub mod migration;
@@ -118,6 +119,7 @@ pub(crate) struct AppState {
         datasets::complete_dataset_file_upload,
         datasets::upsert_episode_curation,
         datasets::create_dataset_view,
+        dataset_inputs::read_job_dataset_input,
         registry::enrol_worker,
         registry::request_registration,
         registry::registration_status,
@@ -153,7 +155,10 @@ pub(crate) struct AppState {
         datasets::CompleteDatasetFileUploadRequest, datasets::BeginDatasetFileUploadResponse,
         datasets::EpisodeCurationRequest, datasets::EpisodeCurationResponse, datasets::DatasetPreviewReadResponse,
         datasets::DatasetPreviewSessionResponse,
-        datasets::CreateDatasetViewRequest, datasets::DatasetViewResponse
+        datasets::CreateDatasetViewRequest, datasets::DatasetViewResponse,
+        dataset_inputs::JobDatasetInputRequest, dataset_inputs::JobDatasetInputResponse,
+        dataset_inputs::JobDatasetInputAssignment, dataset_inputs::DatasetInputFile,
+        dataset_inputs::DatasetInputManifestResponse
     )),
     tags(
         (name = "system", description = "Control-plane status"),
@@ -411,6 +416,10 @@ pub fn app_with_dependencies(
         .route(
             "/api/v1/operator/dataset-versions/{version_id}/views",
             post(datasets::create_dataset_view),
+        )
+        .route(
+            "/api/v1/workers/{worker_id}/job-attempts/{attempt_id}/dataset-inputs/{alias}",
+            get(dataset_inputs::read_job_dataset_input),
         )
         .route(
             "/api/v1/operator/workers/{worker_id}/approve",

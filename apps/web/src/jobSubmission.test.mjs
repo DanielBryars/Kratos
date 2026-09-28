@@ -37,6 +37,7 @@ test("adds the mandatory durable output contract when enabled", () => {
       mandatory: true,
       max_bytes: 1_048_576,
     }],
+    dataset_inputs: [],
   });
 });
 
@@ -50,4 +51,25 @@ test("keeps jobs without durable outputs explicit", () => {
   });
 
   assert.deepEqual(request.output_requirements, []);
+  assert.deepEqual(request.dataset_inputs, []);
+});
+
+test("adds an exact immutable dataset version and optional curated view", () => {
+  const request = buildJobSubmission("training", "image@sha256:def", 120, {
+    enabled: false,
+    logicalPath: "model.pt",
+    role: "model",
+    mediaType: "application/x-pytorch",
+    maxMiB: 1,
+  }, [{
+    alias: " training_data ",
+    dataset_version_id: "11111111-1111-1111-1111-111111111111",
+    dataset_view_id: "22222222-2222-2222-2222-222222222222",
+  }]);
+
+  assert.deepEqual(request.dataset_inputs, [{
+    alias: "training_data",
+    dataset_version_id: "11111111-1111-1111-1111-111111111111",
+    dataset_view_id: "22222222-2222-2222-2222-222222222222",
+  }]);
 });
