@@ -1196,6 +1196,76 @@ async fn cancellation_and_failure_bookkeeping_do_not_deadlock(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrations = "./migrations")]
+async fn a_cancelled_request_refused_to_the_limit_settles_itself(pool: PgPool) {
+    // Refusal is knowledge: it establishes that no machine exists. Combined with a durable
+    // cancellation, both halves of the question are answered, so the request must settle rather
+    // than land in `failed` -- which sits in neither operator view, keeps `released_at` null and
+    // leaves the delete guard blocking cleanup, converging only if somebody happened to ask for
+    // release a second time.
+    let attempt_id = seed_attempt(&pool).await;
+    request_capacity(&pool, attempt_id, "fake").await.unwrap();
+    let provider = FakeProvider::new();
+
+    // One refusal first, so the request is past `requested` and cancellation cannot take the
+    // immediate-converge branch.
+    provider.fail_next_provision("no capacity in this region");
+    dispatch_now(&pool, &provider).await;
+    let refused_once = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(refused_once.status, "provisioning");
+
+    release_capacity(&pool, attempt_id).await.unwrap();
+    let cancelled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert!(cancelled.release_requested_at.is_some());
+    assert_eq!(
+        cancelled.status, "provisioning",
+        "still open, because one refusal is not the provider's last word: {cancelled:?}"
+    );
+
+    // The rest of the attempts are refusals too.
+    for _ in 1..MAX_DISPATCH_ATTEMPTS {
+        provider.fail_next_provision("no capacity in this region");
+        dispatch_now(&pool, &provider).await;
+    }
+
+    let settled = snapshot(&pool, attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        settled.status, "released",
+        "a cancelled request the provider has refused outright must settle itself: {settled:?}"
+    );
+    assert!(settled.released_at.is_some(), "{settled:?}");
+    assert_eq!(settled.external_id, None);
+    assert_eq!(provider.machine_count(), 0, "nothing was ever built");
+
+    // Neither operator view should be holding it, because there is no open question left.
+    assert!(ambiguous_provisions(&pool).await.unwrap().is_empty());
+    assert!(outstanding_releases(&pool).await.unwrap().is_empty());
+
+    // And nothing is left looking due.
+    let outstanding: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
+         WHERE r.attempt_id = $1 AND d.completed_at IS NULL",
+    )
+    .bind(attempt_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(outstanding, 0, "no dispatch may remain outstanding");
+
+    // Settled means cleanup is permitted again, which is the practical point of converging.
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT job_id FROM capacity_requests WHERE attempt_id = $1")
+            .bind(attempt_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("a settled request must not block cleanup");
+}
+
 #[test]
 fn the_feature_is_off_unless_it_is_switched_on() {
     // Off is the state in which nothing can ever be spent, so absent means off and only an

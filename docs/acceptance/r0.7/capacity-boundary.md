@@ -234,6 +234,25 @@ the failure bookkeeping is started underneath it.
 
 *With the dispatch locked first:* the cancellation's outbox write aborted rather than completing.
 
+### 14. A cancelled request the provider refused outright settles itself
+
+The last corner of the same question. A refusal is *knowledge* — it establishes that no machine
+exists. Combined with a durable cancellation, both halves are answered: there is nothing to release
+and nobody wants it. So the request settles as `released` in the same transaction that spends the
+dispatch's final attempt, rather than landing in `failed`.
+
+Left as `failed` it sat in neither operator view, with `released_at` null and the delete guard
+blocking cleanup, converging only if some external caller happened to ask for release a second
+time — a quiet dead end rather than a visible one.
+
+*With the refusal path ignoring the cancellation:* `a cancelled request the provider has refused
+outright must settle itself — left: "failed", right: "released"`, with `release_requested_at` set
+and `released_at` null.
+
+Note the asymmetry with section 10, which is the point: an *ambiguous* exhaustion after
+cancellation must **not** settle, because nothing established that the machine is absent. Only a
+refusal licenses converging.
+
 ## Failure handling
 
 A refused dispatch records its reason and is retried with exponential backoff, stored as a

@@ -748,30 +748,69 @@ async fn terminal_transition(
 
     // The question is not whether provisioning succeeded -- it plainly did not -- but whether a
     // machine exists anyway. Only a positive refusal answers that, and everything else leaves it
-    // open, so only a refusal may be recorded as `failed`.
-    let status = if error.may_have_created_capacity() {
+    // open, so only a refusal may be treated as knowledge.
+    if error.may_have_created_capacity() {
         warn!(
             dispatch = %dispatch.id,
             request = %dispatch.request_id,
             attempts,
             "capacity provision exhausted with an unknown outcome; a machine may exist"
         );
-        RequestStatus::Unreconciled
-    } else {
-        warn!(dispatch = %dispatch.id, attempts, "capacity provision refused; giving up");
-        RequestStatus::Failed
-    };
-    // A request that obtained a handle holds a machine, whatever this dispatch thinks, so it is
-    // left alone rather than moved to either terminal state.
-    sqlx::query(
-        "UPDATE capacity_requests SET status = $2, updated_at = now() \
+        // A request that obtained a handle holds a machine, whatever this dispatch thinks, so it
+        // is left alone rather than moved to a terminal state.
+        sqlx::query(
+            "UPDATE capacity_requests SET status = $2, updated_at = now() \
+             WHERE id = $1 AND status NOT IN ('released', 'releasing', 'failed') \
+               AND external_id IS NULL",
+        )
+        .bind(dispatch.request_id)
+        .bind(RequestStatus::Unreconciled.as_str())
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(());
+    }
+
+    // A positive refusal establishes that no machine exists. If cancellation was already asked
+    // for, both halves of the question are now answered -- there is nothing to release, and
+    // nobody wants it -- so the request settles here. Left as `failed` it would sit in neither
+    // operator view, with `released_at` null and the delete guard blocking cleanup, converging
+    // only if some external caller happened to ask for release a second time.
+    //
+    // This is in the same transaction as the dispatch's final attempt, so the request settling
+    // and the dispatch being spent commit together.
+    let settled = sqlx::query_scalar::<_, bool>(
+        "UPDATE capacity_requests \
+         SET status = CASE WHEN release_requested_at IS NOT NULL THEN 'released' \
+                           ELSE 'failed' END, \
+             released_at = CASE WHEN release_requested_at IS NOT NULL THEN now() \
+                                ELSE released_at END, \
+             updated_at = now() \
          WHERE id = $1 AND status NOT IN ('released', 'releasing', 'failed') \
-           AND external_id IS NULL",
+           AND external_id IS NULL \
+         RETURNING released_at IS NOT NULL",
     )
     .bind(dispatch.request_id)
-    .bind(status.as_str())
-    .execute(&mut **transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
+
+    if settled == Some(true) {
+        // Nothing is outstanding, so no dispatch should look due either.
+        sqlx::query(
+            "UPDATE capacity_dispatches SET completed_at = now() \
+             WHERE request_id = $1 AND completed_at IS NULL",
+        )
+        .bind(dispatch.request_id)
+        .execute(&mut **transaction)
+        .await?;
+        info!(
+            dispatch = %dispatch.id,
+            request = %dispatch.request_id,
+            attempts,
+            "capacity provision refused after cancellation; settled as released"
+        );
+    } else {
+        warn!(dispatch = %dispatch.id, attempts, "capacity provision refused; giving up");
+    }
     Ok(())
 }
 
