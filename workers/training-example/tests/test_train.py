@@ -153,7 +153,34 @@ def test_dataset_selection_emits_mlflow_lineage(capsys: pytest.CaptureFixture[st
     assert params["dataset.version_id"] == "22222222-2222-4222-8222-222222222222"
     assert params["dataset.view_id"] == "33333333-3333-4333-8333-333333333333"
     assert params["dataset.included_episodes"] == "[7, 2]"
+    assert params["dataset.included_episode_count"] == 2
     assert params["dataset.selection_sha256"] == "c" * 64
+
+
+def test_large_dataset_selection_omits_oversized_episode_list(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    selection = train.DatasetSelection(
+        alias="training",
+        dataset_id=UUID("11111111-1111-4111-8111-111111111111"),
+        dataset_name="Robot reaches",
+        dataset_version_id=UUID("22222222-2222-4222-8222-222222222222"),
+        version_number=3,
+        manifest_sha256="a" * 64,
+        dataset_view_id=UUID("33333333-3333-4333-8333-333333333333"),
+        dataset_view_name="Good reaches",
+        dataset_view_manifest_sha256="b" * 64,
+        included_episodes=tuple(range(1_000)),
+        selects_every_episode=False,
+        selection_sha256="c" * 64,
+    )
+
+    train.emit_selection_parameters(selection)
+
+    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    params = {record["name"]: record["value"] for record in records}
+    assert params["dataset.included_episode_count"] == 1_000
+    assert "dataset.included_episodes" not in params
 
 
 def test_oversized_result_is_rejected() -> None:

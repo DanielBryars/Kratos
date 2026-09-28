@@ -74,7 +74,10 @@ def emit_selection_parameters(selection: DatasetSelection) -> None:
     emit_param("dataset.version_number", selection.version_number)
     emit_param("dataset.manifest_sha256", selection.manifest_sha256)
     emit_param("dataset.selection_sha256", selection.selection_sha256)
-    emit_param("dataset.included_episodes", json.dumps(selection.included_episodes))
+    emit_param("dataset.included_episode_count", len(selection.included_episodes))
+    included_episodes = json.dumps(selection.included_episodes)
+    if len(json.dumps(included_episodes, separators=(",", ":")).encode("utf-8")) <= 512:
+        emit_param("dataset.included_episodes", included_episodes)
     if selection.dataset_view_id is not None:
         emit_param("dataset.view_id", str(selection.dataset_view_id))
     if selection.dataset_view_name is not None:
