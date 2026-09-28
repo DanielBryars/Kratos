@@ -112,6 +112,9 @@ pub struct CreateJobRequest {
     /// Exact output paths and limits approved as part of the immutable job specification.
     #[serde(default)]
     pub output_requirements: Vec<JobOutputRequirement>,
+    /// Immutable, project-scoped dataset versions mounted read-only for the workload.
+    #[serde(default)]
+    pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputRequest>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -131,6 +134,7 @@ pub struct OperatorJobResponse {
     pub stderr: Option<String>,
     pub failure_message: Option<String>,
     pub output_requirements: Vec<JobOutputRequirement>,
+    pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputResponse>,
     pub current_attempt: Option<OperatorAttemptIdentity>,
     pub artifacts: Vec<OperatorArtifactResponse>,
 }
@@ -341,6 +345,7 @@ impl JobRecord {
     fn into_response(
         self,
         output_requirements: Vec<JobOutputRequirement>,
+        dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputResponse>,
         visibility: OperatorArtifactListResponse,
     ) -> OperatorJobResponse {
         let record = self;
@@ -360,6 +365,7 @@ impl JobRecord {
             stderr: record.stderr,
             failure_message: record.failure_message,
             output_requirements,
+            dataset_inputs,
             current_attempt: visibility.current_attempt,
             artifacts: visibility.artifacts,
         }
@@ -1346,6 +1352,13 @@ pub(crate) async fn create_job(
         .await
         .map_err(|_| OperatorError::internal())?;
     }
+    crate::dataset_inputs::insert_job_dataset_inputs(
+        &mut transaction,
+        id,
+        project_id,
+        &request.dataset_inputs,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO audit_events \
          (id, actor_type, actor_id, action, target_type, target_id, outcome, detail) \
@@ -1357,7 +1370,8 @@ pub(crate) async fn create_job(
     .bind(json!({
         "image_reference": request.image_reference,
         "timeout_seconds": request.timeout_seconds,
-        "output_count": request.output_requirements.len()
+        "output_count": request.output_requirements.len(),
+        "dataset_input_count": request.dataset_inputs.len()
     }))
     .execute(&mut *transaction)
     .await
@@ -1368,14 +1382,20 @@ pub(crate) async fn create_job(
         .map_err(|_| OperatorError::internal())?;
     Ok((
         StatusCode::CREATED,
-        Json(record.into_response(
-            request.output_requirements,
-            OperatorArtifactListResponse {
-                job_id: id,
-                current_attempt: None,
-                artifacts: Vec::new(),
-            },
-        )),
+        Json(
+            record.into_response(
+                request.output_requirements,
+                crate::dataset_inputs::load_job_dataset_inputs(database, &[id])
+                    .await?
+                    .remove(&id)
+                    .unwrap_or_default(),
+                OperatorArtifactListResponse {
+                    job_id: id,
+                    current_attempt: None,
+                    artifacts: Vec::new(),
+                },
+            ),
+        ),
     ))
 }
 
@@ -1412,6 +1432,8 @@ pub(crate) async fn list_jobs(
         .map_err(|_| OperatorError::internal())?;
     let job_ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
     let mut requirements = job_output_requirements(database, &job_ids).await?;
+    let mut dataset_inputs =
+        crate::dataset_inputs::load_job_dataset_inputs(database, &job_ids).await?;
     let mut visibility = job_artifact_visibility(database, &job_ids).await?;
     Ok(Json(
         records
@@ -1426,7 +1448,8 @@ pub(crate) async fn list_jobs(
                             current_attempt: None,
                             artifacts: Vec::new(),
                         });
-                record.into_response(outputs, artifacts)
+                let inputs = dataset_inputs.remove(&record.id).unwrap_or_default();
+                record.into_response(outputs, inputs, artifacts)
             })
             .collect(),
     ))
@@ -1543,7 +1566,11 @@ pub(crate) async fn cancel_job(
         .await?
         .remove(&record.id)
         .ok_or_else(OperatorError::internal)?;
-    Ok(Json(record.into_response(outputs, visibility)))
+    let inputs = crate::dataset_inputs::load_job_dataset_inputs(database, &[record.id])
+        .await?
+        .remove(&record.id)
+        .unwrap_or_default();
+    Ok(Json(record.into_response(outputs, inputs, visibility)))
 }
 
 /// Who is calling, and what they may act on -- deliberately two fields rather than one id.

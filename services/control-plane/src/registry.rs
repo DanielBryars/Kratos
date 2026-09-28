@@ -344,6 +344,8 @@ pub struct JobAssignment {
     pub observation_stream_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub output_requirements: Vec<JobOutputRequirement>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputAssignment>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -617,6 +619,7 @@ impl TryFrom<AssignmentRecord> for JobAssignment {
             lease_expires_at: record.lease_expires_at,
             observation_stream_id: record.observation_stream_id,
             output_requirements: Vec::new(),
+            dataset_inputs: Vec::new(),
         })
     }
 }
@@ -1602,6 +1605,8 @@ async fn current_or_assign_job(
          WHERE a.worker_id = $1 AND a.status IN ('assigned', 'running') \
            AND j.status IN ('assigned', 'running') \
            AND COALESCE(a.artifact_delivery_expires_at, a.lease_expires_at) > now() \
+           AND (NOT EXISTS (SELECT 1 FROM job_dataset_inputs input WHERE input.job_id = j.id) \
+                OR split_part($2, '.', 2)::integer >= 3) \
          ORDER BY a.assigned_at LIMIT 1",
     )
     .bind(worker_id)
@@ -1617,6 +1622,8 @@ async fn current_or_assign_job(
             .map_err(|error| database_error(&error, "commit active assignment"))?;
         let mut assignment: JobAssignment = record.try_into()?;
         assignment.output_requirements = load_output_requirements(pool, job_id).await?;
+        assignment.dataset_inputs =
+            crate::dataset_inputs::load_assignment_dataset_inputs(pool, job_id).await?;
         return Ok(Some(assignment));
     }
     if !eligible || worker_status != "idle" {
@@ -1637,6 +1644,14 @@ async fn current_or_assign_job(
                    SELECT 1 FROM workers w WHERE w.id = $1 \
                      AND split_part(w.protocol_version, '.', 1) = '1' \
                      AND split_part(w.protocol_version, '.', 2)::integer >= 1 \
+               ) \
+           ) \
+           AND ( \
+               NOT EXISTS (SELECT 1 FROM job_dataset_inputs input WHERE input.job_id = jobs.id) \
+               OR EXISTS ( \
+                   SELECT 1 FROM workers w WHERE w.id = $1 \
+                     AND split_part(w.protocol_version, '.', 1) = '1' \
+                     AND split_part(w.protocol_version, '.', 2)::integer >= 3 \
                ) \
            ) \
          ORDER BY submitted_at \
@@ -1699,8 +1714,22 @@ async fn current_or_assign_job(
     .map_err(|error| database_error(&error, "create job attempt"))?;
     let observation_stream_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO observation_streams (id, attempt_id, job_id, worker_id) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO observation_streams \
+         (id, attempt_id, job_id, worker_id, dataset_lineage) \
+         SELECT $1, $2, $3, $4, COALESCE( \
+             (SELECT jsonb_agg(jsonb_build_object( \
+                 'alias', input.alias, \
+                 'dataset_id', input.dataset_id, \
+                 'dataset_version_id', input.dataset_version_id, \
+                 'source_kind', input.source_kind, \
+                 'source_repository', input.source_repository, \
+                 'resolved_revision', input.resolved_revision, \
+                 'dataset_manifest_sha256', input.dataset_manifest_sha256, \
+                 'dataset_view_id', input.dataset_view_id, \
+                 'dataset_view_manifest_sha256', input.dataset_view_manifest_sha256 \
+              ) ORDER BY input.alias) \
+              FROM job_dataset_inputs input WHERE input.job_id = $3), \
+             '[]'::jsonb)",
     )
     .bind(observation_stream_id)
     .bind(attempt_id)
@@ -1754,6 +1783,7 @@ async fn current_or_assign_job(
             .filter(|minor| *minor >= 2)
             .map(|_| observation_stream_id),
         output_requirements: load_output_requirements(pool, job_id).await?,
+        dataset_inputs: crate::dataset_inputs::load_assignment_dataset_inputs(pool, job_id).await?,
     }))
 }
 
@@ -3328,5 +3358,92 @@ mod tests {
         .await
         .unwrap();
         assert!(delivery.is_some_and(|deadline| deadline > lease));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn dataset_jobs_require_worker_protocol_one_point_three(pool: PgPool) {
+        let owner_id = insert_owner(&pool).await;
+        let worker_id = insert_worker(&pool, owner_id, "idle").await;
+        let job_id = insert_job(&pool, owner_id).await;
+        let dataset_id = Uuid::new_v4();
+        let version_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO datasets (id, project_id, name, created_by_identity_id) \
+             VALUES ($1, $2, 'SVLA', $3)",
+        )
+        .bind(dataset_id)
+        .bind(DEFAULT_PROJECT_ID)
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO dataset_versions \
+             (id, dataset_id, project_id, version_number, source_kind, status, \
+              manifest_sha256, info_json, total_episodes, total_frames, fps, \
+              created_by_identity_id, ready_at) \
+             VALUES ($1, $2, $3, 1, 'upload', 'ready', $4, '{}'::jsonb, 1, 10, 10, $5, now())",
+        )
+        .bind(version_id)
+        .bind(dataset_id)
+        .bind(DEFAULT_PROJECT_ID)
+        .bind("b".repeat(64))
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO job_dataset_inputs \
+             (id, job_id, alias, dataset_id, dataset_version_id, source_kind, \
+              dataset_manifest_sha256) \
+             VALUES ($1, $2, 'training_data', $3, $4, 'upload', $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id)
+        .bind(dataset_id)
+        .bind(version_id)
+        .bind("b".repeat(64))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for protocol in ["1.0", "1.1", "1.2"] {
+            sqlx::query("UPDATE workers SET protocol_version = $2 WHERE id = $1")
+                .bind(worker_id)
+                .bind(protocol)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(
+                current_or_assign_job(&pool, worker_id, true, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        sqlx::query("UPDATE workers SET protocol_version = '1.3' WHERE id = $1")
+            .bind(worker_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let assignment = current_or_assign_job(&pool, worker_id, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.job_id, job_id);
+        assert_eq!(assignment.dataset_inputs.len(), 1);
+        assert_eq!(assignment.dataset_inputs[0].alias, "training_data");
+        assert_eq!(assignment.dataset_inputs[0].dataset_version_id, version_id);
+        assert_eq!(assignment.dataset_inputs[0].manifest_sha256, "b".repeat(64));
+        let lineage: serde_json::Value = sqlx::query_scalar(
+            "SELECT dataset_lineage FROM observation_streams WHERE attempt_id = $1",
+        )
+        .bind(assignment.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(lineage[0]["alias"], "training_data");
+        assert_eq!(lineage[0]["dataset_version_id"], version_id.to_string());
+        assert_eq!(lineage[0]["dataset_manifest_sha256"], "b".repeat(64));
     }
 }
