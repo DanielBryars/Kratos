@@ -1,29 +1,28 @@
 # Manual takeover checklist
 
-**Prepared:** 2026-09-27
+**Prepared:** 2026-09-28
 
 This is the current operating handover for manual work.
 
 ## Known-good live state
 
-- [x] THESHED2 is online and idle on the signed PR #81 agent image `ghcr.io/danielbryars/kratos-agent@sha256:b0b979d9e802263483e28b96389c4edf859023fcee271354e2bc72251aa8b39e`.
+- [x] THESHED2 is online and idle on the signed protocol 1.3 agent image `ghcr.io/danielbryars/kratos-agent@sha256:fb04c8bc1992117d3bd3a1e0403b35c2b73bf895de0e853466aec3326bbe2f30`, with its existing identity and state volume preserved. The older agent containers remain available for rollback.
 - [x] The 2,000-step SmolVLA acceptance run completed and its storage-verified 1.23 GiB model archive is preserved.
 - [x] Observation recovery accepted 105 protocol 1.2 records with no `dropped.spool_write_failed`.
-- [x] Grafana and MLflow are behind IAP; the two small CUDA sample runs are visible in MLflow.
+- [x] Grafana and MLflow are behind IAP. The observation outbox projector is live on Cloud Run revision `kratos-00098-c76`, including restart-safe replay and IAP service identity.
 - [x] Projects and invitations are deployed.
 - [x] Dataset migrations 027/028, catalogue, folder upload, private Leroboscope preview, curation, and immutable view publication are deployed.
 - [x] A real seven-file LeRobot dataset reached Ready, loaded 303 frames and two camera streams for episode 0, and published a one-episode curated view. Full evidence is in [dataset-catalogue-handover.md](dataset-catalogue-handover.md).
+- [x] Exact dataset-version and curated-view selection, scheduling validation, digest-keyed read-only agent staging, and training lineage are deployed end to end.
+- [x] Two fresh CUDA acceptance runs completed on 2026-09-28. Job `576c7e6f-58bc-44d4-8493-1983eb300633` produced MLflow run `45e80d588d0640fabb801bfa0914a984`; curated dataset job `0987191d-e07b-47a1-bbff-30487d59ba6a` produced MLflow run `2f52db973c6047be95336f11fb00dfdd`. Both jobs succeeded and both `model.pt` outputs are storage verified. The curated run records the immutable dataset/version/view identities, selection hashes, episode 0, and train/validation loss.
 
 ## Next work, in order
 
-- [ ] Add exact dataset-version and optional curated-view selection to job specifications and the scheduling screen.
-- [ ] Validate the selected version/view at scheduling time and expose a worker-input protocol only for Ready immutable inputs.
-- [ ] Stage dataset inputs read-only on the agent with digest-keyed caching and bounded cleanup.
-- [ ] Add dataset/version/view lineage to MLflow, then run one curated version through training and verify the complete lineage.
 - [ ] Exercise project invitation claiming with two real Google identities.
 - [ ] Run the witnessed network-loss exercise in `docs/acceptance/r0.2/network-loss-exercise-runbook.md` when someone can disconnect and reconnect the selected worker.
 - [ ] Decide whether to retain or purge incomplete upload rows after reference tracking and a retention policy exist.
-- [ ] Implement queue and SkyPilot capacity only after the design is approved. Kratos remains authoritative for fairness, budgets, job state, and result identity; starting cloud capacity requires an explicit spend decision.
+- [ ] Finish review of the disabled, cost-free capacity-provider boundary in PR #105. A real SkyPilot provider, pre-attempt provisioning, Terraform, and any cloud spend remain later work requiring a separate design and explicit spend decision. Kratos remains authoritative for fairness, budgets, job state, and result identity.
+- [ ] Choose the first useful model objective and authorised dataset. The deployed CUDA workload proves reproducible dataset selection, execution, lineage and storage; it is still a bounded smoke model.
 
 ## Guardrails
 
@@ -35,7 +34,8 @@ This is the current operating handover for manual work.
 
 ## Repository state
 
-- `main`: dataset catalogue and live fixes through PR #94 merged.
-- Live deployment: run `36354202555` for PR #94.
-- `F:\git\Kratos-datasets`: reusable isolated worktree; current documentation branch is `docs/dataset-live-handover`.
+- `main`: MLflow projector and all dataset execution work through PR #104 merged at `50cc735`.
+- Live deployment: run `36439537379`; Cloud Run revision `kratos-00098-c76` has 100% traffic.
+- `F:\git\Kratos-capacity`: Claude's isolated worktree for disabled capacity-provider PR #105.
+- `F:\git\Kratos-release-handoff`: Codex's documentation-only handoff worktree.
 - `F:\git\kratos-coordination\COORDINATION.md`: live Codex/Claude coordination board.
