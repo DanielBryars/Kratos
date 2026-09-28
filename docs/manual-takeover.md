@@ -9,7 +9,7 @@ This is the current operating handover for manual work.
 - [x] THESHED2 is online and idle on the signed protocol 1.3 agent image `ghcr.io/danielbryars/kratos-agent@sha256:18bf47ca5e201de78537f7873e9b9bb906a6429c49c282ccfc945f8a3b048157`, built from the heartbeat replay fix in PR #109 (`7847ded`). Its existing worker identity and `kratos-agent-state` volume are preserved. The immediately previous container is retained as `kratos-agent-pre109-20260928`, and all older agent containers remain available for rollback.
 - [x] The 2,000-step SmolVLA acceptance run completed and its storage-verified 1.23 GiB model archive is preserved.
 - [x] Observation recovery accepted 105 protocol 1.2 records with no `dropped.spool_write_failed`.
-- [x] Grafana and MLflow are behind IAP. The observation outbox projector is live on Cloud Run revision `kratos-00102-6xq`, including restart-safe replay and IAP service identity.
+- [x] Grafana and MLflow are behind IAP. The observation outbox projector is live on the current production Cloud Run revision, including restart-safe replay and IAP service identity.
 - [x] Projects and invitations are deployed.
 - [x] Dataset migrations 027/028, catalogue, folder upload, private Leroboscope preview, curation, and immutable view publication are deployed.
 - [x] A real seven-file LeRobot dataset reached Ready, loaded 303 frames and two camera streams for episode 0, and published a one-episode curated view. Full evidence is in [dataset-catalogue-handover.md](dataset-catalogue-handover.md).
@@ -36,6 +36,6 @@ This is the current operating handover for manual work.
 ## Repository state
 
 - `main`: dataset execution, the disabled capacity boundary and durable heartbeat recovery through PR #109 (`7847ded`) are merged.
-- Live deployment: run `36472751143`; Cloud Run revision `kratos-00102-6xq` is Ready and has 100% traffic.
+- Live deployment: the `Deploy development` workflow on `main` is green; its latest Cloud Run revision is Ready and has 100% traffic. Use the workflow history and Cloud Run service status for the current immutable run and revision identifiers rather than copying a value here that this document's own deployment would immediately replace.
 - Live agent publication: run `36472751107`; immutable digest `sha256:18bf47ca5e201de78537f7873e9b9bb906a6429c49c282ccfc945f8a3b048157` passed its security scan and is running on THESHED2.
 - `F:\git\kratos-coordination\COORDINATION.md`: live Codex/Claude coordination board.
