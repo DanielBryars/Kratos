@@ -1,0 +1,76 @@
+-- Capacity requests and their dispatch outbox (R0.7).
+--
+-- Kratos stays the authoritative queue. A capacity provider supplies bounded machines and nothing
+-- else: it does not decide fairness, budgets, job state or result identity. These tables exist so
+-- that asking a provider for a machine is durable and replayable, and so that a request can be
+-- reconciled after a restart without asking the provider to create a second one.
+--
+-- Nothing here starts any capacity. The boundary and a fake provider are all that exist at this
+-- point, and the feature is off unless explicitly enabled.
+
+CREATE TABLE capacity_requests (
+    id uuid PRIMARY KEY,
+    -- One request per attempt, which is what makes the request replayable rather than repeatable.
+    -- It also means a job cancelled while queued can have no request at all: there is no attempt
+    -- to derive one from, so the constraint decides it rather than any controller logic.
+    attempt_id uuid NOT NULL UNIQUE REFERENCES job_attempts(id) ON DELETE CASCADE,
+    job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id uuid NOT NULL REFERENCES projects(id),
+    provider text NOT NULL CHECK (length(provider) BETWEEN 1 AND 40),
+    -- Derived from the attempt, so a replay after a restart asks the provider the same question
+    -- and is answered with the same machine rather than a second one.
+    idempotency_key text NOT NULL UNIQUE CHECK (length(idempotency_key) BETWEEN 1 AND 200),
+    status text NOT NULL DEFAULT 'requested'
+        CHECK (status IN ('requested', 'provisioning', 'ready', 'releasing', 'released', 'failed')),
+    -- What the provider calls the machine. Null until the provider has answered, and never
+    -- overwritten once set: it is the only handle by which capacity can be released.
+    external_id text CHECK (external_id IS NULL OR length(external_id) BETWEEN 1 AND 200),
+    last_error text CHECK (last_error IS NULL OR length(last_error) <= 500),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    released_at timestamptz,
+    -- A released request has finished with its machine; anything else has not.
+    CHECK ((status = 'released') = (released_at IS NOT NULL)),
+    -- Capacity cannot be ready without something to point at.
+    CHECK (status NOT IN ('ready', 'releasing') OR external_id IS NOT NULL)
+);
+
+CREATE INDEX capacity_requests_job_idx ON capacity_requests (job_id);
+CREATE INDEX capacity_requests_open_idx
+    ON capacity_requests (project_id, created_at)
+    WHERE status NOT IN ('released', 'failed');
+
+-- The outbox. A row is an intention to tell the provider something, and it survives a restart in
+-- the middle of telling it.
+--
+-- Separate from the request's own status on purpose: the status is what Kratos believes, and a
+-- dispatch is an attempt to make the provider agree. Collapsing the two would mean a crash
+-- between "we decided" and "we told them" is indistinguishable from never having decided.
+CREATE TABLE capacity_dispatches (
+    id uuid PRIMARY KEY,
+    request_id uuid NOT NULL REFERENCES capacity_requests(id) ON DELETE CASCADE,
+    action text NOT NULL CHECK (action IN ('provision', 'release')),
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    last_error text CHECK (last_error IS NULL OR length(last_error) <= 500),
+    -- Not before this moment. Backoff is a timestamp rather than a sleep so it survives a restart.
+    next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    completed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    -- One outstanding dispatch per action per request. A second provision for the same request is
+    -- exactly the double-dispatch this table exists to make impossible.
+    UNIQUE (request_id, action)
+);
+
+CREATE INDEX capacity_dispatches_pending_idx
+    ON capacity_dispatches (next_attempt_at)
+    WHERE completed_at IS NULL;
+
+COMMENT ON TABLE capacity_requests IS
+    'One bounded capacity request per job attempt. Kratos remains the authoritative queue; a '
+    'provider supplies machines and decides nothing about fairness, budget, job state or results.';
+COMMENT ON COLUMN capacity_requests.idempotency_key IS
+    'Derived from the attempt so a replay asks the provider the same question and receives the '
+    'same machine rather than a second one.';
+COMMENT ON TABLE capacity_dispatches IS
+    'Durable outbox of things to tell a provider. Separate from the request status so that a '
+    'crash between deciding and telling is distinguishable from never having decided.';
