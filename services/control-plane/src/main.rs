@@ -30,6 +30,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let human_auth = human_auth_from_environment()?;
     let artifact_storage = artifact_storage_from_environment()?;
+    // MLflow is downstream of the promise made to the worker: observations are already durable
+    // when they reach the outbox, so projecting them runs on its own and a tracking server that
+    // is slow or unreachable costs nothing but a delay.
+    let mlflow_enabled = if let (Some(pool), Some((client, experiment_id))) = (
+        database.clone(),
+        kratos_control_plane::mlflow::from_environment(),
+    ) {
+        tokio::spawn(kratos_control_plane::mlflow::run_projector(
+            pool,
+            client,
+            experiment_id,
+        ));
+        true
+    } else {
+        false
+    };
+
     if let (Some(pool), Some(storage)) = (database.clone(), artifact_storage.clone()) {
         tokio::spawn(async move {
             loop {
@@ -44,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         database_enabled = database.is_some(),
         human_auth_enabled = human_auth.is_some(),
         artifact_storage_enabled = artifact_storage.is_some(),
+        mlflow_enabled,
         "Kratos control plane listening"
     );
     axum::serve(
