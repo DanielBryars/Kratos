@@ -18,6 +18,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub mod artifact_storage;
 mod artifacts;
+pub mod capacity;
 pub mod credentials;
 pub mod database;
 mod dataset_inputs;
