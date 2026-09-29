@@ -9,6 +9,7 @@ import {
   type User,
 } from "firebase/auth";
 import { useEffect, useRef, useState } from "react";
+import { CreditLedgerPanel } from "./CreditLedgerPanel";
 
 import {
   buildInvitationLink,
@@ -1184,6 +1185,7 @@ export function App() {
                   ))}
                 </div>
               </div>
+              <CreditLedgerPanel key={user.uid} user={user} />
               <div className="registration-section" id="work-queue">
                 <div className="section-heading">
                   <div><p className="label">Work queue</p><h3>Schedule GPU work</h3></div>

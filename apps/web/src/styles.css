@@ -317,3 +317,10 @@ select { color: var(--text); background: #151f2c; border-color: var(--line-brigh
   font-size: 0.9rem;
 }
 .submission-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.credit-balance { display: flex; flex-direction: column; gap: .3rem; }
+.credit-balance strong { font-size: 1.25rem; }
+.credit-balance span { color: var(--muted); font-size: .85rem; }
+.credit-entries { list-style: none; padding: 0; display: grid; gap: .75rem; }
+.credit-entries li { padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; }
+.credit-entries p { overflow-wrap: anywhere; }
+.credit-identifiers { font-size: .8rem; overflow-wrap: anywhere; }
