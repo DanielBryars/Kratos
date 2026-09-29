@@ -263,7 +263,8 @@ async fn future_cancelled_and_exhausted_jobs_do_not_hold_a_slot(pool: PgPool) {
             }
             "cancelled" => {
                 sqlx::query(
-                    "UPDATE jobs SET status = 'cancelled', finished_at = now() WHERE id = $1",
+                    "UPDATE jobs SET status = 'cancelled', cancel_requested_at = now(), \
+                     finished_at = now() WHERE id = $1",
                 )
                 .bind(oldest)
                 .execute(&pool)
