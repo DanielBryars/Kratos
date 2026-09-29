@@ -20,6 +20,7 @@ pub mod artifact_storage;
 mod artifacts;
 pub mod capacity;
 pub mod credentials;
+mod credits;
 pub mod database;
 mod dataset_inputs;
 mod datasets;
@@ -114,6 +115,8 @@ pub(crate) struct AppState {
         operator::cancel_job,
         scheduling_policy::get_scheduling_policy,
         scheduling_policy::update_scheduling_policy,
+        credits::get_credits,
+        credits::create_entry,
         datasets::list_datasets,
         datasets::import_hugging_face_dataset,
         datasets::create_upload_dataset,
@@ -149,6 +152,8 @@ pub(crate) struct AppState {
         OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
         OperatorObservationStream, VerifiedArtifactEvidence, JobAssignment,
         scheduling_policy::UpdateSchedulingPolicyRequest, scheduling_policy::SchedulingPolicyResponse,
+        credits::CreditAccountResponse, credits::CreditEntryResponse, credits::CreateCreditEntryRequest,
+        credits::CreditEntryKind, credits::CreditEnforcement,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         observations::SubmitObservationBatchRequest, observations::ObservationRecord,
         observations::ObservationBatchResponse,
@@ -388,6 +393,8 @@ pub fn app_with_dependencies(
             get(scheduling_policy::get_scheduling_policy)
                 .put(scheduling_policy::update_scheduling_policy),
         )
+        .route("/api/v1/operator/credits", get(credits::get_credits))
+        .route("/api/v1/operator/credits/entries", post(credits::create_entry))
         .route(
             "/api/v1/operator/datasets",
             get(datasets::list_datasets),
@@ -556,6 +563,22 @@ mod tests {
             "string"
         );
         let policy = &document["paths"]["/api/v1/operator/scheduling-policy"];
+        assert!(document["paths"]["/api/v1/operator/credits"]["get"].is_object());
+        let credit_write = &document["paths"]["/api/v1/operator/credits/entries"]["post"];
+        assert!(credit_write.is_object());
+        assert!(
+            credit_write["parameters"]
+                .as_array()
+                .is_some_and(|parameters| parameters
+                    .iter()
+                    .any(|parameter| parameter["name"] == "Idempotency-Key"
+                        && parameter["required"] == true))
+        );
+        assert_eq!(
+            document["components"]["schemas"]["CreditAccountResponse"]["properties"]["balance_units"]
+                ["type"],
+            "string"
+        );
         assert!(policy["get"].is_object() && policy["put"].is_object());
         assert!(
             document["components"]["schemas"]["UpdateSchedulingPolicyRequest"]["required"]
