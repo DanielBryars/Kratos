@@ -573,7 +573,10 @@ mod tests {
         assert!(document["paths"]["/api/v1/operator/credits"]["get"].is_object());
         let capacity = &document["paths"]["/api/v1/operator/capacity/attention"];
         assert!(capacity["get"].is_object());
-        assert!(capacity["post"].is_null(), "the capacity view must stay read-only");
+        assert!(
+            capacity["post"].is_null(),
+            "the capacity view must stay read-only"
+        );
         let credit_write = &document["paths"]["/api/v1/operator/credits/entries"]["post"];
         assert!(credit_write.is_object());
         assert!(

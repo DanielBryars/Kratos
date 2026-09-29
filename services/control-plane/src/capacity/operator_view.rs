@@ -40,6 +40,7 @@ pub(crate) struct CapacityAttentionResponse {
         (status = 200, description = "Both lists, read from one snapshot. Read-only.", body = CapacityAttentionResponse),
         (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
         (status = 403, description = "Identity is not an operator", body = ErrorResponse),
+        (status = 500, description = "The capacity tables could not be read", body = ErrorResponse),
         (status = 503, description = "Authentication or persistence unavailable", body = ErrorResponse)
     )
 )]
