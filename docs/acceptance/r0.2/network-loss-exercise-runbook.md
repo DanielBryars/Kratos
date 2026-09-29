@@ -33,7 +33,7 @@
    ghcr.io/danielbryars/kratos-soak-workload@sha256:75fa1ec48131c799a7b8b272557c11ed205e81b2c6dac83aea50fbb8edfa8773
    ```
 
-   Verify that immutable digest against its successful publication evidence, then approve **the digest** as a job
+   Verify that immutable digest against its successful publication evidence, then submit **the digest** as the job
    image; never submit a mutable tag. The workload holds the GPU for a fixed 600 seconds, which is
    the window the disconnect happens in.
 3. The worker is `ONLINE IDLE` in the `Home` group with a verified healthy GPU, and no other job is
@@ -50,17 +50,19 @@ Record the wall-clock time of every step, the deployed control-plane revision, a
 | Step | Action | Expected |
 |---|---|---|
 | 1 | On the worker, record `docker inspect kratos-agent --format "{{.RestartCount}} {{.Config.Image}}"`. | Record the baseline restart count. The agent digest matches the current handover checked in prerequisite 1; resolve any mismatch before proceeding. |
-| 2 | From the console, submit the soak workload with a 900-second maximum runtime, comfortably above its fixed 600-second duration. Record the job identifier. | `QUEUED`, then `ASSIGNED` to this worker within one heartbeat, about 30 seconds. |
+| 2 | From the console, submit the soak workload after setting **Runtime limit** to 1800 seconds, comfortably above its fixed 600-second duration. Record the job identifier and submission/assignment timestamps. | `QUEUED`, then `ASSIGNED` to this worker within one heartbeat, about 30 seconds. |
 | 3 | On the worker, run `docker ps --filter label=com.kratos.role=job`. | Exactly one running `kratos-job-<attempt>` container. Record its name. |
 | 4 | When prompted, **disconnect the worker's network**: unplug Ethernet or disable its adapter. Leave the machine running. | — |
-| 5 | Wait until `docker ps -a --filter label=com.kratos.role=job` shows the container as `Exited (0)`, then at least one further minute. | The workload finishes without a network. `docker logs kratos-agent --since 5m` shows `{"status": "retrying", …}` lines and no credential. The console still shows the job as `ASSIGNED`. |
+| 5 | Wait until `docker ps -a --filter label=com.kratos.role=job` shows the container as `Exited (0)`, then one further minute. Reconnect no later than 20 minutes after assignment; if the container has not finished by then, reconnect and record a failed exercise. | The workload finishes without a network. `docker logs kratos-agent --since 5m` shows `{"status": "retrying", …}` lines and no credential. The console still shows the job as `ASSIGNED`. |
 | 6 | Repeat step 1. | The restart count is unchanged: the agent survived the outage. |
 | 7 | When prompted, **reconnect the network**. | Within about a minute the console shows the job `SUCCEEDED` with the workload's structured result and the worker `ONLINE IDLE`. |
-| 8 | On the worker, run `docker events --since 30m --until 0s --filter event=start --filter label=com.kratos.role=job`. | Exactly one `start` event, for the container recorded in step 3. This is the no-duplicate-execution evidence. |
+| 8 | On the worker, run `docker events --since <recorded-submission-RFC3339-timestamp> --until 0s --filter event=start --filter label=com.kratos.role=job`. | Exactly one `start` event, for the container recorded in step 3. This is the no-duplicate-execution evidence. |
 | 9 | Repeat step 3 with `-a`. | The specific exercise container recorded at step 3 has been removed by normal agent acknowledgement cleanup. Earlier evidence containers are untouched. |
 
 Codex SHALL then confirm from the control plane that the job has exactly one attempt, that the
 attempt belongs to this worker, and that one `job.assigned` and one `job.finished` audit event exist.
+
+The 1800-second runtime gives an execution lease of 1920 seconds from assignment, including startup. The 20-minute reconnect deadline leaves time to deliver the result before expiry; do not extend the outage merely to wait for success. The timestamp placeholder in step 8 must be replaced with the recorded submission timestamp.
 
 ## Interpreting the console during the exercise
 

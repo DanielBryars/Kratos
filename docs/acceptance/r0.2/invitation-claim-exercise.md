@@ -34,7 +34,7 @@ exercise meaningful rather than ceremonial.
    ```shell
    gcloud run services describe kratos \
      --project=kratos-dev-509011 --region=europe-west2 \
-     --format="value(status.latestReadyRevisionName)"
+     --format="yaml(status.latestReadyRevisionName,status.traffic)"
    ```
 
 ## Exercise
@@ -45,7 +45,7 @@ As the founder, open the console, find **People → Share this Kratos**, and pre
 **Create invitation link**. Record:
 
 - that the wording above the button states the consequence before you commit to it — a co-owner
-  can revoke workers and delete artefacts;
+  can see jobs and artefacts, submit work, and revoke workers;
 - that the link is shown **once**, and that the panel says so;
 - the expiry the panel reports.
 
@@ -93,7 +93,7 @@ a predicate was missed, which is precisely what the project-scoping work was for
 
 ### 5. Confirm the guest holds real authority
 
-Confirm the selected worker is idle and no jobs are queued. Record its approval and group membership before starting. Have the **guest** quarantine that worker, then return it to service and verify that its original approval and group membership are restored. Do not revoke or re-enrol it.
+Confirm the selected worker is idle and no jobs are queued. Record its approval and group membership before starting. Have the **guest** quarantine that worker. Under **Manage machine**, set the group field to an existing group recorded above (`Home` for THESHED2), then press **Approve and add**. Verify that the worker is approved again and its group memberships are unchanged. Do not enter a new group name. Do not revoke or re-enrol it.
 
 **Expected:** it works, and the founder's console reflects it. A read-only invitee would be a
 different feature from the one that was asked for.
@@ -113,9 +113,7 @@ not offer it.
 
 ### 7. Confirm attribution survives
 
-Any job or dataset the guest created must still name them after removal, and the audit trail must
-still read correctly. Membership is revoked rather than deleted precisely so that "who could see
-this, and until when" stays answerable.
+Codex performs a read-only check of the guest's worker.quarantined and worker.approved audit events and the revoked membership timestamp. Confirm that attribution remains attached to the guest identity after removal. The console does not currently expose this audit trail. Record the check separately from the witness's UI observations.
 
 ## Record
 
