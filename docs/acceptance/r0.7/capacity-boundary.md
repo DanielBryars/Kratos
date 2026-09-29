@@ -291,13 +291,21 @@ the first thing to test against a live provider behind a spend limit. The contra
 leans on hardest is the honesty of `Refused` versus `Unavailable`: a real provider that reports a
 timeout as a refusal would defeat section 10 entirely.
 
-**The operator surfaces are functions, not a console.** `ambiguous_provisions` and
-`outstanding_releases` are the two states the boundary cannot resolve by itself, and both currently
-require somebody to call them from code. Nothing routes them to a person, and neither has an alert.
-A first real provider must not be switched on before that exists, because both states mean "a
-machine may be running and Kratos has stopped trying" — which is precisely the situation that costs
-money quietly. `resolve_unreconciled` also has no caller: settling an open question is, by design,
-a deliberate human act, and there is currently no way for a human to perform it.
+**The operator surfaces can be read, but nothing tells anyone to read them.** `ambiguous_provisions`
+and `outstanding_releases` are the two states the boundary cannot resolve by itself. Both are now
+served, read-only, at `GET /api/v1/operator/capacity/attention`, scoped to the caller's projects
+like every other operator list and read from one snapshot. The endpoint and the functions share one
+query each, so what counts as needing a person cannot drift between them. Tests prove a member sees
+their own project's rows and not another project's, and that a release with attempts left is not
+listed. *With the project filter removed:* the scoping test failed — see PR for the recorded run.
+
+That is visibility on request, not the whole requirement. There is still no console panel and no
+alert, so nothing routes these states to a person who is not already looking. A first real provider
+must not be switched on before that exists, because both states mean "a machine may be running and
+Kratos has stopped trying" — which is precisely the situation that costs money quietly.
+`resolve_unreconciled` also still has no caller: settling an open question is, by design, a
+deliberate human act that needs its own authority decision, and there is currently no way for a
+human to perform it.
 
 The feature has never been switched on, and switching it on with only the fake registered does
 nothing.
