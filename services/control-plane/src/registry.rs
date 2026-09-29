@@ -1636,6 +1636,7 @@ async fn current_or_assign_job(
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
         "SELECT id, name, image_reference, timeout_seconds FROM jobs \
          WHERE status = 'queued' AND gpu_count = 1 \
+           AND (earliest_start_at IS NULL OR earliest_start_at <= statement_timestamp()) \
            AND jobs.project_id = (SELECT project_id FROM workers WHERE id = $1) \
            AND (SELECT count(*) FROM job_attempts a WHERE a.job_id = jobs.id) < max_attempts \
            AND ( \
@@ -1654,7 +1655,7 @@ async fn current_or_assign_job(
                      AND split_part(w.protocol_version, '.', 2)::integer >= 3 \
                ) \
            ) \
-         ORDER BY submitted_at \
+         ORDER BY submitted_at, id \
          FOR UPDATE SKIP LOCKED LIMIT 1",
     )
     .bind(worker_id)
@@ -2735,6 +2736,59 @@ mod tests {
                 .unwrap();
         assert!(legacy_times.0.is_none());
         assert!(legacy_times.1.is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn earliest_start_skips_future_jobs_without_reserving_worker(pool: PgPool) {
+        let owner = insert_owner(&pool).await;
+        let worker = insert_worker(&pool, owner, "idle").await;
+        let future_job = insert_job(&pool, owner).await;
+        sqlx::query("UPDATE jobs SET earliest_start_at = now() + interval '1 day' WHERE id = $1")
+            .bind(future_job)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            current_or_assign_job(&pool, worker, true, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let attempts: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM job_attempts WHERE job_id = $1")
+                .bind(future_job)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+        let immediate_job = insert_job(&pool, owner).await;
+        let assignment = current_or_assign_job(&pool, worker, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(assignment.job_id, immediate_job);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn earliest_start_due_job_can_be_assigned(pool: PgPool) {
+        let owner = insert_owner(&pool).await;
+        let worker = insert_worker(&pool, owner, "idle").await;
+        let job = insert_job(&pool, owner).await;
+        sqlx::query(
+            "UPDATE jobs SET earliest_start_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(job)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            current_or_assign_job(&pool, worker, true, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .job_id,
+            job
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]

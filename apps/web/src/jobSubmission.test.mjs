@@ -73,3 +73,29 @@ test("adds an exact immutable dataset version and optional curated view", () => 
     dataset_view_id: "22222222-2222-2222-2222-222222222222",
   }]);
 });
+
+
+test("earliest start preserves an offset as the same UTC instant", () => {
+  const request = buildJobSubmission("scheduled", "image", 120,
+    DURABLE_TRAINING_PRESET.output, [], "2026-10-01T10:30:00+01:00");
+  assert.equal(request.earliest_start_at, "2026-10-01T09:30:00.000Z");
+});
+
+test("invalid earliest start fails before submission", () => {
+  assert.throws(() => buildJobSubmission("scheduled", "image", 120,
+    DURABLE_TRAINING_PRESET.output, [], "not-a-time"), RangeError);
+});
+
+
+test("local datetime input uses the browser timezone in summer and winter", () => {
+  const old = process.env.TZ;
+  process.env.TZ = "Europe/London";
+  try {
+    for (const [local, utc] of [["2026-07-01T10:30", "2026-07-01T09:30:00.000Z"], ["2026-12-01T10:30", "2026-12-01T10:30:00.000Z"]]) {
+      assert.equal(buildJobSubmission("scheduled", "image", 120, DURABLE_TRAINING_PRESET.output, [], local).earliest_start_at, utc);
+    }
+  } finally {
+    if (old === undefined) delete process.env.TZ;
+    else process.env.TZ = old;
+  }
+});

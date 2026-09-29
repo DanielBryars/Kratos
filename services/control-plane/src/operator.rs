@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -109,6 +109,8 @@ pub struct CreateJobRequest {
     /// Immutable OCI image reference selected and approved by the operator.
     pub image_reference: String,
     pub timeout_seconds: i32,
+    /// Earliest eligibility; omitted means immediately eligible, not reserved.
+    pub earliest_start_at: Option<DateTime<Utc>>,
     /// Exact output paths and limits approved as part of the immutable job specification.
     #[serde(default)]
     pub output_requirements: Vec<JobOutputRequirement>,
@@ -124,6 +126,8 @@ pub struct OperatorJobResponse {
     pub image_reference: String,
     pub gpu_count: i32,
     pub timeout_seconds: i32,
+    /// Earliest eligibility; omitted means immediately eligible, not reserved.
+    pub earliest_start_at: Option<DateTime<Utc>>,
     pub status: String,
     pub assigned_worker_id: Option<Uuid>,
     pub submitted_at: DateTime<Utc>,
@@ -240,6 +244,7 @@ struct JobRecord {
     image_reference: String,
     gpu_count: i32,
     timeout_seconds: i32,
+    earliest_start_at: Option<DateTime<Utc>>,
     status: String,
     assigned_worker_id: Option<Uuid>,
     submitted_at: DateTime<Utc>,
@@ -355,6 +360,7 @@ impl JobRecord {
             image_reference: record.image_reference,
             gpu_count: record.gpu_count,
             timeout_seconds: record.timeout_seconds,
+            earliest_start_at: record.earliest_start_at,
             status: record.status,
             assigned_worker_id: record.assigned_worker_id,
             submitted_at: record.submitted_at,
@@ -1155,7 +1161,7 @@ pub(crate) async fn revoke_worker(
     change_worker_state(state, headers, worker_id, "revoked").await
 }
 
-const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, status, assigned_worker_id, \
+const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, earliest_start_at, status, assigned_worker_id, \
      submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message";
 
 async fn job_output_requirements(
@@ -1277,6 +1283,23 @@ async fn job_artifact_visibility(
     Ok(by_job)
 }
 
+fn validate_job_request(request: &CreateJobRequest) -> Result<(), OperatorError> {
+    let name = request.name.trim();
+    if name.is_empty()
+        || name.chars().count() > 120
+        || !(30..=3600).contains(&request.timeout_seconds)
+        || request
+            .earliest_start_at
+            .is_some_and(|time| !(1..=9999).contains(&time.year()))
+        || !crate::registry::immutable_sha256_reference(&request.image_reference)
+    {
+        return Err(OperatorError::invalid_request());
+    }
+    validate_output_requirements(&request.output_requirements)
+        .map_err(|_| OperatorError::invalid_request())?;
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/jobs",
@@ -1303,16 +1326,8 @@ pub(crate) async fn create_job(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    validate_job_request(&request)?;
     let name = request.name.trim();
-    if name.is_empty()
-        || name.chars().count() > 120
-        || !(30..=3600).contains(&request.timeout_seconds)
-        || !crate::registry::immutable_sha256_reference(&request.image_reference)
-    {
-        return Err(OperatorError::invalid_request());
-    }
-    validate_output_requirements(&request.output_requirements)
-        .map_err(|_| OperatorError::invalid_request())?;
     let id = Uuid::new_v4();
     let mut transaction = database
         .begin()
@@ -1320,8 +1335,8 @@ pub(crate) async fn create_job(
         .map_err(|_| OperatorError::internal())?;
     let query = format!(
         "INSERT INTO jobs \
-         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {JOB_COLUMNS}"
+         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds, earliest_start_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {JOB_COLUMNS}"
     );
     // Both meanings are written, and they are not the same value: the identity records who
     // queued this, the project decides who can see it afterwards.
@@ -1332,6 +1347,7 @@ pub(crate) async fn create_job(
         .bind(name)
         .bind(&request.image_reference)
         .bind(request.timeout_seconds)
+        .bind(request.earliest_start_at)
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
@@ -1370,6 +1386,7 @@ pub(crate) async fn create_job(
     .bind(json!({
         "image_reference": request.image_reference,
         "timeout_seconds": request.timeout_seconds,
+        "earliest_start_at": request.earliest_start_at,
         "output_count": request.output_requirements.len(),
         "dataset_input_count": request.dataset_inputs.len()
     }))
@@ -2782,6 +2799,154 @@ mod tests {
             let cancelled = to_bytes(cancelled.into_body(), 1024 * 1024).await.unwrap();
             let cancelled: Value = serde_json::from_slice(&cancelled).unwrap();
             assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["assigned_worker_id"], Value::Null);
+            let finished_at = cancelled["finished_at"].as_str().unwrap().to_owned();
+            if let Some(first) = &first_finished_at {
+                assert_eq!(&finished_at, first);
+            } else {
+                first_finished_at = Some(finished_at);
+            }
+        }
+
+        let heartbeat = router
+            .oneshot(
+                Request::put(format!("/api/v1/workers/{worker_id}/heartbeat"))
+                    .header(
+                        AUTHORIZATION,
+                        format!("Bearer {}", worker_credential.plaintext.expose()),
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "protocol_version": "1.0",
+                            "sequence": 1,
+                            "observed_at": Utc::now(),
+                            "capabilities": healthy_worker_capabilities()
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(heartbeat.status(), StatusCode::OK);
+        let heartbeat = to_bytes(heartbeat.into_body(), 1024 * 1024).await.unwrap();
+        let heartbeat: Value = serde_json::from_slice(&heartbeat).unwrap();
+        assert_eq!(heartbeat["state"], "idle");
+        assert_eq!(heartbeat["assignment"], Value::Null);
+
+        let persisted: (String, bool, i64) = sqlx::query_as(
+            "SELECT j.status, j.finished_at IS NOT NULL, count(a.id) \
+             FROM jobs j LEFT JOIN job_attempts a ON a.job_id = j.id WHERE j.id = $1 \
+             GROUP BY j.status, j.finished_at",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, ("cancelled".to_owned(), true, 0));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn cancelled_future_job_preserves_earliest_start_and_never_assigns(pool: PgPool) {
+        let operator_id = Uuid::new_v4();
+        let auth = HumanAuth::new(
+            Arc::new(FakeVerifier {
+                identity: HumanIdentity {
+                    subject: "job-operator".to_owned(),
+                    email: "operator@example.com".to_owned(),
+                    display_name: "Job Operator".to_owned(),
+                },
+            }),
+            "operator@example.com",
+            ClientAuthConfig {
+                api_key: "test-api-key".to_owned(),
+                auth_domain: "example.test".to_owned(),
+                project_id: "test-project".to_owned(),
+            },
+        );
+        sqlx::query(
+            "INSERT INTO human_identities \
+             (id, provider, provider_subject, display_name, email, role) \
+             VALUES ($1, 'identity-platform', 'job-operator', 'Job Operator', \
+                     'operator@example.com', 'operator')",
+        )
+        .bind(operator_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        join_default_project(&pool, operator_id).await;
+
+        let worker_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workers \
+             (id, owner_identity_id, agent_instance_id, display_name, protocol_version, \
+              status, capabilities, project_id) VALUES ($1, $2, $3, 'Eligible GPU', '1.0', 'idle', $4, $5)",
+        )
+        .bind(worker_id)
+        .bind(operator_id)
+        .bind(Uuid::new_v4())
+        .bind(healthy_worker_capabilities())
+        .bind(DEFAULT_PROJECT_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let worker_credential = credentials::issue(CredentialKind::Worker).unwrap();
+        sqlx::query(
+            "INSERT INTO worker_credentials (id, worker_id, token_verifier) VALUES ($1, $2, $3)",
+        )
+        .bind(worker_credential.id)
+        .bind(worker_id)
+        .bind(&worker_credential.verifier)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let router = app_with_human_auth(None, Some(pool.clone()), Some(auth));
+        let created = router
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/operator/jobs")
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "Cancelled before assignment",
+                            "image_reference": concat!(
+                                "example.test/work@sha256:",
+                                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            ),
+                            "timeout_seconds": 120,
+                            "earliest_start_at": "2099-10-01T10:30:00+01:00"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = to_bytes(created.into_body(), 1024 * 1024).await.unwrap();
+        let created: Value = serde_json::from_slice(&created).unwrap();
+        let job_id = Uuid::parse_str(created["job_id"].as_str().unwrap()).unwrap();
+
+        let mut first_finished_at = None;
+        for _ in 0..2 {
+            let cancelled = router
+                .clone()
+                .oneshot(
+                    Request::post(format!("/api/v1/operator/jobs/{job_id}/cancel"))
+                        .header(AUTHORIZATION, "Bearer valid-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancelled.status(), StatusCode::OK);
+            let cancelled = to_bytes(cancelled.into_body(), 1024 * 1024).await.unwrap();
+            let cancelled: Value = serde_json::from_slice(&cancelled).unwrap();
+            assert_eq!(cancelled["status"], "cancelled");
+            assert_eq!(cancelled["earliest_start_at"], "2099-10-01T09:30:00Z");
             assert_eq!(cancelled["assigned_worker_id"], Value::Null);
             let finished_at = cancelled["finished_at"].as_str().unwrap().to_owned();
             if let Some(first) = &first_finished_at {
