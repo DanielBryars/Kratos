@@ -71,8 +71,8 @@ Three consequences, all of which matter more than the "custom images are support
   SkyPilot source does not show, so it is **[unknown]**. Whatever RunPod does, handing SkyPilot
   `ghcr.io/danielbryars/kratos-agent@sha256:…` gives no evidence that the agent would start as it
   does today: for example, the bootstrap may replace it, or the agent may receive SkyPilot's shell
-  command as arguments so that SkyPilot's bootstrap does not run. "RunPod accepts custom images as Pod images" is
-  true and does **not** imply our agent runs.
+  command as arguments so that SkyPilot's bootstrap does not run. "RunPod accepts custom images as
+  Pod images" is true and does **not** imply our agent runs.
 - **The image must provide `apt`, and root or working `sudo`.** The bootstrap installs packages with
   `apt` and uses `sudo` for privileged steps when not root, and the SSH user is configurable
   (`docker_username_for_runpod`, default `root`, `sky/clouds/runpod.py`). A non-root image with
