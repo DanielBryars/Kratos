@@ -44,6 +44,10 @@ export function buildJobSubmission(
   datasetInputs: JobDatasetInputDraft[] = [],
   earliestStartLocal = "",
 ): JobSubmission {
+  const earliest = earliestStartLocal ? new Date(earliestStartLocal) : null;
+  if (earliest && (Number.isNaN(earliest.getTime()) || earliest.getUTCFullYear() < 1 || earliest.getUTCFullYear() > 9999)) {
+    throw new RangeError("Choose a valid earliest start date and time.");
+  }
   const outputRequirements = output.enabled
     ? [{
         logical_path: output.logicalPath.trim(),
@@ -54,7 +58,7 @@ export function buildJobSubmission(
       }]
     : [];
   return {
-    ...(earliestStartLocal ? { earliest_start_at: new Date(earliestStartLocal).toISOString() } : {}),
+    ...(earliest ? { earliest_start_at: earliest.toISOString() } : {}),
     name: name.trim(),
     image_reference: imageReference.trim(),
     timeout_seconds: timeoutSeconds,

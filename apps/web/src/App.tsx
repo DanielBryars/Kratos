@@ -917,6 +917,7 @@ export function App() {
       }
       const created = (await response.json()) as Job;
       setJobs((current) => [created, ...current]);
+      setJobEarliestStart("");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "The job could not be queued.");
     } finally {
@@ -926,6 +927,7 @@ export function App() {
 
   function loadDurableTrainingPreset() {
     setDurableOutputEnabled(true);
+    setJobEarliestStart("");
     setJobName(DURABLE_TRAINING_PRESET.name);
     setJobImage(DURABLE_TRAINING_PRESET.imageReference);
     setJobTimeout(DURABLE_TRAINING_PRESET.timeoutSeconds);
@@ -1083,10 +1085,10 @@ export function App() {
                   <label>Runtime limit<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /><small>30–3,600 seconds.</small></label>
                   <label>Dataset version<select value={jobDatasetVersionId} onChange={(event) => { setJobDatasetVersionId(event.target.value); setJobDatasetViewId(""); }}><option value="">No dataset</option>{datasets.flatMap((dataset) => dataset.versions.filter((version) => version.status === "ready").map((version) => <option key={version.id} value={version.id}>{dataset.name} · v{version.version_number}</option>))}</select><small>Only storage-verified immutable versions are available.</small></label>
                   {selectedJobDatasetVersion && <><label>Curated view<select value={jobDatasetViewId} onChange={(event) => setJobDatasetViewId(event.target.value)}><option value="">Complete version</option>{selectedJobDatasetVersion.version.views.map((view) => <option key={view.id} value={view.id}>{view.name} · {view.included_episode_count} episodes</option>)}</select><small>Choose a published episode set or use every episode.</small></label><label>Mount alias<input value={jobDatasetAlias} maxLength={32} onChange={(event) => setJobDatasetAlias(event.target.value)} /><small>Available inside the container at <code>/kratos/inputs/{jobDatasetAlias || "…"}</code>.</small></label></>}
-                  <button className="queue-button" type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
-                </div>
                 <label>Earliest start (your local time, optional)<input type="datetime-local" value={jobEarliestStart} onChange={(event) => setJobEarliestStart(event.target.value)} /></label>
                 <p>Leave blank to queue immediately. A future time makes the job eligible then; it does not reserve a GPU.</p>
+                  <button className="queue-button" type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
+                </div>
                 <div className="output-contract">
                   <div className="output-contract-heading">
                     <label className="output-toggle">

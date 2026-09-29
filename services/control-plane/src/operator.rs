@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
 };
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1313,6 +1313,9 @@ pub(crate) async fn create_job(
     if name.is_empty()
         || name.chars().count() > 120
         || !(30..=3600).contains(&request.timeout_seconds)
+        || request
+            .earliest_start_at
+            .is_some_and(|time| !(1..=9999).contains(&time.year()))
         || !crate::registry::immutable_sha256_reference(&request.image_reference)
     {
         return Err(OperatorError::invalid_request());
