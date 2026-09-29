@@ -265,6 +265,7 @@ export function App() {
   const [policyDraft, setPolicyDraft] = useState<PolicyDraft | null>(null);
   const [policyAction, setPolicyAction] = useState(false);
   const [policyMessage, setPolicyMessage] = useState<string | null>(null);
+  const policyMutation = useRef({ version: 0, saving: false });
   // Held in component state and nowhere else. ADR-017 forbids putting the credential in local or
   // session storage: it must not outlive the tab, and a claim that fails is meant to need the
   // link again rather than be retried from something durable.
@@ -344,6 +345,9 @@ export function App() {
     let nextRefresh: number | null = null;
     async function refresh() {
       controller = new AbortController();
+      const policyVersion = policyMutation.current.version;
+      const policyRefreshIsCurrent = () => policyVersion === policyMutation.current.version
+        && !policyMutation.current.saving;
       try {
         const idToken = await user!.getIdToken();
         if (stopped) return;
@@ -369,7 +373,7 @@ export function App() {
         ]);
         if (stopped) return;
         // Cleared on failure rather than kept, so a stale count cannot drive the queue explanation.
-        setSchedulingPolicy(nextPolicy);
+        if (policyRefreshIsCurrent()) setSchedulingPolicy(nextPolicy);
         if (nextPending) setPending(nextPending);
         if (nextWorkers) setWorkers(nextWorkers);
         if (nextMembers) setMembers(nextMembers);
@@ -386,7 +390,7 @@ export function App() {
         if (!(error instanceof DOMException && error.name === "AbortError")) {
           if (!stopped) {
             setJobStatusUnavailable(true);
-            setSchedulingPolicy(null);
+            if (policyRefreshIsCurrent()) setSchedulingPolicy(null);
           }
         }
       } finally {
@@ -989,7 +993,7 @@ export function App() {
   }
 
   async function saveSchedulingPolicy() {
-    if (!user || !schedulingPolicy) return;
+    if (!user || !schedulingPolicy || policyMutation.current.saving) return;
     setPolicyMessage(null);
     let update: SchedulingPolicyUpdate | null = null;
     try {
@@ -998,6 +1002,9 @@ export function App() {
       setPolicyMessage(error instanceof Error ? error.message : "Enter a valid limit.");
       return;
     }
+    // A GET started before or during this save must never replace its result.
+    policyMutation.current.version += 1;
+    policyMutation.current.saving = true;
     setPolicyAction(true);
     try {
       const idToken = await user.getIdToken();
@@ -1015,6 +1022,8 @@ export function App() {
     } catch (error) {
       setPolicyMessage(error instanceof Error ? error.message : "The concurrency limit could not be saved.");
     } finally {
+      policyMutation.current.version += 1;
+      policyMutation.current.saving = false;
       setPolicyAction(false);
     }
   }

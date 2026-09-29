@@ -39,12 +39,12 @@ PostgreSQL API tests (`services/control-plane/src/scheduling_policy/tests.rs`):
 - Missing, zero, negative, fractional, string, out-of-range, unknown-field and malformed bodies are rejected, and the stored limit is unchanged with no audit.
 - Missing or invalid token gets 401, including with an invalid body. An unknown non-bootstrap identity and a revoked member get 403.
 - Project scoping: a member of another project sees and changes only that project's policy and count. A caller in two projects gets 409.
-- A policy update racing a membership revocation that holds the project row fails with 403 and changes nothing.
+- A policy update racing a membership revocation by a different co-owner waits specifically in the project-lock query, then fails with 403 and changes nothing. Using a different revoker prevents the identity foreign key from blocking authentication before the recheck.
 
 The OpenAPI test asserts both operations and the required request field. Web tests (`apps/web/src/schedulingPolicy.test.mjs`) cover the payload rules (explicit null, positive integer, rejection of empty, zero, negative, fractional and oversized input), the policy summary, and queue explanation precedence: earliest start over limit, limit when at capacity, generic otherwise, and unknown when the policy is unavailable.
 
 ## Status and limitations
 
-All 52 web tests and the production web build pass locally. PostgreSQL scheduler and API tests await CI execution; no server-test pass is claimed yet. No live or deployed acceptance has been performed and no workload has been run. The concurrency tests depend on `pg_stat_activity` showing lock waits for sessions of the same role in the per-test database.
+All 52 web tests and the production web build pass locally. The required Rust CI job executes the PostgreSQL scheduler and API tests and applies migrations to PostgreSQL 16. Exact revision results are recorded in [PR #115 checks](https://github.com/DanielBryars/Kratos/pull/115/checks). No live or deployed acceptance has been performed and no workload has been run. The concurrency tests depend on `pg_stat_activity` showing lock waits for sessions of the same role in the per-test database.
 
 Not implemented: fairness between projects or users, per-user limits, priority, credits, reservations, and preemption. The limit applies to the single-GPU jobs the scheduler currently assigns. The console explanation reads the project-wide count on the five-second refresh, so it can lag the scheduler briefly.

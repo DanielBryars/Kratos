@@ -358,10 +358,11 @@ async fn policy_is_scoped_to_the_callers_project(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 async fn update_rechecks_membership_after_a_concurrent_revocation(pool: PgPool) {
     let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
-    member(&pool, "co-owner", DEFAULT_PROJECT_ID).await;
+    let co_owner = member(&pool, "co-owner", DEFAULT_PROJECT_ID).await;
     let router = router_for(&pool, "owner", "owner-token");
 
-    // Hold the project row as membership removal does, and revoke the caller inside it.
+    // Revoke as the other owner: using the caller as the revoker would take a foreign-key
+    // lock on their identity and block authentication before it reaches the policy recheck.
     let mut revocation = pool.begin().await.unwrap();
     sqlx::query("SELECT id FROM projects WHERE id = $1 FOR UPDATE")
         .bind(DEFAULT_PROJECT_ID)
@@ -369,10 +370,11 @@ async fn update_rechecks_membership_after_a_concurrent_revocation(pool: PgPool) 
         .await
         .unwrap();
     sqlx::query(
-        "UPDATE project_memberships SET revoked_at = now(), revoked_by_identity_id = $1 \
+        "UPDATE project_memberships SET revoked_at = now(), revoked_by_identity_id = $2 \
          WHERE identity_id = $1",
     )
     .bind(owner)
+    .bind(co_owner)
     .execute(&mut *revocation)
     .await
     .unwrap();
@@ -391,7 +393,8 @@ async fn update_rechecks_membership_after_a_concurrent_revocation(pool: PgPool) 
     for _ in 0..400 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE '%FROM projects WHERE id = $1 FOR NO KEY UPDATE%'",
         )
         .fetch_one(&pool)
         .await
