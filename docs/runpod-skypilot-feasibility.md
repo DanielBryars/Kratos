@@ -68,16 +68,20 @@ Three consequences, all of which matter more than the "custom images are support
 - **SkyPilot does not use our image's `CMD`/`ENTRYPOINT` to start work.** Its design requires this
   bootstrap to run and stay alive. What RunPod does with `docker_args` when the image also declares
   an `ENTRYPOINT` — replace it, or pass the string to it as arguments — is RunPod behaviour that the
-  SkyPilot source does not show, so it is **[unknown]**. Either way, handing SkyPilot
+  SkyPilot source does not show, so it is **[unknown]**. Whatever RunPod does, handing SkyPilot
   `ghcr.io/danielbryars/kratos-agent@sha256:…` gives no evidence that the agent would start as it
-  does today: either the bootstrap replaces it, or the agent receives SkyPilot's shell command as
-  arguments and SkyPilot's bootstrap does not run. "RunPod accepts custom images as Pod images" is
+  does today: for example, the bootstrap may replace it, or the agent may receive SkyPilot's shell
+  command as arguments so that SkyPilot's bootstrap does not run. "RunPod accepts custom images as Pod images" is
   true and does **not** imply our agent runs.
 - **The image must provide `apt`, and root or working `sudo`.** The bootstrap installs packages with
-  `apt` and uses `sudo` for privileged steps when not root. A non-root image with passwordless
-  `sudo` is therefore within what the code handles; an image without `apt`, or non-root without
-  usable `sudo` (typical of distroless and Alpine), would fail during bootstrap. **[evidenced from
-  the command; not run]**
+  `apt` and uses `sudo` for privileged steps when not root, and the SSH user is configurable
+  (`docker_username_for_runpod`, default `root`, `sky/clouds/runpod.py`). A non-root image with
+  passwordless `sudo` is therefore largely within what the code handles. One step does not survive
+  it: `$(prefix_cmd) export -p > …` becomes `sudo export -p`, which fails because `export` is a shell
+  builtin, so the `&&`-chained move into `/etc/profile.d` is skipped and SSH sessions do not inherit
+  the container's environment. The bootstrap still reaches `sleep infinity`, since its steps are
+  `;`-separated. An image without `apt`, or non-root without usable `sudo` (typical of distroless
+  and Alpine), would fail during bootstrap. **[evidenced from the command; not run]**
 - **Work arrives by SSH, not by our worker protocol.** Nothing polls the Kratos control plane, so
   nothing heartbeats, leases an attempt, or reports a result.
 
@@ -130,7 +134,7 @@ teardown]** This is worth stating precisely because the reason is not the obviou
 That is the whole of the evidence. Acceptance by a feature gate is not a witnessed teardown: **no
 autodown has been observed terminating a pod in our account.** The idle timer is also enforced from
 inside the cluster — skylet on the pod calls `provision_lib.terminate_instances` itself
-(`sky/skylet/events.py:382-419`), using the API key copied onto the pod (§6) — so it depends on the
+(`sky/skylet/events.py:382-441`), using the API key copied onto the pod (§6) — so it depends on the
 pod staying healthy enough to run skylet. The first paid run (§7) is what would turn this into
 evidence.
 
@@ -301,9 +305,10 @@ The shape I would propose for the first paid run, deliberately minimal and touch
 production path:
 
 - **One `sky launch`** of a standalone SkyPilot task, `--cloud runpod`, a single GPU, `SECURE`, with
-  `--down` and a short `--idle-minutes-to-autostop` so the pod terminates on its own even if the
-  session dies. Since `autostop` is unsupported, `--down` is not optional — it is the only working
-  form.
+  `--down` and a short `--idle-minutes-to-autostop`, intended to make the pod terminate on its own
+  even if the session dies. Since `autostop` is refused, `--down` is not optional — it is the only
+  form the feature gate accepts. Whether it actually terminates is what this run would find out
+  (§2), so a manual `sky down` and a console check stay part of the plan regardless.
 - **A public PyTorch image**, so no registry credential reaches RunPod (§6).
 - **Synthetic data generated on the pod.** No dataset staging, no GCS, no private data — which also
   sidesteps `STORAGE_MOUNTING` being unsupported (§8).
