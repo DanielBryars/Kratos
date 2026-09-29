@@ -1192,6 +1192,7 @@ export function App() {
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
                 <div className="scheduling-policy" aria-labelledby="scheduling-policy-heading">
                   <p className="label" id="scheduling-policy-heading">Project concurrency</p>
+                  <p className="muted compact">Due jobs keep their submission order. With a project limit, the last free slot may wait for another recently active worker to take an older job that needs its capabilities. Running jobs are not interrupted.</p>
                   {schedulingPolicy && shownPolicyDraft ? (
                     <>
                       <p className="muted compact" role="status">{describePolicy(schedulingPolicy)}</p>

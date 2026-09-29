@@ -1,5 +1,5 @@
 //! Per-project scheduling policy. Today that is only the concurrency limit the scheduler enforces
-//! in `registry::project_at_capacity`; null means unlimited, and there is no default quota.
+//! in `registry::project_available_slots`; null means unlimited, and there is no default quota.
 
 use axum::{
     Json,

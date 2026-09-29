@@ -101,6 +101,10 @@ different resource classes; the UI should show the relevant class and blockers i
 
 ### Ordering and fairness
 
+The policy below remains a proposal. The implemented registered-worker scheduler retains
+submission-time order among due compatible jobs and protects the last free project slot across
+current protocol capabilities. See [the implemented policy and its limits](../acceptance/r0.3-capability-fairness.md).
+
 Within a compatible resource class, the scheduler applies these keys in order:
 
 1. authorised priority band;

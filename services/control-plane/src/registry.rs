@@ -1570,7 +1570,7 @@ pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, A
 pub(crate) const ACTIVE_PROJECT_JOBS: &str = "SELECT count(*) FROM jobs \
      WHERE project_id = $1 AND status IN ('assigned', 'running', 'cancelling')";
 
-/// Whether the worker's project is at its configured concurrency limit.
+/// Free project slots, or `None` for an unlimited project.
 ///
 /// The project row is locked before counting and stays locked until the assignment commits, so
 /// two workers of one project cannot both count the same free slot. The count is a separate
@@ -1584,10 +1584,10 @@ pub(crate) const ACTIVE_PROJECT_JOBS: &str = "SELECT count(*) FROM jobs \
 /// they can delay a heartbeat briefly but cannot form a cycle with it. Lifecycle transitions
 /// that free a slot do not take this lock: they only lower the count, so a scheduler racing one
 /// can at worst refuse conservatively and assign on the next heartbeat.
-async fn project_at_capacity(
+async fn project_available_slots(
     transaction: &mut Transaction<'_, Postgres>,
     worker_id: Uuid,
-) -> Result<bool, ApiError> {
+) -> Result<Option<i64>, ApiError> {
     let (project_id, limit) = sqlx::query_as::<_, (Uuid, Option<i32>)>(
         "SELECT p.id, p.max_concurrent_jobs FROM projects p \
          JOIN workers w ON w.project_id = p.id WHERE w.id = $1 \
@@ -1598,14 +1598,14 @@ async fn project_at_capacity(
     .await
     .map_err(|error| database_error(&error, "lock project for assignment"))?;
     let Some(limit) = limit else {
-        return Ok(false);
+        return Ok(None);
     };
     let active: i64 = sqlx::query_scalar(ACTIVE_PROJECT_JOBS)
         .bind(project_id)
         .fetch_one(&mut **transaction)
         .await
         .map_err(|error| database_error(&error, "count active project jobs"))?;
-    Ok(active >= i64::from(limit))
+    Ok(Some(i64::from(limit) - active))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1677,42 +1677,21 @@ async fn current_or_assign_job(
             .map_err(|error| database_error(&error, "commit empty assignment"))?;
         return Ok(None);
     }
-    if project_at_capacity(&mut transaction, worker_id).await? {
+    let available_slots = project_available_slots(&mut transaction, worker_id).await?;
+    if available_slots.is_some_and(|slots| slots <= 0) {
         transaction
             .commit()
             .await
             .map_err(|error| database_error(&error, "commit capped assignment"))?;
         return Ok(None);
     }
-    let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
-        "SELECT id, name, image_reference, timeout_seconds FROM jobs \
-         WHERE status = 'queued' AND gpu_count = 1 \
-           AND (earliest_start_at IS NULL OR earliest_start_at <= statement_timestamp()) \
-           AND jobs.project_id = (SELECT project_id FROM workers WHERE id = $1) \
-           AND (SELECT count(*) FROM job_attempts a WHERE a.job_id = jobs.id) < max_attempts \
-           AND ( \
-               NOT EXISTS (SELECT 1 FROM job_output_requirements r WHERE r.job_id = jobs.id) \
-               OR EXISTS ( \
-                   SELECT 1 FROM workers w WHERE w.id = $1 \
-                     AND split_part(w.protocol_version, '.', 1) = '1' \
-                     AND split_part(w.protocol_version, '.', 2)::integer >= 1 \
-               ) \
-           ) \
-           AND ( \
-               NOT EXISTS (SELECT 1 FROM job_dataset_inputs input WHERE input.job_id = jobs.id) \
-               OR EXISTS ( \
-                   SELECT 1 FROM workers w WHERE w.id = $1 \
-                     AND split_part(w.protocol_version, '.', 1) = '1' \
-                     AND split_part(w.protocol_version, '.', 2)::integer >= 3 \
-               ) \
-           ) \
-         ORDER BY submitted_at, id \
-         FOR UPDATE SKIP LOCKED LIMIT 1",
+    let queued = fairness::select_queued_job(
+        &mut transaction,
+        worker_id,
+        &worker.2,
+        available_slots == Some(1),
     )
-    .bind(worker_id)
-    .fetch_optional(&mut *transaction)
-    .await
-    .map_err(|error| database_error(&error, "select queued job"))?;
+    .await?;
     let Some((job_id, name, image_reference, timeout_seconds)) = queued else {
         transaction
             .commit()
@@ -3555,3 +3534,5 @@ mod tests {
 
 #[cfg(test)]
 mod concurrency_tests;
+
+mod fairness;
