@@ -316,3 +316,4 @@ select { color: var(--text); background: #151f2c; border-color: var(--line-brigh
   color: var(--muted, #6b7280);
   font-size: 0.9rem;
 }
+.submission-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
