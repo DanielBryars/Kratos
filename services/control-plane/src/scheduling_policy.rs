@@ -25,15 +25,24 @@ pub(crate) struct UpdateSchedulingPolicyRequest {
     /// field is rejected rather than read as null, so a partial client cannot clear a limit.
     #[serde(default, deserialize_with = "present")]
     #[schema(value_type = Option<i32>, required = true, minimum = 1)]
-    max_concurrent_jobs: Option<Option<i64>>,
+    max_concurrent_jobs: LimitUpdate,
+}
+
+#[derive(Debug, Default)]
+enum LimitUpdate {
+    #[default]
+    Missing,
+    Clear,
+    Set(i64),
 }
 
 /// Distinguishes an explicit null from an absent field, which serde otherwise conflates.
-fn present<'de, D>(deserializer: D) -> Result<Option<Option<i64>>, D::Error>
+fn present<'de, D>(deserializer: D) -> Result<LimitUpdate, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<i64>::deserialize(deserializer).map(Some)
+    Option::<i64>::deserialize(deserializer)
+        .map(|value| value.map_or(LimitUpdate::Clear, LimitUpdate::Set))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -46,11 +55,11 @@ pub(crate) struct SchedulingPolicyResponse {
 }
 
 /// The requested limit, or `None` to clear it. Zero, negative, oversized and absent are refused.
-fn requested_limit(value: Option<Option<i64>>) -> Result<Option<i32>, OperatorError> {
+fn requested_limit(value: LimitUpdate) -> Result<Option<i32>, OperatorError> {
     match value {
-        None => Err(OperatorError::invalid_request()),
-        Some(None) => Ok(None),
-        Some(Some(value)) => i32::try_from(value)
+        LimitUpdate::Missing => Err(OperatorError::invalid_request()),
+        LimitUpdate::Clear => Ok(None),
+        LimitUpdate::Set(value) => i32::try_from(value)
             .ok()
             .filter(|limit| *limit > 0)
             .map(Some)
