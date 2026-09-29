@@ -1283,6 +1283,23 @@ async fn job_artifact_visibility(
     Ok(by_job)
 }
 
+fn validate_job_request(request: &CreateJobRequest) -> Result<(), OperatorError> {
+    let name = request.name.trim();
+    if name.is_empty()
+        || name.chars().count() > 120
+        || !(30..=3600).contains(&request.timeout_seconds)
+        || request
+            .earliest_start_at
+            .is_some_and(|time| !(1..=9999).contains(&time.year()))
+        || !crate::registry::immutable_sha256_reference(&request.image_reference)
+    {
+        return Err(OperatorError::invalid_request());
+    }
+    validate_output_requirements(&request.output_requirements)
+        .map_err(|_| OperatorError::invalid_request())?;
+    Ok(())
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/operator/jobs",
@@ -1309,19 +1326,8 @@ pub(crate) async fn create_job(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    validate_job_request(&request)?;
     let name = request.name.trim();
-    if name.is_empty()
-        || name.chars().count() > 120
-        || !(30..=3600).contains(&request.timeout_seconds)
-        || request
-            .earliest_start_at
-            .is_some_and(|time| !(1..=9999).contains(&time.year()))
-        || !crate::registry::immutable_sha256_reference(&request.image_reference)
-    {
-        return Err(OperatorError::invalid_request());
-    }
-    validate_output_requirements(&request.output_requirements)
-        .map_err(|_| OperatorError::invalid_request())?;
     let id = Uuid::new_v4();
     let mut transaction = database
         .begin()
