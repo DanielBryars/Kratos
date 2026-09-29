@@ -28,7 +28,7 @@ pub(crate) struct UpdateSchedulingPolicyRequest {
     max_concurrent_jobs: LimitUpdate,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 enum LimitUpdate {
     #[default]
     Missing,
