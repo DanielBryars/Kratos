@@ -4,6 +4,7 @@ export type JobSubmission = {
   name: string;
   image_reference: string;
   timeout_seconds: number;
+  earliest_start_at?: string;
   output_requirements: OutputRequirement[];
   dataset_inputs: JobDatasetInputDraft[];
 };
@@ -41,6 +42,7 @@ export function buildJobSubmission(
   timeoutSeconds: number,
   output: DurableOutputDraft,
   datasetInputs: JobDatasetInputDraft[] = [],
+  earliestStartLocal = "",
 ): JobSubmission {
   const outputRequirements = output.enabled
     ? [{
@@ -52,6 +54,7 @@ export function buildJobSubmission(
       }]
     : [];
   return {
+    ...(earliestStartLocal ? { earliest_start_at: new Date(earliestStartLocal).toISOString() } : {}),
     name: name.trim(),
     image_reference: imageReference.trim(),
     timeout_seconds: timeoutSeconds,

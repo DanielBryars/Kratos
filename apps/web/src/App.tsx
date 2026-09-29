@@ -75,6 +75,7 @@ type Job = {
   image_reference: string;
   gpu_count: number;
   timeout_seconds: number;
+  earliest_start_at?: string | null;
   status: "queued" | "assigned" | "running" | "cancelling" | "succeeded" | "failed" | "cancelled";
   assigned_worker_id: string | null;
   submitted_at: string;
@@ -188,6 +189,9 @@ function pluralise(count: number, singular: string, plural = `${singular}s`) {
 }
 
 function jobTiming(job: Job) {
+  if (job.status === "queued" && job.earliest_start_at && new Date(job.earliest_start_at).getTime() > Date.now()) {
+    return `Waiting until ${new Date(job.earliest_start_at).toLocaleString()} · earliest start, not a reservation`;
+  }
   const submittedAt = new Date(job.submitted_at).getTime();
   const startedAt = job.started_at ? new Date(job.started_at).getTime() : null;
   const finishedAt = job.finished_at ? new Date(job.finished_at).getTime() : null;
@@ -232,6 +236,7 @@ export function App() {
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
+  const [jobEarliestStart, setJobEarliestStart] = useState("");
   const [jobDatasetAlias, setJobDatasetAlias] = useState("training");
   const [jobDatasetVersionId, setJobDatasetVersionId] = useState("");
   const [jobDatasetViewId, setJobDatasetViewId] = useState("");
@@ -904,7 +909,7 @@ export function App() {
           alias: jobDatasetAlias,
           dataset_version_id: jobDatasetVersionId,
           dataset_view_id: jobDatasetViewId || null,
-        }] : [])),
+        }] : [], jobEarliestStart)),
       });
       if (!response.ok) {
         const error = (await response.json().catch(() => ({}))) as ApiError;
@@ -1080,6 +1085,8 @@ export function App() {
                   {selectedJobDatasetVersion && <><label>Curated view<select value={jobDatasetViewId} onChange={(event) => setJobDatasetViewId(event.target.value)}><option value="">Complete version</option>{selectedJobDatasetVersion.version.views.map((view) => <option key={view.id} value={view.id}>{view.name} · {view.included_episode_count} episodes</option>)}</select><small>Choose a published episode set or use every episode.</small></label><label>Mount alias<input value={jobDatasetAlias} maxLength={32} onChange={(event) => setJobDatasetAlias(event.target.value)} /><small>Available inside the container at <code>/kratos/inputs/{jobDatasetAlias || "…"}</code>.</small></label></>}
                   <button className="queue-button" type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
                 </div>
+                <label>Earliest start (your local time, optional)<input type="datetime-local" value={jobEarliestStart} onChange={(event) => setJobEarliestStart(event.target.value)} /></label>
+                <p>Leave blank to queue immediately. A future time makes the job eligible then; it does not reserve a GPU.</p>
                 <div className="output-contract">
                   <div className="output-contract-heading">
                     <label className="output-toggle">

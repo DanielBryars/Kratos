@@ -73,3 +73,15 @@ test("adds an exact immutable dataset version and optional curated view", () => 
     dataset_view_id: "22222222-2222-2222-2222-222222222222",
   }]);
 });
+
+
+test("earliest start preserves an offset as the same UTC instant", () => {
+  const request = buildJobSubmission("scheduled", "image", 120,
+    DURABLE_TRAINING_PRESET.output, [], "2026-10-01T10:30:00+01:00");
+  assert.equal(request.earliest_start_at, "2026-10-01T09:30:00.000Z");
+});
+
+test("invalid earliest start fails before submission", () => {
+  assert.throws(() => buildJobSubmission("scheduled", "image", 120,
+    DURABLE_TRAINING_PRESET.output, [], "not-a-time"), RangeError);
+});
