@@ -26,6 +26,16 @@ import {
 } from "./artifactPresentation";
 import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
 import {
+  buildPolicyUpdate,
+  describePolicy,
+  describeQueueWait,
+  draftFromPolicy,
+  queueWaitReason,
+  type PolicyDraft,
+  type SchedulingPolicy,
+  type SchedulingPolicyUpdate,
+} from "./schedulingPolicy";
+import {
   buildDeclaration,
   describeVersionStatus,
   manifestProblems,
@@ -188,8 +198,9 @@ function pluralise(count: number, singular: string, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
-function jobTiming(job: Job) {
-  if (job.status === "queued" && job.earliest_start_at && new Date(job.earliest_start_at).getTime() > Date.now()) {
+function jobTiming(job: Job, policy: SchedulingPolicy | null) {
+  const waitReason = queueWaitReason(job, policy);
+  if (waitReason === "earliest_start" && job.earliest_start_at) {
     return `Waiting until ${new Date(job.earliest_start_at).toLocaleString()} · earliest start, not a reservation`;
   }
   const submittedAt = new Date(job.submitted_at).getTime();
@@ -210,7 +221,10 @@ function jobTiming(job: Job) {
   if (finishedAt !== null) {
     return `Finished after ${formatDuration(finishedAt - submittedAt)}`;
   }
-  return `Queued for ${formatDuration(Date.now() - submittedAt)} · completion estimate unavailable`;
+  const waiting = waitReason && waitReason !== "earliest_start"
+    ? describeQueueWait(waitReason, policy)
+    : "completion estimate unavailable";
+  return `Queued for ${formatDuration(Date.now() - submittedAt)} · ${waiting}`;
 }
 
 export function App() {
@@ -246,6 +260,11 @@ export function App() {
   const [durableOutputMediaType, setDurableOutputMediaType] = useState("application/x-pytorch");
   const [durableOutputMaxMiB, setDurableOutputMaxMiB] = useState(1);
   const [jobAction, setJobAction] = useState(false);
+  const [schedulingPolicy, setSchedulingPolicy] = useState<SchedulingPolicy | null>(null);
+  // Null while not editing, so the five-second refresh cannot overwrite a half-typed limit.
+  const [policyDraft, setPolicyDraft] = useState<PolicyDraft | null>(null);
+  const [policyAction, setPolicyAction] = useState(false);
+  const [policyMessage, setPolicyMessage] = useState<string | null>(null);
   // Held in component state and nowhere else. ADR-017 forbids putting the credential in local or
   // session storage: it must not outlive the tab, and a claim that fails is meant to need the
   // link again rather than be retried from something durable.
@@ -316,6 +335,8 @@ export function App() {
       setJobs([]);
       setHasLoadedJobsSnapshot(false);
       setJobStatusUnavailable(false);
+      setSchedulingPolicy(null);
+      setPolicyDraft(null);
       return;
     }
     let stopped = false;
@@ -328,23 +349,27 @@ export function App() {
         if (stopped) return;
         const headers = { Authorization: `Bearer ${idToken}` };
         const request = { headers, signal: controller.signal };
-        const [pendingResponse, workersResponse, jobsResponse, membersResponse, invitationsResponse, datasetsResponse] = await Promise.all([
+        const [pendingResponse, workersResponse, jobsResponse, membersResponse, invitationsResponse, datasetsResponse, policyResponse] = await Promise.all([
           fetch("/api/v1/operator/worker-registration-requests", request),
           fetch("/api/v1/operator/workers", request),
           fetch("/api/v1/operator/jobs", request),
           fetch("/api/v1/operator/project-members", request),
           fetch("/api/v1/operator/project-invitations", request),
           fetch("/api/v1/operator/datasets", request),
+          fetch("/api/v1/operator/scheduling-policy", request),
         ]);
-        const [nextPending, nextWorkers, nextJobs, nextMembers, nextInvitations, nextDatasets] = await Promise.all([
+        const [nextPending, nextWorkers, nextJobs, nextMembers, nextInvitations, nextDatasets, nextPolicy] = await Promise.all([
           pendingResponse.ok ? pendingResponse.json() as Promise<PendingRegistration[]> : null,
           workersResponse.ok ? workersResponse.json() as Promise<Worker[]> : null,
           jobsResponse.ok ? jobsResponse.json() as Promise<Job[]> : null,
           membersResponse.ok ? membersResponse.json() as Promise<Member[]> : null,
           invitationsResponse.ok ? invitationsResponse.json() as Promise<PendingInvitation[]> : null,
           datasetsResponse.ok ? datasetsResponse.json() as Promise<Dataset[]> : null,
+          policyResponse.ok ? policyResponse.json() as Promise<SchedulingPolicy> : null,
         ]);
         if (stopped) return;
+        // Cleared on failure rather than kept, so a stale count cannot drive the queue explanation.
+        setSchedulingPolicy(nextPolicy);
         if (nextPending) setPending(nextPending);
         if (nextWorkers) setWorkers(nextWorkers);
         if (nextMembers) setMembers(nextMembers);
@@ -359,7 +384,10 @@ export function App() {
         }
       } catch (error) {
         if (!(error instanceof DOMException && error.name === "AbortError")) {
-          if (!stopped) setJobStatusUnavailable(true);
+          if (!stopped) {
+            setJobStatusUnavailable(true);
+            setSchedulingPolicy(null);
+          }
         }
       } finally {
         controller = null;
@@ -960,6 +988,37 @@ export function App() {
     }
   }
 
+  async function saveSchedulingPolicy() {
+    if (!user || !schedulingPolicy) return;
+    setPolicyMessage(null);
+    let update: SchedulingPolicyUpdate | null = null;
+    try {
+      update = buildPolicyUpdate(policyDraft ?? draftFromPolicy(schedulingPolicy));
+    } catch (error) {
+      setPolicyMessage(error instanceof Error ? error.message : "Enter a valid limit.");
+      return;
+    }
+    setPolicyAction(true);
+    try {
+      const idToken = await user.getIdToken();
+      const response = await fetch("/api/v1/operator/scheduling-policy", {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify(update),
+      });
+      if (!response.ok) {
+        const error = (await response.json().catch(() => ({}))) as ApiError;
+        throw new Error(error.message ?? `Request failed with ${response.status}`);
+      }
+      setSchedulingPolicy((await response.json()) as SchedulingPolicy);
+      setPolicyDraft(null);
+    } catch (error) {
+      setPolicyMessage(error instanceof Error ? error.message : "The concurrency limit could not be saved.");
+    } finally {
+      setPolicyAction(false);
+    }
+  }
+
   const jobsSnapshotState = jobSnapshotState(
     hasLoadedJobsSnapshot,
     jobStatusUnavailable,
@@ -978,6 +1037,7 @@ export function App() {
     || job.status === "cancelling"
   ).length;
   const completedJobCount = jobs.filter((job) => job.status === "succeeded").length;
+  const shownPolicyDraft = policyDraft ?? (schedulingPolicy ? draftFromPolicy(schedulingPolicy) : null);
 
   return (
     <main>
@@ -1079,6 +1139,23 @@ export function App() {
                   <button className="button-secondary button-compact" type="button" disabled={jobAction} onClick={loadDurableTrainingPreset}>Load training example</button>
                 </div>
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
+                <div className="scheduling-policy" aria-labelledby="scheduling-policy-heading">
+                  <p className="label" id="scheduling-policy-heading">Project concurrency</p>
+                  {schedulingPolicy && shownPolicyDraft ? (
+                    <>
+                      <p className="muted compact" role="status">{describePolicy(schedulingPolicy)}</p>
+                      <div className="job-form">
+                        <label className="output-toggle">
+                          <input type="checkbox" checked={shownPolicyDraft.unlimited} disabled={policyAction} onChange={(event) => setPolicyDraft({ ...shownPolicyDraft, unlimited: event.target.checked })} />
+                          <span><strong>Unlimited</strong><small>No project limit on jobs running at once.</small></span>
+                        </label>
+                        <label>Maximum concurrent jobs<input type="number" min={1} step={1} value={shownPolicyDraft.limit} disabled={policyAction || shownPolicyDraft.unlimited} onChange={(event) => setPolicyDraft({ ...shownPolicyDraft, limit: event.target.value })} /><small>Assigned, running and cancelling jobs count. Lowering the limit does not stop active jobs.</small></label>
+                        <button className="button-secondary" type="button" disabled={policyAction} onClick={() => void saveSchedulingPolicy()}>{policyAction ? "Saving…" : "Save limit"}</button>
+                      </div>
+                    </>
+                  ) : <p className="muted compact">The project concurrency limit is unavailable.</p>}
+                  {policyMessage && <p className="notice notice--error" role="alert">{policyMessage}</p>}
+                </div>
                 <div className="job-form">
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /><small>Make it easy to recognise later.</small></label>
                   <label>Immutable image<input value={jobImage} spellCheck={false} onChange={(event) => setJobImage(event.target.value)} /><small>Public registry image pinned with <code>@sha256</code>.</small></label>
@@ -1118,7 +1195,7 @@ export function App() {
                       <p className="job-image">{job.image_reference}</p>
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
                       {job.dataset_inputs.map((input) => <p className="job-identity" key={input.alias}>Input <strong>{input.alias}</strong>: {input.dataset_name} v{input.version_number}{input.dataset_view_name ? ` · ${input.dataset_view_name}` : " · complete version"} · <code>{input.dataset_manifest_sha256.slice(0, 12)}</code></p>)}
-                      <p>{jobTiming(job)}</p>
+                      <p>{jobTiming(job, schedulingPolicy)}</p>
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
                       {job.current_attempt?.observation_stream && (
                         <div className="run-observations" aria-label={`Live observations for ${job.name}`}>

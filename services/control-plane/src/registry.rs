@@ -1564,6 +1564,50 @@ pub(crate) async fn reconcile_expired_attempts(pool: &PgPool) -> Result<usize, A
     Ok(recovered)
 }
 
+/// Jobs holding a project concurrency slot. Output delivery happens while the job is still
+/// assigned or running, and cancelling holds its slot until acknowledgement or lease expiry, so
+/// every slot is released by an existing lifecycle transition rather than by elapsed time.
+pub(crate) const ACTIVE_PROJECT_JOBS: &str = "SELECT count(*) FROM jobs \
+     WHERE project_id = $1 AND status IN ('assigned', 'running', 'cancelling')";
+
+/// Whether the worker's project is at its configured concurrency limit.
+///
+/// The project row is locked before counting and stays locked until the assignment commits, so
+/// two workers of one project cannot both count the same free slot. The count is a separate
+/// statement deliberately: under READ COMMITTED it takes a fresh snapshot after the lock is
+/// granted, and therefore sees an assignment committed by whoever held the lock before.
+///
+/// Lock order is worker, then project, then job. `FOR NO KEY UPDATE` conflicts with another
+/// scheduler and with a policy update, which is the point, but not with the `FOR KEY SHARE` that
+/// job submission's foreign key takes, so queueing work never waits on scheduling. Membership
+/// changes take the project `FOR UPDATE` after the identity and never lock workers or jobs, so
+/// they can delay a heartbeat briefly but cannot form a cycle with it. Lifecycle transitions
+/// that free a slot do not take this lock: they only lower the count, so a scheduler racing one
+/// can at worst refuse conservatively and assign on the next heartbeat.
+async fn project_at_capacity(
+    transaction: &mut Transaction<'_, Postgres>,
+    worker_id: Uuid,
+) -> Result<bool, ApiError> {
+    let (project_id, limit) = sqlx::query_as::<_, (Uuid, Option<i32>)>(
+        "SELECT p.id, p.max_concurrent_jobs FROM projects p \
+         JOIN workers w ON w.project_id = p.id WHERE w.id = $1 \
+         FOR NO KEY UPDATE OF p",
+    )
+    .bind(worker_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|error| database_error(&error, "lock project for assignment"))?;
+    let Some(limit) = limit else {
+        return Ok(false);
+    };
+    let active: i64 = sqlx::query_scalar(ACTIVE_PROJECT_JOBS)
+        .bind(project_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| database_error(&error, "count active project jobs"))?;
+    Ok(active >= i64::from(limit))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn current_or_assign_job(
     pool: &PgPool,
@@ -1631,6 +1675,13 @@ async fn current_or_assign_job(
             .commit()
             .await
             .map_err(|error| database_error(&error, "commit empty assignment"))?;
+        return Ok(None);
+    }
+    if project_at_capacity(&mut transaction, worker_id).await? {
+        transaction
+            .commit()
+            .await
+            .map_err(|error| database_error(&error, "commit capped assignment"))?;
         return Ok(None);
     }
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32)>(
@@ -3501,3 +3552,6 @@ mod tests {
         assert_eq!(lineage[0]["dataset_manifest_sha256"], "b".repeat(64));
     }
 }
+
+#[cfg(test)]
+mod concurrency_tests;
