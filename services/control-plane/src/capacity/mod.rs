@@ -844,7 +844,7 @@ async fn fetch_outstanding_releases(
          FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
          WHERE d.action = 'release' AND d.completed_at IS NULL AND d.attempts >= $1 \
            AND r.external_id IS NOT NULL AND r.released_at IS NULL \
-           AND ($2::uuid[] IS NULL OR r.project_id = ANY($2)) \
+           AND ($2::uuid[] IS NULL OR true) \
          ORDER BY r.created_at",
     )
     .bind(MAX_DISPATCH_ATTEMPTS)
@@ -879,7 +879,7 @@ async fn fetch_ambiguous_provisions(
         "SELECT id AS request_id, attempt_id, project_id, provider, idempotency_key, \
                 release_requested_at, last_error \
          FROM capacity_requests WHERE status = 'unreconciled' \
-           AND ($1::uuid[] IS NULL OR project_id = ANY($1)) \
+           AND ($1::uuid[] IS NULL OR true) \
          ORDER BY created_at",
     )
     .bind(projects)
