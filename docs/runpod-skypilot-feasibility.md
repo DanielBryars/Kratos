@@ -18,31 +18,39 @@ useful part; please read that section before planning a paid run.
 
 ## Verdict
 
-RunPod is a reasonable place to run a **standalone** short GPU training job through SkyPilot, and
-the pinned release supports the one cost control that matters (`autodown`, which terminates).
+RunPod is a reasonable place to try a **standalone** short GPU training job through SkyPilot. The
+pinned release's feature gate permits the one cost control that matters (`autodown`, which
+terminates); **nobody has yet seen it terminate a pod in our account**, so that is a code-level
+permission, not a teardown result.
 
-**It cannot run the existing Kratos agent as it stands.** That is not a tuning problem; it is two
-independent architectural mismatches, both evidenced below. Anything that presents RunPod as a
-drop-in host for our current worker is wrong.
+**The pinned SkyPilot RunPod path does not provide what the existing Kratos agent needs.** The
+adapter provisions no Docker socket, and SkyPilot supplies its own start command and delivers work
+over SSH rather than through our worker protocol (§1). Those are missing prerequisites on this
+path, evidenced below; they are not a proof that no RunPod configuration could host the agent.
+Nothing here supports presenting RunPod via SkyPilot as a drop-in host for our current worker.
 
 Separately, **SkyPilot's RunPod provisioning is not idempotent.** It reconciles by pod *name* with a
 list-then-create, and sends no idempotency token. That is precisely the property the merged capacity
 boundary (PR #105) documents as the single most important thing a real provider must get right, and
-the acceptance note for it explicitly says it was never tested against a real provider. This is the
-answer: the first real provider does not offer it, so Kratos would have to supply the guarantee
-itself.
+the acceptance note for it explicitly says it was never tested against a real provider. On this
+path the guarantee is not offered, so Kratos would have to supply it itself. Whether RunPod's own
+API accepts an idempotency key that SkyPilot simply does not send is outside what this source
+shows **[unknown]**.
 
 ---
 
 ## 1. Pod execution versus our Docker agent — the decisive finding
 
-**A RunPod Pod *is* the container.** There is no VM and no Docker daemon. Our agent's execution
-model is an agent container that talks to a Docker socket and runs each job as a sibling container
-(`DockerExecutor`, `remove_job_container`). There is no socket to talk to on a Pod. **[evidenced by
-absence: nothing in `sky/provision/runpod/` mounts or provisions a Docker socket, and the pod
-parameters in `utils.launch` contain no such option.]**
+**A RunPod Pod is launched as a container image.** Our agent's execution model is an agent
+container that talks to a Docker socket and runs each job as a sibling container
+(`DockerExecutor`, `remove_job_container`). **The SkyPilot RunPod adapter provisions no Docker
+socket. [evidenced by absence: nothing in `sky/provision/runpod/` mounts or provisions a Docker
+socket or requests privileged mode, and the pod parameters in `utils.launch` contain no such
+option.]** That establishes a missing prerequisite on this path. Whether some other RunPod
+configuration (a different template, pod type or API option) can expose Docker to a pod is
+**[unknown]** — I did not investigate RunPod beyond what SkyPilot uses.
 
-**SkyPilot replaces the image's entrypoint.** This is the part most likely to be assumed away.
+**SkyPilot supplies its own start command.** This is the part most likely to be assumed away.
 `sky/provision/runpod/utils.py::launch` builds `docker_args` as:
 
 ```
@@ -52,15 +60,24 @@ bash -c 'echo <base64 of setup_cmd> | base64 --decode > init.sh; bash init.sh'
 and `setup_cmd` is an SSH bootstrap ending in `sleep infinity`: `apt update`, `apt install
 openssh-server rsync curl patch -y`, `mkdir -p /var/run/sshd`, permit root login, `ssh-keygen -A`,
 append the cluster public key to `authorized_keys`, `service ssh restart`, then `sleep infinity`.
-SkyPilot then runs the task over SSH. **[evidenced]**
+Each privileged step is prefixed by `prefix_cmd`, which emits `sudo` when `id -u` is non-zero and
+nothing for root (`utils.py:318-341`). SkyPilot then runs the task over SSH. **[evidenced]**
 
 Three consequences, all of which matter more than the "custom images are supported" headline:
 
-- **Our image's own `CMD`/`ENTRYPOINT` never runs.** Handing SkyPilot
-  `ghcr.io/danielbryars/kratos-agent@sha256:…` would start the image and then *not* start the agent.
-  So "RunPod accepts custom images as Pod images" is true and does **not** imply our agent runs.
-- **The image must be `apt`-based and installable as root.** A distroless, Alpine, or non-root image
-  fails during bootstrap. **[evidenced]**
+- **SkyPilot does not use our image's `CMD`/`ENTRYPOINT` to start work.** Its design requires this
+  bootstrap to run and stay alive. What RunPod does with `docker_args` when the image also declares
+  an `ENTRYPOINT` — replace it, or pass the string to it as arguments — is RunPod behaviour that the
+  SkyPilot source does not show, so it is **[unknown]**. Either way, handing SkyPilot
+  `ghcr.io/danielbryars/kratos-agent@sha256:…` gives no evidence that the agent would start as it
+  does today: either the bootstrap replaces it, or the agent receives SkyPilot's shell command as
+  arguments and SkyPilot's bootstrap does not run. "RunPod accepts custom images as Pod images" is
+  true and does **not** imply our agent runs.
+- **The image must provide `apt`, and root or working `sudo`.** The bootstrap installs packages with
+  `apt` and uses `sudo` for privileged steps when not root. A non-root image with passwordless
+  `sudo` is therefore within what the code handles; an image without `apt`, or non-root without
+  usable `sudo` (typical of distroless and Alpine), would fail during bootstrap. **[evidenced from
+  the command; not run]**
 - **Work arrives by SSH, not by our worker protocol.** Nothing polls the Kratos control plane, so
   nothing heartbeats, leases an attempt, or reports a result.
 
@@ -79,8 +96,10 @@ both are open decisions.
 2. **Make the agent run as PID 1 of the Pod and execute jobs in-process.** This needs a non-Docker
    executor — a real change to the agent's execution model, not configuration.
 
-**Do not plan on option 3, "run our agent container and let it use Docker",** because there is no
-Docker socket.
+**Do not plan on option 3, "run our agent container and let it use Docker",** through this
+SkyPilot path, because the adapter provisions no Docker socket. Reopening it would first need
+evidence that some RunPod configuration exposes Docker to a pod, and a provisioning path other than
+the pinned adapter to request it.
 
 ---
 
@@ -96,8 +115,9 @@ Both hold, and the autodown question has a precise answer.
 **Custom images are accepted as Pod images. [evidenced]** — with the entrypoint caveat in §1, which
 is the part that decides whether this is useful to us.
 
-**`autodown` works; `autostop` does not. [evidenced]** This is worth stating precisely because the
-reason is not the obvious one. In `sky/core.py`:
+**`autodown` is permitted; `autostop` is refused. [evidenced as a feature gate, not as a
+teardown]** This is worth stating precisely because the reason is not the obvious one. In
+`sky/core.py`:
 
 - `sky stop` requires `STOP` → refused, with a message directing the user to `sky down`
   (`core.py:1062-1071`).
@@ -105,9 +125,16 @@ reason is not the obvious one. In `sky/core.py`:
   is unsupported.
 - `autodown` requires only `AUTODOWN` (`core.py:1172-1174`), and **`AUTODOWN` is absent from
   RunPod's unsupported list** — the string `AUTODOWN` does not appear in `sky/clouds/runpod.py` at
-  all. So it is supported.
+  all. So SkyPilot will accept it for RunPod.
 
-**So the only automatic cost control is "idle for N minutes, then terminate".** For spend safety
+That is the whole of the evidence. Acceptance by a feature gate is not a witnessed teardown: **no
+autodown has been observed terminating a pod in our account.** The idle timer is also enforced from
+inside the cluster — skylet on the pod calls `provision_lib.terminate_instances` itself
+(`sky/skylet/events.py:382-419`), using the API key copied onto the pod (§6) — so it depends on the
+pod staying healthy enough to run skylet. The first paid run (§7) is what would turn this into
+evidence.
+
+**So the only automatic cost control on offer is "idle for N minutes, then terminate".** For spend safety
 that is the better of the two: terminate stops GPU billing outright. The cost is that there is no
 "park the disk, release the GPU" mode.
 
@@ -219,7 +246,8 @@ Two things follow.
 
 **Good news: a default `sky down` leaves no residual storage charge.** SkyPilot only attaches a
 network volume when `VolumeMounts` is configured (`run_instances`), and nothing configures it by
-default, so container and volume disk go with the pod. **[evidenced + cited]**
+default, so container and volume disk go with the pod. **[evidenced + cited; not witnessed in our
+account]**
 
 **The spend trap: a network volume is a standing charge that no teardown removes.** It is the
 obvious answer to the re-download cost in §2, and RunPod's own documentation says it is "retained
@@ -319,10 +347,16 @@ I would rather name these than let the document read as more complete than it is
 4. **Actual GPU availability and price for any specific type**, which is dynamic and which I did not
    query — no account, and querying availability was outside the read-only scope I was given.
 5. **Whether the SSH bootstrap succeeds on a CUDA base image** in practice. It requires `apt` and
-   root; most PyTorch/CUDA images satisfy that, but I have not run it.
-6. **Nothing about GCP.** Codex owns the GCP preflight, and the note that global GPU quota remains
+   root or working `sudo`; most PyTorch/CUDA images satisfy that, but I have not run it.
+6. **What RunPod does with `docker_args` when the image declares an `ENTRYPOINT`** (§1). SkyPilot's
+   source shows what it sends, not RunPod's override semantics.
+7. **Whether any RunPod configuration outside the pinned SkyPilot adapter can expose Docker to a
+   pod** (§1). The adapter's absence of a socket is evidence about this path only.
+8. **Whether autodown actually terminates a pod in our account** (§2). The feature gate permits it;
+   no teardown has been witnessed.
+9. **Nothing about GCP.** Codex owns the GCP preflight, and the note that global GPU quota remains
    zero is theirs, not independently checked by me.
-7. **Whether any of this survives a SkyPilot upgrade.** Every code claim is pinned to 0.13.0. The
+10. **Whether any of this survives a SkyPilot upgrade.** Every code claim is pinned to 0.13.0. The
    `STOP` gap in particular is an adapter limitation, not a RunPod one, so it could change.
 
 ---
@@ -332,7 +366,7 @@ I would rather name these than let the document read as more complete than it is
 **Primary, read directly:** installed source of `skypilot==0.13.0` —
 `sky/__init__.py`, `sky/clouds/runpod.py`, `sky/clouds/cloud.py`, `sky/core.py`,
 `sky/provision/runpod/instance.py`, `sky/provision/runpod/utils.py`,
-`sky/provision/runpod/api/commands.py`.
+`sky/provision/runpod/api/commands.py`, `sky/skylet/events.py`.
 
 **RunPod documentation:**
 
