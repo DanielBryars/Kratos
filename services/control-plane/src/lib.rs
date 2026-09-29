@@ -30,6 +30,7 @@ mod observations;
 mod operator;
 pub mod projects;
 mod registry;
+mod scheduling_policy;
 
 use artifact_storage::{ArtifactStorageClient, ResumableUploadSession};
 use artifacts::{
@@ -111,6 +112,8 @@ pub(crate) struct AppState {
         operator::list_jobs,
         operator::list_job_artifacts,
         operator::cancel_job,
+        scheduling_policy::get_scheduling_policy,
+        scheduling_policy::update_scheduling_policy,
         datasets::list_datasets,
         datasets::import_hugging_face_dataset,
         datasets::create_upload_dataset,
@@ -145,6 +148,7 @@ pub(crate) struct AppState {
         WorkerGroupResponse, CreateJobRequest, OperatorJobResponse, OperatorArtifactResponse,
         OperatorArtifactStatus, OperatorArtifactListResponse, OperatorAttemptIdentity,
         OperatorObservationStream, VerifiedArtifactEvidence, JobAssignment,
+        scheduling_policy::UpdateSchedulingPolicyRequest, scheduling_policy::SchedulingPolicyResponse,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         observations::SubmitObservationBatchRequest, observations::ObservationRecord,
         observations::ObservationBatchResponse,
@@ -380,6 +384,11 @@ pub fn app_with_dependencies(
             get(operator::list_job_artifacts),
         )
         .route(
+            "/api/v1/operator/scheduling-policy",
+            get(scheduling_policy::get_scheduling_policy)
+                .put(scheduling_policy::update_scheduling_policy),
+        )
+        .route(
             "/api/v1/operator/datasets",
             get(datasets::list_datasets),
         )
@@ -545,6 +554,13 @@ mod tests {
             document["components"]["schemas"]["VerifiedArtifactEvidence"]["properties"]["storage_generation"]
                 ["type"],
             "string"
+        );
+        let policy = &document["paths"]["/api/v1/operator/scheduling-policy"];
+        assert!(policy["get"].is_object() && policy["put"].is_object());
+        assert!(
+            document["components"]["schemas"]["UpdateSchedulingPolicyRequest"]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&"max_concurrent_jobs".into()))
         );
     }
 

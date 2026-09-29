@@ -159,6 +159,9 @@ input { width: 100%; min-height: 42px; border: 1px solid var(--line-bright); bor
 input:hover { border-color: #465c76; }
 input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(102, 171, 255, .11); }
 .queue-button { margin-top: 23px; white-space: nowrap; }
+.scheduling-policy { display: grid; gap: 9px; margin-bottom: 14px; }
+.scheduling-policy .job-form { grid-template-columns: auto 1fr auto; align-items: center; }
+.scheduling-policy .job-form .output-toggle { display: flex; }
 .output-contract { display: grid; gap: 13px; padding: 16px 17px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(120deg, rgba(13, 21, 32, .96), rgba(16, 28, 42, .72)); }
 .output-contract-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .output-toggle { display: flex; align-items: center; gap: 11px; color: #c9d9e9; font-size: 0.88rem; }
@@ -270,7 +273,7 @@ select { color: var(--text); background: #151f2c; border-color: var(--line-brigh
   .card-heading, .registration-section { padding-right: 18px; padding-left: 18px; }
   .card-heading, .section-heading, .operator-action, .worker-heading, .output-contract-heading { align-items: flex-start; flex-direction: column; }
   .worker-grid { grid-template-columns: 1fr; }
-  .job-form, .output-fields { grid-template-columns: 1fr; }
+  .job-form, .output-fields, .scheduling-policy .job-form { grid-template-columns: 1fr; }
   .registration { align-items: stretch; flex-direction: column; }
   .registration-actions, .form-row { align-items: stretch; flex-direction: column; }
   .job-heading { align-items: flex-start; flex-direction: column; }

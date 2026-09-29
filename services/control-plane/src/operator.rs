@@ -402,7 +402,7 @@ impl OperatorError {
         )
     }
 
-    const fn forbidden() -> Self {
+    pub(crate) const fn forbidden() -> Self {
         Self::new(
             StatusCode::FORBIDDEN,
             "forbidden",
