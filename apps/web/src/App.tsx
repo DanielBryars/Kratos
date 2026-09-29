@@ -25,6 +25,7 @@ import {
   type OutputRequirement,
 } from "./artifactPresentation";
 import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
+import { SubmissionRetry, definitiveSubmissionRejection, type SubmissionAttempt, type SubmissionOutcome } from "./submissionRetry";
 import {
   buildPolicyUpdate,
   describePolicy,
@@ -260,6 +261,10 @@ export function App() {
   const [durableOutputMediaType, setDurableOutputMediaType] = useState("application/x-pytorch");
   const [durableOutputMaxMiB, setDurableOutputMaxMiB] = useState(1);
   const [jobAction, setJobAction] = useState(false);
+  const submissionRetry = useRef(new SubmissionRetry());
+  const [jobSubmitting, setJobSubmitting] = useState(false);
+  const jobMutationVersion = useRef(0);
+  const [pendingSubmission, setPendingSubmission] = useState<SubmissionAttempt | null>(null);
   const [schedulingPolicy, setSchedulingPolicy] = useState<SchedulingPolicy | null>(null);
   // Null while not editing, so the five-second refresh cannot overwrite a half-typed limit.
   const [policyDraft, setPolicyDraft] = useState<PolicyDraft | null>(null);
@@ -346,6 +351,7 @@ export function App() {
     async function refresh() {
       controller = new AbortController();
       const policyVersion = policyMutation.current.version;
+      const jobVersion = jobMutationVersion.current;
       const policyRefreshIsCurrent = () => policyVersion === policyMutation.current.version
         && !policyMutation.current.saving;
       try {
@@ -379,17 +385,17 @@ export function App() {
         if (nextMembers) setMembers(nextMembers);
         if (nextInvitations) setInvitations(nextInvitations);
         if (nextDatasets) setDatasets(nextDatasets);
-        if (nextJobs) {
+        if (nextJobs && jobVersion === jobMutationVersion.current) {
           setJobs(nextJobs);
           setHasLoadedJobsSnapshot(true);
           setJobStatusUnavailable(false);
-        } else {
+        } else if (!nextJobs && jobVersion === jobMutationVersion.current) {
           setJobStatusUnavailable(true);
         }
       } catch (error) {
         if (!(error instanceof DOMException && error.name === "AbortError")) {
           if (!stopped) {
-            setJobStatusUnavailable(true);
+            if (jobVersion === jobMutationVersion.current) setJobStatusUnavailable(true);
             if (policyRefreshIsCurrent()) setSchedulingPolicy(null);
           }
         }
@@ -922,41 +928,77 @@ export function App() {
     }
   }
 
+  useEffect(() => {
+    submissionRetry.current.reset();
+    setPendingSubmission(null);
+    setJobSubmitting(false);
+  }, [user?.uid]);
+
   async function submitJob() {
     if (!user) return;
-    setJobAction(true);
+    let attempt: SubmissionAttempt | null;
+    try {
+      attempt = submissionRetry.current.begin(() => buildJobSubmission(jobName, jobImage, jobTimeout, {
+        enabled: durableOutputEnabled,
+        logicalPath: durableOutputPath,
+        role: durableOutputRole,
+        mediaType: durableOutputMediaType,
+        maxMiB: durableOutputMaxMiB,
+      }, jobDatasetVersionId ? [{
+        alias: jobDatasetAlias,
+        dataset_version_id: jobDatasetVersionId,
+        dataset_view_id: jobDatasetViewId || null,
+      }] : [], jobEarliestStart));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Check the job details.");
+      return;
+    }
+    if (!attempt) return;
+    setPendingSubmission(attempt);
+    setJobSubmitting(true);
     setMessage(null);
+    let finishedCurrent = false;
+    let failureOutcome: SubmissionOutcome = "uncertain";
     try {
       const idToken = await user.getIdToken();
+      if (!submissionRetry.current.isCurrent(attempt)) return;
       const response = await fetch("/api/v1/operator/jobs", {
         method: "POST",
-        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json" },
-        body: JSON.stringify(buildJobSubmission(jobName, jobImage, jobTimeout, {
-          enabled: durableOutputEnabled,
-          logicalPath: durableOutputPath,
-          role: durableOutputRole,
-          mediaType: durableOutputMediaType,
-          maxMiB: durableOutputMaxMiB,
-        }, jobDatasetVersionId ? [{
-          alias: jobDatasetAlias,
-          dataset_version_id: jobDatasetVersionId,
-          dataset_view_id: jobDatasetViewId || null,
-        }] : [], jobEarliestStart)),
+        headers: { Authorization: `Bearer ${idToken}`, "Content-Type": "application/json", "Idempotency-Key": attempt.key },
+        body: attempt.body,
       });
       if (!response.ok) {
+        if (definitiveSubmissionRejection(response.status)) failureOutcome = "rejected";
         const error = (await response.json().catch(() => ({}))) as ApiError;
         throw new Error(error.message ?? `Request failed with ${response.status}`);
       }
       const created = (await response.json()) as Job;
-      setJobs((current) => [created, ...current]);
+      if (!created || typeof created.job_id !== "string") throw new Error("The submission response could not be confirmed. Retry the same submission.");
+      finishedCurrent = submissionRetry.current.finish(attempt, "accepted");
+      if (!finishedCurrent) return;
+      jobMutationVersion.current += 1;
+      setPendingSubmission(null);
+      setHasLoadedJobsSnapshot(true);
+      setJobStatusUnavailable(false);
+      setJobs((current) => [created, ...current.filter((job) => job.job_id !== created.job_id)]);
       setJobEarliestStart("");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "The job could not be queued.");
+      finishedCurrent = submissionRetry.current.finish(attempt, failureOutcome);
+      if (finishedCurrent) {
+        setPendingSubmission(submissionRetry.current.pending);
+        setMessage(error instanceof Error ? error.message : "The submission could not be confirmed. Retry the same submission.");
+      }
     } finally {
-      setJobAction(false);
+      if (finishedCurrent) setJobSubmitting(false);
     }
   }
 
+  function discardSubmissionRetry() {
+    if (submissionRetry.current.busy) return;
+    submissionRetry.current.reset();
+    setPendingSubmission(null);
+    setMessage(null);
+  }
   function loadDurableTrainingPreset() {
     setDurableOutputEnabled(true);
     setJobEarliestStart("");
@@ -1145,7 +1187,7 @@ export function App() {
               <div className="registration-section" id="work-queue">
                 <div className="section-heading">
                   <div><p className="label">Work queue</p><h3>Schedule GPU work</h3></div>
-                  <button className="button-secondary button-compact" type="button" disabled={jobAction} onClick={loadDurableTrainingPreset}>Load training example</button>
+                  <button className="button-secondary button-compact" type="button" disabled={jobAction || jobSubmitting || pendingSubmission !== null} onClick={loadDurableTrainingPreset}>Load training example</button>
                 </div>
                 <p className="muted compact">Submit one immutable container image. Kratos assigns it to the next online, approved worker with a healthy GPU.</p>
                 <div className="scheduling-policy" aria-labelledby="scheduling-policy-heading">
@@ -1165,6 +1207,7 @@ export function App() {
                   ) : <p className="muted compact">The project concurrency limit is unavailable.</p>}
                   {policyMessage && <p className="notice notice--error" role="alert">{policyMessage}</p>}
                 </div>
+                <fieldset className="submission-fields" disabled={jobAction || jobSubmitting || pendingSubmission !== null} aria-label="Job details">
                 <div className="job-form">
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /><small>Make it easy to recognise later.</small></label>
                   <label>Immutable image<input value={jobImage} spellCheck={false} onChange={(event) => setJobImage(event.target.value)} /><small>Public registry image pinned with <code>@sha256</code>.</small></label>
@@ -1173,7 +1216,7 @@ export function App() {
                   {selectedJobDatasetVersion && <><label>Curated view<select value={jobDatasetViewId} onChange={(event) => setJobDatasetViewId(event.target.value)}><option value="">Complete version</option>{selectedJobDatasetVersion.version.views.map((view) => <option key={view.id} value={view.id}>{view.name} · {view.included_episode_count} episodes</option>)}</select><small>Choose a published episode set or use every episode.</small></label><label>Mount alias<input value={jobDatasetAlias} maxLength={32} onChange={(event) => setJobDatasetAlias(event.target.value)} /><small>Available inside the container at <code>/kratos/inputs/{jobDatasetAlias || "…"}</code>.</small></label></>}
                 <label>Earliest start (your local time, optional)<input type="datetime-local" value={jobEarliestStart} onChange={(event) => setJobEarliestStart(event.target.value)} /></label>
                 <p>Leave blank to queue immediately. A future time makes the job eligible then; it does not reserve a GPU.</p>
-                  <button className="queue-button" type="button" disabled={jobAction || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobAction ? "Updating…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
+                  <button className="queue-button" type="button" disabled={jobAction || jobSubmitting || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobSubmitting ? "Submitting…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
                 </div>
                 <div className="output-contract">
                   <div className="output-contract-heading">
@@ -1192,6 +1235,16 @@ export function App() {
                     </div></>
                   )}
                 </div>
+                </fieldset>
+                {pendingSubmission && !jobSubmitting && (
+                  <div className="notice" role="status">
+                    <p>The submission of <strong>{pendingSubmission.name}</strong> is not confirmed. Retry sends the same job without creating a duplicate. Check recent runs before starting another submission. Reloading or signing out loses this retry.</p>
+                    <div className="worker-actions">
+                      <button type="button" disabled={jobAction} onClick={() => void submitJob()}>Retry submission</button>
+                      <button className="button-secondary" type="button" onClick={discardSubmissionRetry}>Discard retry and start a new submission</button>
+                    </div>
+                  </div>
+                )}
                 {jobsSnapshotState === "loading" && <p className="muted compact">Loading jobs and output status…</p>}
                 {jobsSnapshotState === "empty" && <p className="muted compact">No jobs have been submitted.</p>}
                 {jobsUnavailableMessage && <p className="notice notice--error" role="status">{jobsUnavailableMessage}</p>}

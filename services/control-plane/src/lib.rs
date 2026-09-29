@@ -562,6 +562,17 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.contains(&"max_concurrent_jobs".into()))
         );
+        let create_job = &document["paths"]["/api/v1/operator/jobs"]["post"];
+        let parameters = create_job["parameters"].as_array().unwrap();
+        let idempotency_key = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "Idempotency-Key")
+            .unwrap();
+        assert_eq!(idempotency_key["in"], "header");
+        assert_ne!(idempotency_key["required"], true);
+        for status in ["200", "201", "409", "422"] {
+            assert!(create_job["responses"][status].is_object(), "{status}");
+        }
     }
 
     #[tokio::test]

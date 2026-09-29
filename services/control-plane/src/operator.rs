@@ -26,6 +26,8 @@ use crate::{
     registry::{ErrorResponse, WorkerCapabilities, reconcile_expired_attempts},
 };
 
+mod submission;
+
 const DEFAULT_EXPIRY_SECONDS: i64 = 900;
 const MIN_EXPIRY_SECONDS: i64 = 300;
 const MAX_EXPIRY_SECONDS: i64 = 3600;
@@ -1305,12 +1307,20 @@ fn validate_job_request(request: &CreateJobRequest) -> Result<(), OperatorError>
     path = "/api/v1/operator/jobs",
     tag = "operator",
     security(("human_bearer" = [])),
+    params(
+        ("Idempotency-Key" = Option<Uuid>, Header, description = "Optional hyphenated UUID naming this submission. \
+         Scoped to the caller's project and identity. Resending an identical request with the same key returns \
+         the job it created (200) instead of queueing another; a different request with the same key is \
+         rejected (409). Omit it to queue a new job on every request.")
+    ),
     request_body = CreateJobRequest,
     responses(
+        (status = 200, description = "Identical replay of an earlier submission with this Idempotency-Key; the existing job in its current state", body = OperatorJobResponse),
         (status = 201, description = "GPU job queued", body = OperatorJobResponse),
         (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
         (status = 403, description = "Identity is not an operator", body = ErrorResponse),
-        (status = 422, description = "Job request is invalid", body = ErrorResponse)
+        (status = 409, description = "idempotency_key_reused: the key was already used for a different request; or project_required", body = ErrorResponse),
+        (status = 422, description = "Job request is invalid, or invalid_idempotency_key", body = ErrorResponse)
     )
 )]
 pub(crate) async fn create_job(
@@ -1326,21 +1336,52 @@ pub(crate) async fn create_job(
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    // After authorisation, so the header's shape tells an unauthenticated caller nothing.
+    let idempotency_key = submission::idempotency_key(&headers)?;
+    let (status, job) = queue_job(database, &caller, project_id, idempotency_key, request).await?;
+    Ok((status, Json(job)))
+}
+
+/// Queue a job for an already authorised caller, or answer a replay of one it already queued.
+///
+/// Separate from the handler so that the database's arbitration between simultaneous submissions
+/// can be tested directly. An uncommitted placeholder job would block HTTP authentication:
+/// authorisation takes `FOR UPDATE` on the caller's identity row, which a job insert blocked
+/// mid-transaction already holds `FOR KEY SHARE` through its owner foreign key.
+#[allow(clippy::too_many_lines)]
+async fn queue_job(
+    database: &sqlx::PgPool,
+    caller: &Caller,
+    project_id: Uuid,
+    idempotency_key: Option<Uuid>,
+    request: CreateJobRequest,
+) -> Result<(StatusCode, OperatorJobResponse), OperatorError> {
     validate_job_request(&request)?;
+    let fingerprint = idempotency_key
+        .map(|_| submission::fingerprint(&request))
+        .transpose()?;
     let name = request.name.trim();
     let id = Uuid::new_v4();
     let mut transaction = database
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Without a key both submission columns are null and the partial index cannot conflict, so
+    // this is the plain insert it always was. With one, a committed job holding the same key makes
+    // this return no row, and one still in flight is waited for first -- which is what lets exactly
+    // one of two simultaneous submissions create the job.
     let query = format!(
         "INSERT INTO jobs \
-         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds, earliest_start_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {JOB_COLUMNS}"
+         (id, owner_identity_id, project_id, name, image_reference, timeout_seconds, earliest_start_at, \
+          submission_idempotency_key, submission_fingerprint) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (project_id, owner_identity_id, submission_idempotency_key) \
+             WHERE submission_idempotency_key IS NOT NULL DO NOTHING \
+         RETURNING {JOB_COLUMNS}"
     );
     // Both meanings are written, and they are not the same value: the identity records who
     // queued this, the project decides who can see it afterwards.
-    let record = sqlx::query_as::<_, JobRecord>(&query)
+    let inserted = sqlx::query_as::<_, JobRecord>(&query)
         .bind(id)
         .bind(caller.identity_id)
         .bind(project_id)
@@ -1348,9 +1389,25 @@ pub(crate) async fn create_job(
         .bind(&request.image_reference)
         .bind(request.timeout_seconds)
         .bind(request.earliest_start_at)
-        .fetch_one(&mut *transaction)
+        .bind(idempotency_key)
+        .bind(fingerprint.as_deref())
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
+    let Some(record) = inserted else {
+        // Nothing was written, so there is nothing to keep: the replay reads committed state.
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| OperatorError::internal())?;
+        let (Some(key), Some(fingerprint)) = (idempotency_key, fingerprint) else {
+            return Err(OperatorError::internal());
+        };
+        let existing = submission::replay(database, caller, project_id, key, &fingerprint).await?;
+        return Ok((StatusCode::OK, existing));
+    };
+    // Everything below belongs to the submission that created the job, and commits or rolls back
+    // with it. A failure here releases the key along with the job row.
     for output in &request.output_requirements {
         sqlx::query(
             "INSERT INTO job_output_requirements \
@@ -1388,7 +1445,10 @@ pub(crate) async fn create_job(
         "timeout_seconds": request.timeout_seconds,
         "earliest_start_at": request.earliest_start_at,
         "output_count": request.output_requirements.len(),
-        "dataset_input_count": request.dataset_inputs.len()
+        "dataset_input_count": request.dataset_inputs.len(),
+        // Whether a key was sent, never the key: the audit trail records the submission, and the
+        // key is the client's retry handle rather than something anyone needs to read back.
+        "idempotency_key_supplied": idempotency_key.is_some()
     }))
     .execute(&mut *transaction)
     .await
@@ -1399,19 +1459,17 @@ pub(crate) async fn create_job(
         .map_err(|_| OperatorError::internal())?;
     Ok((
         StatusCode::CREATED,
-        Json(
-            record.into_response(
-                request.output_requirements,
-                crate::dataset_inputs::load_job_dataset_inputs(database, &[id])
-                    .await?
-                    .remove(&id)
-                    .unwrap_or_default(),
-                OperatorArtifactListResponse {
-                    job_id: id,
-                    current_attempt: None,
-                    artifacts: Vec::new(),
-                },
-            ),
+        record.into_response(
+            request.output_requirements,
+            crate::dataset_inputs::load_job_dataset_inputs(database, &[id])
+                .await?
+                .remove(&id)
+                .unwrap_or_default(),
+            OperatorArtifactListResponse {
+                job_id: id,
+                current_attempt: None,
+                artifacts: Vec::new(),
+            },
         ),
     ))
 }
