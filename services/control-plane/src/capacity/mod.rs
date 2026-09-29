@@ -22,11 +22,12 @@ use std::fmt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 pub mod fake;
+pub(crate) mod operator_view;
 
 #[cfg(test)]
 mod tests;
@@ -824,16 +825,31 @@ async fn terminal_transition(
 /// # Errors
 /// Returns an error when the database cannot be reached.
 pub async fn outstanding_releases(pool: &PgPool) -> Result<Vec<OutstandingRelease>, CapacityError> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    fetch_outstanding_releases(&mut connection, None).await
+}
+
+/// `projects` of `None` means every project. One query for the function and the console, so what
+/// counts as outstanding cannot drift between them.
+async fn fetch_outstanding_releases(
+    connection: &mut PgConnection,
+    projects: Option<&[Uuid]>,
+) -> Result<Vec<OutstandingRelease>, CapacityError> {
     sqlx::query_as::<_, OutstandingRelease>(
         "SELECT r.id AS request_id, r.attempt_id, r.project_id, r.provider, \
                 r.external_id, d.attempts, d.last_error \
          FROM capacity_dispatches d JOIN capacity_requests r ON r.id = d.request_id \
          WHERE d.action = 'release' AND d.completed_at IS NULL AND d.attempts >= $1 \
            AND r.external_id IS NOT NULL AND r.released_at IS NULL \
+           AND ($2::uuid[] IS NULL OR r.project_id = ANY($2)) \
          ORDER BY r.created_at",
     )
     .bind(MAX_DISPATCH_ATTEMPTS)
-    .fetch_all(pool)
+    .bind(projects)
+    .fetch_all(connection)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))
 }
@@ -847,14 +863,50 @@ pub async fn outstanding_releases(pool: &PgPool) -> Result<Vec<OutstandingReleas
 /// # Errors
 /// Returns an error when the database cannot be reached.
 pub async fn ambiguous_provisions(pool: &PgPool) -> Result<Vec<AmbiguousProvision>, CapacityError> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| CapacityError::Inconsistent(error.to_string()))?;
+    fetch_ambiguous_provisions(&mut connection, None).await
+}
+
+/// `projects` of `None` means every project.
+async fn fetch_ambiguous_provisions(
+    connection: &mut PgConnection,
+    projects: Option<&[Uuid]>,
+) -> Result<Vec<AmbiguousProvision>, CapacityError> {
     sqlx::query_as::<_, AmbiguousProvision>(
         "SELECT id AS request_id, attempt_id, project_id, provider, idempotency_key, \
                 release_requested_at, last_error \
-         FROM capacity_requests WHERE status = 'unreconciled' ORDER BY created_at",
+         FROM capacity_requests WHERE status = 'unreconciled' \
+           AND ($1::uuid[] IS NULL OR project_id = ANY($1)) \
+         ORDER BY created_at",
     )
-    .fetch_all(pool)
+    .bind(projects)
+    .fetch_all(connection)
     .await
     .map_err(|error| CapacityError::Inconsistent(error.to_string()))
+}
+
+/// Both operator views for `projects`, read from one snapshot so a request moving between them
+/// mid-read cannot appear in both or in neither.
+///
+/// # Errors
+/// Returns an error when the database cannot be reached.
+pub(crate) async fn needing_attention(
+    pool: &PgPool,
+    projects: &[Uuid],
+) -> Result<(Vec<AmbiguousProvision>, Vec<OutstandingRelease>), CapacityError> {
+    let inconsistent = |error: sqlx::Error| CapacityError::Inconsistent(error.to_string());
+    let mut transaction = pool.begin().await.map_err(inconsistent)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *transaction)
+        .await
+        .map_err(inconsistent)?;
+    let ambiguous = fetch_ambiguous_provisions(&mut transaction, Some(projects)).await?;
+    let outstanding = fetch_outstanding_releases(&mut transaction, Some(projects)).await?;
+    transaction.commit().await.map_err(inconsistent)?;
+    Ok((ambiguous, outstanding))
 }
 
 /// Ask the provider again about a request whose outcome was never established.
@@ -927,7 +979,7 @@ pub async fn resolve_unreconciled(
 }
 
 /// A request whose provider outcome was never established.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct AmbiguousProvision {
     pub request_id: Uuid,
     pub attempt_id: Uuid,
@@ -942,7 +994,7 @@ pub struct AmbiguousProvision {
 }
 
 /// Capacity that Kratos has given up releasing and that a person now owns.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow, serde::Serialize, utoipa::ToSchema)]
 pub struct OutstandingRelease {
     pub request_id: Uuid,
     pub attempt_id: Uuid,

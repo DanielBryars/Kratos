@@ -117,6 +117,7 @@ pub(crate) struct AppState {
         scheduling_policy::update_scheduling_policy,
         credits::get_credits,
         credits::create_entry,
+        capacity::operator_view::capacity_attention,
         datasets::list_datasets,
         datasets::import_hugging_face_dataset,
         datasets::create_upload_dataset,
@@ -154,6 +155,8 @@ pub(crate) struct AppState {
         scheduling_policy::UpdateSchedulingPolicyRequest, scheduling_policy::SchedulingPolicyResponse,
         credits::CreditAccountResponse, credits::CreditEntryResponse, credits::CreateCreditEntryRequest,
         credits::CreditEntryKind, credits::CreditEnforcement,
+        capacity::operator_view::CapacityAttentionResponse, capacity::AmbiguousProvision,
+        capacity::OutstandingRelease,
         JobResultRequest, JobResultResponse, JobOutputRequirement, ArtifactManifestFile,
         observations::SubmitObservationBatchRequest, observations::ObservationRecord,
         observations::ObservationBatchResponse,
@@ -396,6 +399,10 @@ pub fn app_with_dependencies(
         .route("/api/v1/operator/credits", get(credits::get_credits))
         .route("/api/v1/operator/credits/entries", post(credits::create_entry))
         .route(
+            "/api/v1/operator/capacity/attention",
+            get(capacity::operator_view::capacity_attention),
+        )
+        .route(
             "/api/v1/operator/datasets",
             get(datasets::list_datasets),
         )
@@ -564,6 +571,12 @@ mod tests {
         );
         let policy = &document["paths"]["/api/v1/operator/scheduling-policy"];
         assert!(document["paths"]["/api/v1/operator/credits"]["get"].is_object());
+        let capacity = &document["paths"]["/api/v1/operator/capacity/attention"];
+        assert!(capacity["get"].is_object());
+        assert!(
+            capacity["post"].is_null(),
+            "the capacity view must stay read-only"
+        );
         let credit_write = &document["paths"]["/api/v1/operator/credits/entries"]["post"];
         assert!(credit_write.is_object());
         assert!(
