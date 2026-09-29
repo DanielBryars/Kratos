@@ -297,7 +297,12 @@ served, read-only, at `GET /api/v1/operator/capacity/attention`, scoped to the c
 like every other operator list and read from one snapshot. The endpoint and the functions share one
 query each, so what counts as needing a person cannot drift between them. Tests prove a member sees
 their own project's rows and not another project's, and that a release with attempts left is not
-listed. *With the project filter removed:* the scoping test failed — see PR for the recorded run.
+listed.
+
+*With the project filter made inert* (`OR true`, so the query still binds its parameter and only
+the scoping changes): `a member must see their own project's unknown outcomes and no other
+project's`, with two request ids returned where one was expected. It was the only test of 195 to
+fail.
 
 That is visibility on request, not the whole requirement. There is still no console panel and no
 alert, so nothing routes these states to a person who is not already looking. A first real provider
