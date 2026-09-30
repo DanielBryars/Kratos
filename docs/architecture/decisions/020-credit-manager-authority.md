@@ -29,7 +29,8 @@ Credit is not like that, for a reason worth stating plainly: **a grant has no so
 payment, no provider invoice, and no external account it is drawn from. Codex's reviewed next-step
 note is explicit that no money rates, initial grants or provider payouts are to be invented. So
 `kind = 'grant'` creates spending power from nothing, and manager authority is, in effect, the
-authority to create money inside this system.
+authority to create money inside this system — and since
+[ADR-021](021-credits-are-pence-sterling.md), that is literal: a unit is one penny sterling.
 
 That is why it must not fall out of membership. Inviting somebody to look at a training run is a
 normal, low-stakes act — Daniel has done it — and it must not also hand them the ability to conjure
@@ -138,9 +139,9 @@ revoked cannot be recovered from inside the product.
 - **Separation of duties.** Whether one person may both grant credit and spend it is not addressed.
   With a single operator it is moot; it will not stay moot, and pretending this ADR settled it would
   be worse than naming it.
-- **Where credit comes from.** Until a grant has a source, "credit" is an internal accounting unit
-  and not money. Rates, payments, quotes and provider payouts are explicitly out of scope, per the
-  handover.
+- **Where credit comes from.** [ADR-021](021-credits-are-pence-sterling.md) settles the
+  denomination — pence sterling — but not the source: a grant still has no payment behind it.
+  Rates, payments, quotes and provider payouts are explicitly out of scope, per the handover.
 - **Enforcement.** Reservation, settlement, the worker shutdown reserve and replay-safe accounting
   are the reviewed next-step work, and must be proved end to end before anything is enforced.
 - **Whether a platform-level role should exist.** Decision 2 would be revisited if one did.
