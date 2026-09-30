@@ -12,6 +12,9 @@ export type CreditEntry = {
 
 export type CreditAccount = {
   project_id: string;
+  /** Every amount is pence of this currency. The console reads nothing else. */
+  currency: "GBP";
+  minor_unit_exponent: 2;
   balance_units: string;
   account_exists: boolean;
   enforcement: "not_enforced";
@@ -41,6 +44,9 @@ function record(value: unknown): value is Record<string, unknown> {
 /** Never round ledger integers through JavaScript Number, including sequence cursors. */
 export function parseCreditAccount(value: unknown): CreditAccount {
   if (!record(value) || typeof value.project_id !== "string"
+    // Refuse rather than guess: a server that ever changed its unit would otherwise be shown at
+    // the wrong scale, silently, by a factor of a hundred or more.
+    || value.currency !== "GBP" || value.minor_unit_exponent !== 2
     || !nonnegative(value.balance_units) || typeof value.account_exists !== "boolean"
     || value.enforcement !== "not_enforced" || typeof value.can_manage !== "boolean"
     || !Array.isArray(value.entries)
@@ -61,10 +67,18 @@ export function parseCreditAccount(value: unknown): CreditAccount {
   return value as CreditAccount;
 }
 
+/**
+ * Pence as pounds: "150000" is "£1,500.00". BigInt throughout, because a ledger integer can exceed
+ * what a JavaScript number holds exactly, and a pound figure off by a penny is worse than none.
+ */
 export function formatCreditUnits(value: string, signed = false): string {
   if (!integer(value)) throw new Error("Invalid credit units.");
   const amount = BigInt(value);
-  return `${signed && amount > 0n ? "+" : ""}${amount.toLocaleString("en-GB")}`;
+  const magnitude = amount < 0n ? -amount : amount;
+  const pounds = (magnitude / 100n).toLocaleString("en-GB");
+  const pence = (magnitude % 100n).toString().padStart(2, "0");
+  const sign = amount < 0n ? "-" : signed && amount > 0n ? "+" : "";
+  return `${sign}£${pounds}.${pence}`;
 }
 
 export function creditHistoryUrl(before: string | null): string {

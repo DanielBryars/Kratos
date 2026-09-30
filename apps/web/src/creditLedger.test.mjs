@@ -9,16 +9,32 @@ const entry = {
   occurred_at: "2026-09-29T12:00:00Z",
 };
 const account = {
-  project_id: "project", balance_units: "9007199254740993", account_exists: true,
+  project_id: "project", currency: "GBP", minor_unit_exponent: 2, balance_units: "9007199254740993", account_exists: true,
   enforcement: "not_enforced", can_manage: false, entries: [entry], next_before_sequence: "9007199254740993",
 };
 
 test("ledger units and history cursors preserve integers beyond JavaScript precision", () => {
   const parsed = parseCreditAccount(account);
-  assert.equal(formatCreditUnits(parsed.balance_units), "9,007,199,254,740,993");
-  assert.equal(formatCreditUnits("9223372036854775807", true), "+9,223,372,036,854,775,807");
-  assert.equal(formatCreditUnits("-9223372036854775808", true), "-9,223,372,036,854,775,808");
+  // Units are pence: the last two digits are the pence, exactly, even beyond 2^53.
+  assert.equal(formatCreditUnits(parsed.balance_units), "£90,071,992,547,409.93");
+  assert.equal(formatCreditUnits("9223372036854775807", true), "+£92,233,720,368,547,758.07");
+  assert.equal(formatCreditUnits("-9223372036854775808", true), "-£92,233,720,368,547,758.08");
   assert.equal(creditHistoryUrl(parsed.next_before_sequence), "/api/v1/operator/credits?limit=25&before_sequence=9007199254740993");
+});
+
+test("pence are shown as pounds and pence, never as a bare count", () => {
+  assert.equal(formatCreditUnits("0"), "£0.00");
+  assert.equal(formatCreditUnits("5"), "£0.05");
+  assert.equal(formatCreditUnits("150000"), "£1,500.00");
+  assert.equal(formatCreditUnits("-1"), "-£0.01");
+  assert.equal(formatCreditUnits("1999", true), "+£19.99");
+  assert.equal(formatCreditUnits("-1999", true), "-£19.99");
+});
+
+test("an account in any other currency or scale is refused rather than shown at the wrong scale", () => {
+  for (const [currency, exponent] of [["USD", 2], ["GBP", 0], ["GBP", 3], [undefined, 2], ["GBP", undefined], ["GBP", "2"]]) {
+    assert.throws(() => parseCreditAccount({ ...account, currency, minor_unit_exponent: exponent }));
+  }
 });
 
 test("empty account has an explicit non-enforcing state", () => {

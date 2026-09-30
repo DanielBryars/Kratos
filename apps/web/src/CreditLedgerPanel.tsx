@@ -48,14 +48,14 @@ export function CreditLedgerPanel({ user }: { user: User }) {
       {loading && <p role="status">Loading credit history…</p>}
       {error && <p className="notice notice--error" role="alert">{error}</p>}
       {account && <>
-        <p className="credit-balance">{account.account_exists ? <><strong>{formatCreditUnits(account.balance_units)} units</strong><span>Balance at last refresh</span></> : <><strong>No credit account yet</strong><span>No credits have been granted.</span></>}</p>
+        <p className="credit-balance">{account.account_exists ? <><strong>{formatCreditUnits(account.balance_units)}</strong><span>Balance at last refresh</span></> : <><strong>No credit account yet</strong><span>No credits have been granted.</span></>}</p>
         {before && <p className="muted compact">Showing older entries. Refresh latest to return to recent activity.</p>}
         {account.entries.length === 0 ? <p className="muted compact">No entries on this page.</p> : (
           <ol className="credit-entries" aria-label="Credit ledger entries">
             {account.entries.map((entry) => <li key={entry.id}>
-              <div className="worker-heading"><strong>{entry.kind[0].toUpperCase() + entry.kind.slice(1)}</strong><strong>{formatCreditUnits(entry.amount_units, true)} units</strong></div>
+              <div className="worker-heading"><strong>{entry.kind[0].toUpperCase() + entry.kind.slice(1)}</strong><strong>{formatCreditUnits(entry.amount_units, true)}</strong></div>
               <p>{entry.reason}</p>
-              <p className="muted compact">{new Date(entry.occurred_at).toLocaleString()} · Balance after entry: {formatCreditUnits(entry.balance_after_units)} units</p>
+              <p className="muted compact">{new Date(entry.occurred_at).toLocaleString()} · Balance after entry: {formatCreditUnits(entry.balance_after_units)}</p>
               <details><summary>Entry details</summary><p className="credit-identifiers">Entry {entry.id}<br />Sequence {entry.sequence}<br />Recorded by {entry.actor_identity_id}{entry.reverses_entry_id && <><br />Reverses {entry.reverses_entry_id}</>}</p></details>
             </li>)}
           </ol>
