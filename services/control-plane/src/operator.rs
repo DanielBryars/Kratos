@@ -693,17 +693,22 @@ pub(crate) async fn list_worker_registration_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PendingRegistrationResponse>>, OperatorError> {
-    authenticate_operator(&state, &headers).await?;
+    let caller = authenticate_operator(&state, &headers).await?;
     let database = state
         .database
         .as_ref()
         .ok_or_else(OperatorError::unavailable)?;
+    // Scoped to the caller's projects, like every other operator list. A pending request carries
+    // the project the machine radioed in for, and `confirmation_code` is the secret that ties a
+    // physical machine to its approval -- so an unscoped listing hands every operator the means
+    // to identify, and then claim, somebody else's enrolling machine.
     let records = sqlx::query_as::<_, PendingRegistrationRecord>(
         "SELECT id, agent_instance_id, display_name, confirmation_code, created_at, expires_at, \
                 capabilities FROM worker_registration_requests \
          WHERE approved_at IS NULL AND rejected_at IS NULL AND claimed_at IS NULL \
-           AND expires_at > now() ORDER BY created_at",
+           AND expires_at > now() AND project_id = ANY($1) ORDER BY created_at",
     )
+    .bind(&caller.project_ids)
     .fetch_all(database)
     .await
     .map_err(|_| OperatorError::internal())?;
@@ -738,10 +743,17 @@ async fn decide_registration(
         .begin()
         .await
         .map_err(|_| OperatorError::internal())?;
+    // Scoped, and deliberately indistinguishable from "no such request": whether another project
+    // has a machine enrolling is not this caller's business. Approving is not a neutral act --
+    // the approver becomes the worker's owner at claim time, since the claim path reads
+    // `approved_by_identity_id` -- so an unscoped decision is a way to take somebody else's
+    // machine, and rejecting is a way to deny their enrolment.
     let exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM worker_registration_requests WHERE id = $1)",
+        "SELECT EXISTS (SELECT 1 FROM worker_registration_requests \
+         WHERE id = $1 AND project_id = ANY($2))",
     )
     .bind(registration_id)
+    .bind(&caller.project_ids)
     .fetch_one(&mut *transaction)
     .await
     .map_err(|_| OperatorError::internal())?;
@@ -752,14 +764,19 @@ async fn decide_registration(
         let mut challenge = [0_u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut challenge);
         sqlx::query(
+            // The scope predicate is repeated on the update itself rather than left to the check
+            // above: a prior read is not authority, and this statement is what actually grants
+            // ownership.
             "UPDATE worker_registration_requests SET approved_at = now(), \
              approved_by_identity_id = $2, claim_challenge = $3 \
              WHERE id = $1 AND approved_at IS NULL AND rejected_at IS NULL \
-               AND claimed_at IS NULL AND expires_at > now()",
+               AND claimed_at IS NULL AND expires_at > now() \
+               AND project_id = ANY($4)",
         )
         .bind(registration_id)
         .bind(caller.identity_id)
         .bind(challenge.as_slice())
+        .bind(&caller.project_ids)
         .execute(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -768,10 +785,12 @@ async fn decide_registration(
         sqlx::query(
             "UPDATE worker_registration_requests SET rejected_at = now(), \
              rejected_by_identity_id = $2 WHERE id = $1 AND approved_at IS NULL \
-               AND rejected_at IS NULL AND claimed_at IS NULL AND expires_at > now()",
+               AND rejected_at IS NULL AND claimed_at IS NULL AND expires_at > now() \
+               AND project_id = ANY($3)",
         )
         .bind(registration_id)
         .bind(caller.identity_id)
+        .bind(&caller.project_ids)
         .execute(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?
@@ -2554,6 +2573,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // A real operator reaches a project through a membership, created by bootstrap sign-in or
+        // by claiming an invitation. Without one this identity has the role and none of the
+        // access, which is now what the registration endpoints check.
+        sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
+            .bind(DEFAULT_PROJECT_ID)
+            .bind(operator_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let registration_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO worker_registration_requests \

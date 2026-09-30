@@ -17,6 +17,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header::AUTHORIZATION},
 };
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection, PgPool};
 use tower::ServiceExt;
@@ -326,6 +327,121 @@ async fn co_owner_sees_exactly_what_the_founder_sees(pool: PgPool) {
 ///
 /// The second half is the one worth testing: a 403 on a real id and a 404 on an invented one would
 /// tell a stranger which jobs exist.
+/// A machine radioing in to the founder's project, waiting for somebody to approve it.
+async fn seed_pending_enrolment(pool: &PgPool) -> (Uuid, String) {
+    let registration_id = Uuid::new_v4();
+    // Matches the schema's Crockford-ish alphabet: ^[A-Z2-9]{4}-[A-Z2-9]{4}$
+    let code = "KRAT-9XZ7".to_owned();
+    sqlx::query(
+        "INSERT INTO worker_registration_requests \
+         (id, agent_instance_id, display_name, public_key, protocol_version, capabilities, \
+          confirmation_code, expires_at, project_id) \
+         VALUES ($1, $2, 'Enrolling machine', $3, '1.3', $4, $5, now() + interval '1 hour', $6)",
+    )
+    .bind(registration_id)
+    .bind(Uuid::new_v4())
+    .bind(vec![7_u8; 32])
+    .bind(worker_capabilities())
+    .bind(&code)
+    .bind(DEFAULT_PROJECT_ID)
+    .execute(pool)
+    .await
+    .unwrap();
+    (registration_id, code)
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_outsider_cannot_see_or_decide_another_projects_enrolment(pool: PgPool) {
+    // Enrolment was the one resource this suite never covered, which is why it kept its holes
+    // after the others were closed. It is also the worst one to leave open: `confirmation_code`
+    // identifies a physical machine, and approving is not neutral -- the claim path makes the
+    // approver the worker's owner. An unscoped decision is therefore a way to take somebody
+    // else's machine, and rejecting is a way to deny their enrolment.
+    let (founder_router, _founder_id) = found(&pool).await;
+    let (registration_id, code) = seed_pending_enrolment(&pool).await;
+
+    // The founder, who owns the project the machine radioed in for, sees it.
+    let (status, body) = get(
+        &founder_router,
+        "/api/v1/operator/worker-registration-requests",
+        "founder-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(body[0]["confirmation_code"], json!(code));
+
+    // An identity with no membership at all.
+    sqlx::query(
+        "INSERT INTO human_identities \
+         (id, provider, provider_subject, display_name, email, role) \
+         VALUES ($1, 'identity-platform', 'outsider', 'Outsider', 'outsider@example.com', \
+                 'operator')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outsider = router_for(
+        &pool,
+        "outsider",
+        "outsider@example.com",
+        "outsider-token",
+        false,
+    );
+
+    let (status, body) = get(
+        &outsider,
+        "/api/v1/operator/worker-registration-requests",
+        "outsider-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!([]),
+        "an outsider must not see another project's enrolling machine, least of all its \
+         confirmation code: {body}"
+    );
+
+    // And must not be able to take it. Indistinguishable from a request that does not exist.
+    let (status, _) = post(
+        &outsider,
+        &format!("/api/v1/operator/worker-registration-requests/{registration_id}/approve"),
+        "outsider-token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "approving another project's enrolment would make the approver its owner"
+    );
+
+    let (status, _) = post(
+        &outsider,
+        &format!("/api/v1/operator/worker-registration-requests/{registration_id}/reject"),
+        "outsider-token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "nor deny somebody else's machine its enrolment"
+    );
+
+    // The request is untouched, so the founder can still approve it.
+    let (approved, rejected): (Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+        "SELECT approved_at, rejected_at FROM worker_registration_requests WHERE id = $1",
+    )
+    .bind(registration_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(approved.is_none() && rejected.is_none());
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn a_non_member_cannot_tell_an_existing_resource_from_an_invented_one(pool: PgPool) {
     let (_founder_router, founder_id) = found(&pool).await;
