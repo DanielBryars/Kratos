@@ -15,13 +15,16 @@
 //! fixed: the ledger is append-only, so an entry recorded under one meaning of "unit" can never be
 //! rewritten under another.
 //!
-//! Writing needs an active row in `project_credit_managers` *and* an active operator membership
-//! of the same project. Nothing grants the manager row yet: who should hold it is still an open
-//! product decision, so every project starts with nobody able to write.
+//! **Any active member of a project may write its ledger** (Daniel, 2026-09-30): an unrevoked
+//! membership and an enabled operator identity, rechecked under locks at write time. This is an
+//! interim policy, chosen for simplicity while there is one operator and nothing is enforced. Its
+//! cost is explicit: inviting somebody to a project lets them grant it credit. ADR-020's manager
+//! design is the way back to a narrower rule; `project_credit_managers` is kept, empty, for it.
 //!
-//! Lock order for a write is identity, project, manager, account. Identity before project is the
-//! order membership changes already take them in -- the caller's identity during authorisation,
-//! then the project -- avoiding that lock inversion. Nothing here locks a job or a worker.
+//! Lock order for a write is identity, project, account, with membership read under the project
+//! lock. Identity before project is the order membership changes already take them in -- the
+//! caller's identity during authorisation, then the project -- avoiding that lock inversion.
+//! Nothing here locks a job or a worker.
 
 use axum::{
     Json,
@@ -52,15 +55,13 @@ const DEFAULT_PAGE_SIZE: usize = 25;
 const MAX_PAGE_SIZE: usize = 100;
 const MAX_REASON_CHARS: usize = 500;
 
-/// Whether `identity` may write `project`'s ledger right now: an active manager row, an active
-/// membership of the same project, and an enabled operator identity. The read path's answer.
-const ACTIVE_MANAGER: &str = "SELECT EXISTS ( \
-     SELECT 1 FROM project_credit_managers m \
-     JOIN project_memberships pm \
-       ON pm.project_id = m.project_id AND pm.identity_id = m.identity_id \
-     JOIN human_identities i ON i.id = m.identity_id \
-     WHERE m.project_id = $1 AND m.identity_id = $2 AND m.revoked_at IS NULL \
-       AND pm.revoked_at IS NULL AND i.role = 'operator' AND i.disabled_at IS NULL)";
+/// Whether `identity` may write `project`'s ledger right now: an active membership of it and an
+/// enabled operator identity. The read path's answer, and the same rule the write rechecks.
+const ACTIVE_WRITER: &str = "SELECT EXISTS ( \
+     SELECT 1 FROM project_memberships pm \
+     JOIN human_identities i ON i.id = pm.identity_id \
+     WHERE pm.project_id = $1 AND pm.identity_id = $2 AND pm.revoked_at IS NULL \
+       AND i.role = 'operator' AND i.disabled_at IS NULL)";
 
 /// The identity half of the write-time rule, holding the row until commit so it cannot be disabled
 /// between this check and the entry. `FOR SHARE` because disabling is a non-key update, which
@@ -68,15 +69,11 @@ const ACTIVE_MANAGER: &str = "SELECT EXISTS ( \
 const LOCK_ACTIVE_IDENTITY: &str = "SELECT id FROM human_identities \
      WHERE id = $1 AND role = 'operator' AND disabled_at IS NULL FOR SHARE";
 
-/// The rest of the write-time rule, holding the manager row until commit so it cannot be revoked
-/// between this check and the entry. Membership is held by the project lock taken before it, which
-/// membership removal needs `FOR UPDATE`.
-const LOCK_ACTIVE_MANAGER: &str = "SELECT m.identity_id FROM project_credit_managers m \
-     JOIN project_memberships pm \
-       ON pm.project_id = m.project_id AND pm.identity_id = m.identity_id \
-     WHERE m.project_id = $1 AND m.identity_id = $2 AND m.revoked_at IS NULL \
-       AND pm.revoked_at IS NULL \
-     FOR SHARE OF m";
+/// The membership half of the write-time rule. It needs no row lock of its own: the project lock
+/// taken before it conflicts with the `FOR UPDATE` that membership removal takes, so the answer
+/// cannot change before commit.
+const ACTIVE_MEMBERSHIP: &str = "SELECT identity_id FROM project_memberships \
+     WHERE project_id = $1 AND identity_id = $2 AND revoked_at IS NULL";
 
 const ENTRY_COLUMNS: &str = "id, sequence, kind, amount_units, balance_after_units, reason, \
      actor_identity_id, reverses_entry_id, occurred_at";
@@ -131,11 +128,11 @@ impl CreditsError {
         )
     }
 
-    const fn manager_required() -> Self {
+    const fn writer_required() -> Self {
         Self::refused(
             StatusCode::FORBIDDEN,
-            "credit_manager_required",
-            "Only a credit manager of this project may change its credit.",
+            "project_membership_required",
+            "Only an active member of this project may change its credit.",
         )
     }
 
@@ -523,7 +520,7 @@ async fn read_credits(
         .execute(&mut *transaction)
         .await
         .map_err(|_| CreditsError::internal())?;
-    let can_manage: bool = sqlx::query_scalar(ACTIVE_MANAGER)
+    let can_manage: bool = sqlx::query_scalar(ACTIVE_WRITER)
         .bind(project_id)
         .bind(identity_id)
         .fetch_one(&mut *transaction)
@@ -596,7 +593,7 @@ async fn read_credits(
         (status = 200, description = "Identical replay; the entry the key first created", body = CreditEntryResponse),
         (status = 201, description = "Entry appended", body = CreditEntryResponse),
         (status = 401, description = "Identity token missing or invalid", body = ErrorResponse),
-        (status = 403, description = "Not an active credit manager and operator member of the project", body = ErrorResponse),
+        (status = 403, description = "Not an active operator member of the project", body = ErrorResponse),
         (status = 404, description = "Reversal target is not an entry of this project", body = ErrorResponse),
         (status = 409, description = "Key reused for a different request, several projects, balance below zero or beyond its maximum, or target already reversed or not reversible", body = ErrorResponse),
         (status = 422, description = "Invalid body or Idempotency-Key", body = ErrorResponse),
@@ -635,7 +632,7 @@ async fn record_entry(
         .begin()
         .await
         .map_err(|_| CreditsError::internal())?;
-    lock_manager(&mut transaction, identity_id, project_id).await?;
+    lock_writer(&mut transaction, identity_id, project_id).await?;
     let balance = lock_account(&mut transaction, project_id).await?;
 
     let previous = sqlx::query_as::<_, EntryRecord>(&format!(
@@ -716,7 +713,7 @@ async fn record_entry(
 /// `FOR KEY SHARE` on the project conflicts with the `FOR UPDATE` membership removal takes, so the
 /// membership read after it cannot change before commit. It is the weakest project lock that does,
 /// and does not queue behind the scheduler's `FOR NO KEY UPDATE`.
-async fn lock_manager(
+async fn lock_writer(
     transaction: &mut Transaction<'_, Postgres>,
     identity_id: Uuid,
     project_id: Uuid,
@@ -726,20 +723,20 @@ async fn lock_manager(
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| CreditsError::internal())?
-        .ok_or_else(CreditsError::manager_required)?;
+        .ok_or_else(CreditsError::writer_required)?;
     sqlx::query_scalar::<_, Uuid>("SELECT id FROM projects WHERE id = $1 FOR KEY SHARE")
         .bind(project_id)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| CreditsError::internal())?
-        .ok_or_else(CreditsError::manager_required)?;
-    sqlx::query_scalar::<_, Uuid>(LOCK_ACTIVE_MANAGER)
+        .ok_or_else(CreditsError::writer_required)?;
+    sqlx::query_scalar::<_, Uuid>(ACTIVE_MEMBERSHIP)
         .bind(project_id)
         .bind(identity_id)
         .fetch_optional(&mut **transaction)
         .await
         .map_err(|_| CreditsError::internal())?
-        .ok_or_else(CreditsError::manager_required)?;
+        .ok_or_else(CreditsError::writer_required)?;
     Ok(())
 }
 

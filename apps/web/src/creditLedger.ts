@@ -85,3 +85,30 @@ export function creditHistoryUrl(before: string | null): string {
   if (before !== null && !positive(before)) throw new Error("Invalid credit history cursor.");
   return `/api/v1/operator/credits?limit=25${before === null ? "" : `&before_sequence=${before}`}`;
 }
+
+/** The largest balance the ledger can hold, in pence: `i64::MAX`. */
+const MAX_PENCE = 9223372036854775807n;
+
+/**
+ * "12", "12.5" or "12.50" pounds as a canonical pence string ("1250"), or null if it is not a
+ * positive amount of whole pence. Parsed as text, never as a number, so "0.1" is exactly 10 pence
+ * and a large figure is not rounded on its way to the ledger.
+ */
+export function poundsToPence(text: string): string | null {
+  const match = /^([0-9]+)(?:\.([0-9]{1,2}))?$/.exec(text.trim().replace(/,/g, ""));
+  if (!match) return null;
+  const pence = BigInt(match[1]) * 100n + BigInt((match[2] ?? "").padEnd(2, "0") || "0");
+  if (pence <= 0n || pence > MAX_PENCE) return null;
+  return pence.toString();
+}
+
+export type CreditGrantRequest = { kind: "grant"; amount_units: string; reason: string };
+
+/** A grant of `pence`, or null when the reason is empty or longer than the ledger accepts. */
+export function creditGrantRequest(pence: string, reason: string): CreditGrantRequest | null {
+  const trimmed = reason.trim();
+  if (!/^[1-9][0-9]*$/.test(pence) || trimmed.length === 0 || [...trimmed].length > 500) return null;
+  return { kind: "grant", amount_units: pence, reason: trimmed };
+}
+
+export const CREDIT_ENTRIES_URL = "/api/v1/operator/credits/entries";
