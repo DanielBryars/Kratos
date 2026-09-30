@@ -371,6 +371,8 @@ async fn ledger_records_grants_adjustments_and_reversals(pool: PgPool) {
         body,
         json!({
             "project_id": DEFAULT_PROJECT_ID,
+            "currency": "GBP",
+            "minor_unit_exponent": 2,
             "balance_units": "0",
             "account_exists": false,
             "enforcement": "not_enforced",

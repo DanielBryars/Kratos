@@ -9,6 +9,12 @@
 //! Amounts cross the API as canonical decimal strings, never JSON numbers, so a browser cannot
 //! round a large balance through a double.
 //!
+//! **A unit is one penny of pounds sterling** (ADR-021). Every `*_units` value is an integer count
+//! of pence, and the account response says so in `currency` and `minor_unit_exponent` so that no
+//! client has to know it. The unit was fixed before the first entry was written, and has to stay
+//! fixed: the ledger is append-only, so an entry recorded under one meaning of "unit" can never be
+//! rewritten under another.
+//!
 //! Writing needs an active row in `project_credit_managers` *and* an active operator membership
 //! of the same project. Nothing grants the manager row yet: who should hold it is still an open
 //! product decision, so every project starts with nobody able to write.
@@ -225,6 +231,17 @@ impl CreditEntryKind {
     }
 }
 
+/// The currency every amount in the ledger is denominated in. One, fixed, and stated in the response
+/// rather than assumed by clients.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub(crate) enum CreditCurrency {
+    #[serde(rename = "GBP")]
+    Gbp,
+}
+
+/// Pence per pound as a power of ten, as ISO 4217 states it: 2.
+const GBP_MINOR_UNIT_EXPONENT: u8 = 2;
+
 /// Always `not_enforced` for now: the balance is recorded, and nothing is refused because of it.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -236,8 +253,9 @@ pub(crate) enum CreditEnforcement {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateCreditEntryRequest {
     kind: CreditEntryKind,
-    /// Canonical decimal integer. Required for a grant (positive) and an adjustment (non-zero);
-    /// must be absent for a reversal, whose amount is the exact negation of its target's.
+    /// Canonical decimal integer of **pence**. Required for a grant (positive) and an adjustment
+    /// (non-zero); must be absent for a reversal, whose amount is the exact negation of its
+    /// target's.
     #[schema(value_type = Option<String>, example = "1000", pattern = "^-?(0|[1-9][0-9]*)$")]
     amount_units: Option<String>,
     /// 1 to 500 characters once surrounding whitespace is trimmed.
@@ -266,6 +284,12 @@ pub(crate) struct CreditEntryResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CreditAccountResponse {
     project_id: Uuid,
+    /// The currency of every amount here. Always `GBP`.
+    currency: CreditCurrency,
+    /// The power of ten dividing `*_units` into the currency's major unit: 2, so units are pence.
+    #[schema(example = 2)]
+    minor_unit_exponent: u8,
+    /// Pence, as a canonical decimal string.
     #[schema(value_type = String, example = "0")]
     balance_units: String,
     /// False until the first entry; the balance of a project without an account is zero.
@@ -542,6 +566,8 @@ async fn read_credits(
         .collect::<Result<_, _>>()?;
     Ok(CreditAccountResponse {
         project_id,
+        currency: CreditCurrency::Gbp,
+        minor_unit_exponent: GBP_MINOR_UNIT_EXPONENT,
         balance_units: balance.unwrap_or(0).to_string(),
         account_exists: balance.is_some(),
         enforcement: CreditEnforcement::NotEnforced,
