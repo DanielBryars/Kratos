@@ -84,6 +84,11 @@ struct CanonicalJobRequest<'a> {
     earliest_start_at: Option<String>,
     output_requirements: Vec<CanonicalOutput<'a>>,
     dataset_inputs: Vec<CanonicalDatasetInput<'a>>,
+    /// Omitted when there are none, so a request without parameters hashes exactly as it did
+    /// before parameters existed: a retry spanning that deploy is still recognised as the same
+    /// request. `serde_json`'s map is ordered by key, so key order in the request never matters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -119,6 +124,7 @@ pub(super) fn fingerprint(request: &CreateJobRequest) -> Result<String, Operator
         earliest_start_at,
         output_requirements,
         dataset_inputs,
+        parameters: _,
     } = request;
     let mut outputs: Vec<CanonicalOutput<'_>> = output_requirements
         .iter()
@@ -165,6 +171,8 @@ pub(super) fn fingerprint(request: &CreateJobRequest) -> Result<String, Operator
             .map(|time| time.to_rfc3339_opts(SecondsFormat::Nanos, true)),
         output_requirements: outputs,
         dataset_inputs: inputs,
+        // Read through the normalisation, so `{}` and an omitted object are the same request.
+        parameters: request.effective_parameters(),
     };
     let bytes = serde_json::to_vec(&canonical).map_err(|_| OperatorError::internal())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))

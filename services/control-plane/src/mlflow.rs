@@ -279,6 +279,16 @@ impl MlflowClient {
                 &serde_json::to_string(&stream.dataset_lineage).unwrap_or_else(|_| "[]".to_owned()),
             ));
         }
+        // The parameters as the job was submitted, recorded by the control plane at run creation
+        // rather than by the workload. Part of the same request that creates the run, so a run
+        // can never exist without them -- a separate call would reopen the window in which a
+        // created run is orphaned by a failure before its id is stored.
+        if let Some(parameters) = &stream.parameters {
+            tags.push(tag(
+                "kratos.parameters",
+                &serde_json::to_string(parameters).unwrap_or_else(|_| "{}".to_owned()),
+            ));
+        }
         let body = json!({
             "experiment_id": experiment_id,
             "start_time": started_at.timestamp_millis(),
@@ -340,6 +350,7 @@ struct StreamRecord {
     job_id: Uuid,
     worker_id: Uuid,
     dataset_lineage: Value,
+    parameters: Option<Value>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -360,8 +371,8 @@ struct PendingObservation {
 /// because one unreachable tracking server must not stop the others or the caller's loop.
 pub async fn project_once(pool: &PgPool, client: &MlflowClient, experiment_id: &str) -> u64 {
     let streams = match sqlx::query_as::<_, StreamRecord>(
-        "SELECT s.id, s.attempt_id, s.job_id, s.worker_id, s.dataset_lineage \
-         FROM observation_streams s \
+        "SELECT s.id, s.attempt_id, s.job_id, s.worker_id, s.dataset_lineage, j.parameters \
+         FROM observation_streams s JOIN jobs j ON j.id = s.job_id \
          WHERE EXISTS ( \
              SELECT 1 FROM observations o \
              WHERE o.stream_id = s.id AND o.mlflow_applied_at IS NULL \

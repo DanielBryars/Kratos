@@ -224,6 +224,7 @@ fn meaningful_changes(dataset_version_id: Uuid) -> Vec<(&'static str, Value)> {
             "dataset_inputs",
             json!([{ "alias": "other_data", "dataset_version_id": dataset_version_id }]),
         ),
+        ("parameters", json!({ "learning_rate": 0.001 })),
     ]
 }
 
@@ -242,7 +243,11 @@ async fn submit(router: &Router, token: &str, keys: &[&str], body: &Value) -> (S
         .unwrap();
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap())
+    // axum answers a wrongly typed field itself, with a 422 and a plain-text body.
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn count(pool: &PgPool, query: &str) -> i64 {
@@ -782,4 +787,92 @@ async fn submissions_without_a_key_are_never_deduplicated(pool: PgPool) {
         2
     );
     assert_eq!(queued_audit_events(&pool).await, 2);
+}
+
+#[test]
+fn a_request_without_parameters_fingerprints_exactly_as_it_did_before_they_existed() {
+    // Computed by `main` at 4560697, before parameters were added. A request that does not use
+    // them must hash identically, or a retry spanning the deploy would be refused as a different
+    // request.
+    let body = json!({
+        "name": "Golden",
+        "image_reference": image('a'),
+        "timeout_seconds": 600,
+        "earliest_start_at": "2099-10-01T09:30:00Z",
+        "output_requirements": outputs(),
+        "dataset_inputs": [{ "alias": "training_data", "dataset_version_id": "6c1f1d2e-3a4b-4c5d-8e6f-7a8b9c0d1e2f" }]
+    });
+    let golden = "171abb0ebb6946957a4379541e3b2de367638417ad8d965cc6cfdcbb4bbd364b";
+    assert_eq!(fingerprint(&request(body.clone())).unwrap(), golden);
+
+    // An empty object is no parameters at all, in the fingerprint as everywhere else.
+    let mut empty = body;
+    empty["parameters"] = json!({});
+    assert_eq!(fingerprint(&request(empty)).unwrap(), golden);
+}
+
+#[test]
+fn parameter_order_is_not_part_of_the_request_but_values_are() {
+    let mut first = simple_body();
+    first["parameters"] = json!({ "epochs": 12, "learning_rate": 0.0003, "model": "smolvla" });
+    let mut reordered = simple_body();
+    reordered["parameters"] = json!({ "model": "smolvla", "learning_rate": 0.0003, "epochs": 12 });
+    assert_eq!(
+        fingerprint(&request(first.clone())).unwrap(),
+        fingerprint(&request(reordered)).unwrap()
+    );
+    let mut changed = first.clone();
+    changed["parameters"]["epochs"] = json!(13);
+    assert_ne!(
+        fingerprint(&request(first)).unwrap(),
+        fingerprint(&request(changed)).unwrap()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn parameters_and_long_runtimes_are_validated_stored_and_returned(pool: PgPool) {
+    insert_operator(&pool, "operator", DEFAULT_PROJECT_ID).await;
+    let router = router(&pool, "operator");
+
+    let mut valid = simple_body();
+    valid["timeout_seconds"] = json!(86_400);
+    valid["parameters"] =
+        json!({ "learning_rate": 0.0003, "epochs": 12, "model.name": "smolvla", "_amp": true });
+    let (status, body) = submit(&router, TOKEN, &[], &valid).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["timeout_seconds"], 86_400);
+    assert_eq!(body["parameters"], valid["parameters"]);
+
+    // A job without parameters says nothing about them.
+    let (status, body) = submit(&router, TOKEN, &[], &simple_body()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(body.get("parameters").is_none(), "{body}");
+
+    let too_many: serde_json::Map<String, Value> = (0..65)
+        .map(|index| (format!("p{index}"), json!(index)))
+        .collect();
+    let mut invalid: Vec<(&str, Value)> = vec![
+        ("timeout_seconds", json!(86_401)),
+        ("timeout_seconds", json!(29)),
+        ("parameters", json!({ "nested": { "a": 1 } })),
+        ("parameters", json!({ "list": [1, 2] })),
+        ("parameters", json!({ "nothing": null })),
+        ("parameters", json!({ "1starts_with_digit": 1 })),
+        ("parameters", json!({ "has space": 1 })),
+        ("parameters", json!({ "x".repeat(65): 1 })),
+        ("parameters", Value::Object(too_many)),
+        ("parameters", json!({ "big": "x".repeat(4_100) })),
+        ("parameters", json!([1, 2])),
+    ];
+    for (field, value) in invalid.drain(..) {
+        let mut body = simple_body();
+        body[field] = value.clone();
+        let (status, _) = submit(&router, TOKEN, &[], &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field} = {value}"
+        );
+    }
+    assert_eq!(count(&pool, "SELECT count(*) FROM jobs").await, 2);
 }

@@ -68,12 +68,17 @@ pub(super) async fn select_queued_job(
     } else {
         current_minor
     };
+    // Protocol 1.4 carries parameters and lifts the agent's one-hour runtime bound. A 1.3 agent
+    // rejects an assignment over an hour outright, and would silently run a parameterised job
+    // without its parameters, so either one requires 1.4.
+    //
     // Current single-GPU protocol features are cumulative. Derive the requirement once for
     // both this worker and peer eligibility. If placement gains non-cumulative constraints,
     // replace the ceiling with exact worker/job compatibility; do not extend it by guessing.
     let queued = sqlx::query_as::<_, (Uuid, String, String, i32, i32)>(
         "SELECT j.id, j.name, j.image_reference, j.timeout_seconds, r.required_minor \
          FROM jobs j CROSS JOIN LATERAL (SELECT CASE \
+             WHEN j.parameters IS NOT NULL OR j.timeout_seconds > 3600 THEN 4 \
              WHEN EXISTS (SELECT 1 FROM job_dataset_inputs i WHERE i.job_id = j.id) THEN 3 \
              WHEN EXISTS (SELECT 1 FROM job_output_requirements o WHERE o.job_id = j.id) THEN 1 \
              ELSE 0 END AS required_minor) r \
