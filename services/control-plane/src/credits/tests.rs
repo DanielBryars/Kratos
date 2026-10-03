@@ -193,34 +193,6 @@ async fn join(pool: &PgPool, identity_id: Uuid, project_id: Uuid) {
         .unwrap();
 }
 
-/// A fixture only: nothing in the product grants this yet.
-async fn make_manager(pool: &PgPool, project_id: Uuid, identity_id: Uuid) {
-    sqlx::query("INSERT INTO project_credit_managers (project_id, identity_id) VALUES ($1, $2)")
-        .bind(project_id)
-        .bind(identity_id)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
-async fn manager(pool: &PgPool, subject: &str, project_id: Uuid) -> Uuid {
-    let identity_id = member(pool, subject, project_id).await;
-    make_manager(pool, project_id, identity_id).await;
-    identity_id
-}
-
-async fn revoke_manager(pool: &PgPool, project_id: Uuid, identity_id: Uuid) {
-    sqlx::query(
-        "UPDATE project_credit_managers SET revoked_at = now() \
-         WHERE project_id = $1 AND identity_id = $2",
-    )
-    .bind(project_id)
-    .bind(identity_id)
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
 async fn revoke_membership(pool: &PgPool, project_id: Uuid, identity_id: Uuid) {
     sqlx::query(
         "UPDATE project_memberships SET revoked_at = now(), revoked_by_identity_id = $2 \
@@ -362,7 +334,7 @@ fn units_are_parsed_only_in_canonical_form() {
 #[sqlx::test(migrations = "./migrations")]
 #[allow(clippy::too_many_lines)]
 async fn ledger_records_grants_adjustments_and_reversals(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
 
     let (status, body) = read(&router, "owner", "").await;
@@ -440,7 +412,7 @@ async fn ledger_records_grants_adjustments_and_reversals(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn amounts_stay_exact_to_the_limit_of_i64_and_never_overdraw(pool: PgPool) {
-    manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
 
     let (status, body) = submit(&router, "owner", &grant(I64_MAX)).await;
@@ -482,7 +454,7 @@ async fn amounts_stay_exact_to_the_limit_of_i64_and_never_overdraw(pool: PgPool)
 #[sqlx::test(migrations = "./migrations")]
 #[allow(clippy::too_many_lines)]
 async fn invalid_requests_are_rejected_without_creating_anything(pool: PgPool) {
-    manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
     let id = Uuid::new_v4();
 
@@ -600,43 +572,26 @@ async fn requests_are_authenticated_before_they_are_examined(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-#[allow(clippy::too_many_lines)]
-async fn only_active_managers_who_are_active_operator_members_may_write(pool: PgPool) {
+async fn any_active_operator_member_may_write_and_nobody_else(pool: PgPool) {
+    // The interim rule (2026-09-30): membership is the authority. What it must still refuse is
+    // everybody who is not an active, enabled operator member of *this* project.
     let router = router(&pool);
 
-    // A member, but nothing made them a manager: nobody is one by default.
-    member(&pool, "member", DEFAULT_PROJECT_ID).await;
-    let (status, body) = read(&router, "member", "").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["can_manage"], false);
-    let (status, body) = submit(&router, "member", &grant("5")).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "credit_manager_required");
-
-    // A manager whose manager row was revoked.
-    let revoked = manager(&pool, "revoked", DEFAULT_PROJECT_ID).await;
-    assert_eq!(read(&router, "revoked", "").await.1["can_manage"], true);
-    revoke_manager(&pool, DEFAULT_PROJECT_ID, revoked).await;
-    assert_eq!(read(&router, "revoked", "").await.1["can_manage"], false);
-    let (status, body) = submit(&router, "revoked", &grant("5")).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "credit_manager_required");
-
-    // Managing another project, whose membership has since ended, confers nothing here.
+    // A member of another project only.
     let other = second_project(&pool).await;
-    let elsewhere = member(&pool, "elsewhere", DEFAULT_PROJECT_ID).await;
-    join(&pool, elsewhere, other).await;
-    make_manager(&pool, other, elsewhere).await;
-    revoke_membership(&pool, other, elsewhere).await;
-    let (status, body) = read(&router, "elsewhere", "").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["project_id"], DEFAULT_PROJECT_ID.to_string());
-    assert_eq!(body["can_manage"], false);
-    let (status, _) = submit(&router, "elsewhere", &grant("5")).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let outsider = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO human_identities (id, provider, provider_subject, display_name, role) \
+         VALUES ($1, 'identity-platform', 'outsider', 'outsider', 'operator')",
+    )
+    .bind(outsider)
+    .execute(&pool)
+    .await
+    .unwrap();
+    join(&pool, outsider, other).await;
 
-    // A manager row outliving the membership it depends on.
-    let former = manager(&pool, "former", DEFAULT_PROJECT_ID).await;
+    // A member whose membership has been revoked.
+    let former = member(&pool, "former", DEFAULT_PROJECT_ID).await;
     revoke_membership(&pool, DEFAULT_PROJECT_ID, former).await;
     let (status, _) = read(&router, "former", "").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -644,45 +599,50 @@ async fn only_active_managers_who_are_active_operator_members_may_write(pool: Pg
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // A disabled identity.
-    let disabled = manager(&pool, "disabled", DEFAULT_PROJECT_ID).await;
+    let disabled = member(&pool, "disabled", DEFAULT_PROJECT_ID).await;
     sqlx::query("UPDATE human_identities SET disabled_at = now() WHERE id = $1")
         .bind(disabled)
         .execute(&pool)
         .await
         .unwrap();
-    let (status, _) = read(&router, "disabled", "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = submit(&router, "disabled", &grant("5")).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // The write's own recheck refuses each of them even past authentication.
-    for (identity, project_id) in [
-        (revoked, DEFAULT_PROJECT_ID),
-        (former, DEFAULT_PROJECT_ID),
-        (disabled, DEFAULT_PROJECT_ID),
-        (elsewhere, other),
-    ] {
-        let error = record(&pool, identity, project_id, grant("5"))
+    // A membership held by an identity that is not an operator.
+    let plain = member(&pool, "plain", DEFAULT_PROJECT_ID).await;
+    sqlx::query("UPDATE human_identities SET role = 'member' WHERE id = $1")
+        .bind(plain)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The write's own recheck refuses each of them even past authentication, including the
+    // outsider aiming at a project they do not belong to.
+    for identity in [outsider, former, disabled, plain] {
+        let error = record(&pool, identity, DEFAULT_PROJECT_ID, grant("5"))
             .await
             .unwrap_err();
-        assert_eq!(error.code(), Some("credit_manager_required"));
+        assert_eq!(error.code(), Some("project_membership_required"));
     }
-
     assert_eq!(accounts(&pool).await, 0);
     assert_eq!(entries(&pool).await, 0);
     assert_eq!(audits(&pool).await, 0);
 
-    // The same request from an active manager succeeds, so the refusals were about the caller.
-    manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
-    let (status, _) = submit(&router, "owner", &grant("5")).await;
+    // Any ordinary member may write, with no further grant of authority, and is told so.
+    member(&pool, "member", DEFAULT_PROJECT_ID).await;
+    let (status, body) = read(&router, "member", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["can_manage"], true);
+    let (status, _) = submit(&router, "member", &grant("5")).await;
     assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(reconciled_balance(&pool, DEFAULT_PROJECT_ID).await, 5);
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn ledgers_are_isolated_between_projects(pool: PgPool) {
     let other = second_project(&pool).await;
-    manager(&pool, "alpha", DEFAULT_PROJECT_ID).await;
-    let beta = manager(&pool, "beta", other).await;
+    member(&pool, "alpha", DEFAULT_PROJECT_ID).await;
+    let beta = member(&pool, "beta", other).await;
     let router = router(&pool);
     let key = fresh_key();
 
@@ -730,8 +690,8 @@ async fn ledgers_are_isolated_between_projects(pool: PgPool) {
 #[sqlx::test(migrations = "./migrations")]
 #[allow(clippy::too_many_lines)]
 async fn a_retry_returns_the_original_entry_and_writes_nothing(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
-    manager(&pool, "co-owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    member(&pool, "co-owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
     let key = fresh_key();
     let top_up = json!({"kind": "grant", "amount_units": "100", "reason": "Top up"});
@@ -781,16 +741,15 @@ async fn a_retry_returns_the_original_entry_and_writes_nothing(pool: PgPool) {
     assert_eq!(audits(&pool).await, 3);
 
     // A replay is authorised afresh: losing the right to write also loses the replay.
-    revoke_manager(&pool, DEFAULT_PROJECT_ID, owner).await;
-    let (status, body) = post_keyed(&router, "owner", &key, &top_up).await;
+    revoke_membership(&pool, DEFAULT_PROJECT_ID, owner).await;
+    let (status, _) = post_keyed(&router, "owner", &key, &top_up).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["code"], "credit_manager_required");
     assert_eq!(reconciled_balance(&pool, DEFAULT_PROJECT_ID).await, 100);
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn a_refused_write_leaves_no_trace_and_frees_its_key(pool: PgPool) {
-    manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
     let key = fresh_key();
 
@@ -822,7 +781,7 @@ async fn a_refused_write_leaves_no_trace_and_frees_its_key(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn an_entry_is_reversed_at_most_once_and_reversals_are_final(pool: PgPool) {
-    manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
 
     let (_, granted) = submit(&router, "owner", &grant("40")).await;
@@ -884,7 +843,7 @@ async fn forge_entry(
 #[sqlx::test(migrations = "./migrations")]
 #[allow(clippy::too_many_lines)]
 async fn the_database_keeps_the_ledger_append_only_and_reconciled(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let (_, granted) = record(&pool, owner, DEFAULT_PROJECT_ID, grant("60"))
         .await
         .unwrap();
@@ -947,14 +906,11 @@ async fn the_database_keeps_the_ledger_append_only_and_reconciled(pool: PgPool) 
 
     assert_eq!(entries(&pool).await, 2);
     assert_eq!(reconciled_balance(&pool, DEFAULT_PROJECT_ID).await, 80);
-
-    // Revoking a manager is an ordinary update, and allowed.
-    revoke_manager(&pool, DEFAULT_PROJECT_ID, owner).await;
 }
 
 #[sqlx::test(migrations = "./migrations")]
 async fn history_pages_newest_first_and_stay_coherent_under_writes(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let router = router(&pool);
     for amount in ["1", "2", "3", "4", "5"] {
         record(&pool, owner, DEFAULT_PROJECT_ID, grant(amount))
@@ -994,7 +950,7 @@ async fn history_pages_newest_first_and_stay_coherent_under_writes(pool: PgPool)
 
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_debits_cannot_overdraw_together(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     record(&pool, owner, DEFAULT_PROJECT_ID, grant("100"))
         .await
         .unwrap();
@@ -1034,7 +990,7 @@ async fn concurrent_debits_cannot_overdraw_together(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn concurrent_retries_write_one_entry_and_one_audit(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     record(&pool, owner, DEFAULT_PROJECT_ID, grant("1"))
         .await
         .unwrap();
@@ -1068,43 +1024,8 @@ async fn concurrent_retries_write_one_entry_and_one_audit(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_write_waits_for_and_obeys_a_concurrent_manager_revocation(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
-
-    // First a revocation that rolls back, after which the write proceeds: that shows the write
-    // really queues on the manager row, which the committed case relies on.
-    for commit in [false, true] {
-        let mut revocation = pool.begin().await.unwrap();
-        sqlx::query(
-            "UPDATE project_credit_managers SET revoked_at = now() \
-             WHERE project_id = $1 AND identity_id = $2",
-        )
-        .bind(DEFAULT_PROJECT_ID)
-        .bind(owner)
-        .execute(&mut *revocation)
-        .await
-        .unwrap();
-        let write = {
-            let pool = pool.clone();
-            tokio::spawn(async move { record(&pool, owner, DEFAULT_PROJECT_ID, grant("5")).await })
-        };
-        wait_for_lock_waiters(&pool, "%FROM project_credit_managers m%", 1).await;
-        if commit {
-            revocation.commit().await.unwrap();
-            let error = write.await.unwrap().unwrap_err();
-            assert_eq!(error.code(), Some("credit_manager_required"));
-        } else {
-            revocation.rollback().await.unwrap();
-            assert_eq!(write.await.unwrap().unwrap().0, StatusCode::CREATED);
-        }
-    }
-    assert_eq!(entries(&pool).await, 1);
-    assert_eq!(reconciled_balance(&pool, DEFAULT_PROJECT_ID).await, 5);
-}
-
-#[sqlx::test(migrations = "./migrations")]
 async fn a_write_waits_for_and_obeys_a_concurrent_membership_removal(pool: PgPool) {
-    let owner = manager(&pool, "owner", DEFAULT_PROJECT_ID).await;
+    let owner = member(&pool, "owner", DEFAULT_PROJECT_ID).await;
     let co_owner = member(&pool, "co-owner", DEFAULT_PROJECT_ID).await;
 
     // Removed the way the membership handler removes someone: under the project row lock.
@@ -1132,7 +1053,7 @@ async fn a_write_waits_for_and_obeys_a_concurrent_membership_removal(pool: PgPoo
     removal.commit().await.unwrap();
 
     let error = write.await.unwrap().unwrap_err();
-    assert_eq!(error.code(), Some("credit_manager_required"));
+    assert_eq!(error.code(), Some("project_membership_required"));
     assert_eq!(accounts(&pool).await, 0);
     assert_eq!(audits(&pool).await, 0);
 }

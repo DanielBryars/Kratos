@@ -1,7 +1,23 @@
 # ADR-020 — Who may move credit, and how they come to hold that authority
 
-**Status:** Proposed
+**Status:** Deferred — superseded for now by an interim rule (see below)
 **Date:** 2026-09-29
+
+## Interim decision (2026-09-30)
+
+Daniel chose the simpler rule for now: **any active operator member of a project may add credit to
+it.** No manager role, no bootstrap, no delegation. The write path checks an unrevoked membership and
+an enabled operator identity, rechecked under locks at commit.
+
+The cost is the one this ADR describes, accepted knowingly: inviting somebody to a project lets them
+grant it credit, and credit is pence sterling ([ADR-021](021-credits-are-pence-sterling.md)). It is
+tolerable today because there is one operator and nothing enforces a balance. It stops being
+tolerable at the first of: a second person invited to a project that holds real credit, or any
+enforcement reading the balance. Either is the trigger to implement the design below, whose
+`project_credit_managers` table is kept, empty, for that purpose.
+
+Decision 4 — revoking a membership revokes credit authority — holds trivially under the interim
+rule, since authority *is* membership.
 
 ## Context
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { creditHistoryUrl, formatCreditUnits, parseCreditAccount } from "./creditLedger.ts";
+import { creditGrantRequest, creditHistoryUrl, formatCreditUnits, parseCreditAccount, poundsToPence } from "./creditLedger.ts";
 
 const entry = {
   id: "entry", sequence: "9007199254740993", kind: "grant",
@@ -57,4 +57,22 @@ test("history cursors cannot become zero, negative, rounded numbers or query inj
     assert.throws(() => creditHistoryUrl(cursor));
     assert.throws(() => parseCreditAccount({ ...account, next_before_sequence: cursor }));
   }
+});
+
+test("pounds typed in become exact pence, and nothing else is accepted", () => {
+  const cases = { "12": "1200", "12.5": "1250", "12.50": "1250", "0.1": "10", "0.01": "1", " 1,500.00 ": "150000",
+    "92233720368547758.07": "9223372036854775807" };
+  for (const [typed, pence] of Object.entries(cases)) assert.equal(poundsToPence(typed), pence, typed);
+  for (const bad of ["", "0", "0.00", "-5", "+5", "1.234", "1e3", ".5", "5.", "£5", "abc", "92233720368547758.08"]) {
+    assert.equal(poundsToPence(bad), null, bad);
+  }
+});
+
+test("a grant needs a reason the ledger will accept", () => {
+  assert.deepEqual(creditGrantRequest("1250", "  Monthly top-up "), { kind: "grant", amount_units: "1250", reason: "Monthly top-up" });
+  assert.equal(creditGrantRequest("1250", "   "), null);
+  assert.equal(creditGrantRequest("1250", "x".repeat(501)), null);
+  assert.notEqual(creditGrantRequest("1250", "x".repeat(500)), null);
+  assert.equal(creditGrantRequest("0", "reason"), null);
+  assert.equal(creditGrantRequest("12.50", "reason"), null);
 });

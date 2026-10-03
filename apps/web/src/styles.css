@@ -323,6 +323,10 @@ select { color: var(--text); background: #151f2c; border-color: var(--line-brigh
 .credit-balance { display: flex; flex-direction: column; gap: .3rem; }
 .credit-balance strong { font-size: 1.25rem; }
 .credit-balance span { color: var(--muted); font-size: .85rem; }
+.credit-add { display: grid; grid-template-columns: minmax(8rem, 12rem) 1fr auto; gap: .75rem; align-items: end; margin: 1rem 0; }
+.credit-add label { display: grid; gap: .3rem; }
+.credit-add .notice, .credit-add [role="status"] { grid-column: 1 / -1; margin: 0; }
+@media (max-width: 640px) { .credit-add { grid-template-columns: 1fr; } }
 .credit-entries { list-style: none; padding: 0; display: grid; gap: .75rem; }
 .credit-entries li { padding: 1rem; border: 1px solid var(--line); border-radius: .75rem; }
 .credit-entries p { overflow-wrap: anywhere; }

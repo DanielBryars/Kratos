@@ -13,7 +13,7 @@ async fn membership_operation_and_credit_write_do_not_invert_identity_project_lo
     let project = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO human_identities (id, provider, provider_subject, display_name, role) \
-         VALUES ($1, 'test', $2, 'Credit manager', 'operator')",
+         VALUES ($1, 'test', $2, 'Credit writer', 'operator')",
     )
     .bind(identity)
     .bind(identity.to_string())
@@ -26,12 +26,6 @@ async fn membership_operation_and_credit_write_do_not_invert_identity_project_lo
         .await
         .unwrap();
     sqlx::query("INSERT INTO project_memberships (project_id, identity_id) VALUES ($1, $2)")
-        .bind(project)
-        .bind(identity)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO project_credit_managers (project_id, identity_id) VALUES ($1, $2)")
         .bind(project)
         .bind(identity)
         .execute(&pool)
@@ -65,8 +59,7 @@ async fn membership_operation_and_credit_write_do_not_invert_identity_project_lo
             let waiting: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
                  WHERE datname = current_database() AND wait_event_type = 'Lock' \
-                   AND (query LIKE 'SELECT id FROM human_identities%' \
-                        OR query LIKE 'SELECT m.identity_id FROM project_credit_managers%'))",
+                   AND query LIKE 'SELECT id FROM human_identities%')",
             )
             .fetch_one(&pool)
             .await
