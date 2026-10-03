@@ -14,7 +14,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, TimeDelta, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use tokio::sync::{Mutex, Semaphore};
@@ -346,6 +346,13 @@ pub struct JobAssignment {
     pub output_requirements: Vec<JobOutputRequirement>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputAssignment>,
+    /// The job's parameters, which the agent delivers to the workload as `KRATOS_PARAMETERS`.
+    /// Omitted when there are none, and only ever sent to a protocol 1.4 worker: the scheduler
+    /// never assigns a parameterised job below 1.4, because an older agent would run it without
+    /// them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -620,8 +627,19 @@ impl TryFrom<AssignmentRecord> for JobAssignment {
             observation_stream_id: record.observation_stream_id,
             output_requirements: Vec::new(),
             dataset_inputs: Vec::new(),
+            parameters: None,
         })
     }
+}
+
+/// The job's parameters, read for every delivery of the assignment -- the first and any replay --
+/// so a re-delivered assignment can never arrive without them.
+async fn load_parameters(pool: &PgPool, job_id: Uuid) -> Result<Option<Value>, ApiError> {
+    sqlx::query_scalar::<_, Option<Value>>("SELECT parameters FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|error| database_error(&error, "load job parameters"))
 }
 
 async fn load_output_requirements(
@@ -1668,6 +1686,7 @@ async fn current_or_assign_job(
         assignment.output_requirements = load_output_requirements(pool, job_id).await?;
         assignment.dataset_inputs =
             crate::dataset_inputs::load_assignment_dataset_inputs(pool, job_id).await?;
+        assignment.parameters = load_parameters(pool, job_id).await?;
         return Ok(Some(assignment));
     }
     if !eligible || worker_status != "idle" {
@@ -1815,6 +1834,7 @@ async fn current_or_assign_job(
             .map(|_| observation_stream_id),
         output_requirements: load_output_requirements(pool, job_id).await?,
         dataset_inputs: crate::dataset_inputs::load_assignment_dataset_inputs(pool, job_id).await?,
+        parameters: load_parameters(pool, job_id).await?,
     }))
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission.ts";
+import { buildJobSubmission, DURABLE_TRAINING_PRESET, parseJobParameters } from "./jobSubmission.ts";
 
 test("pins the durable training preset to an immutable image", () => {
   assert.match(
@@ -98,4 +98,41 @@ test("local datetime input uses the browser timezone in summer and winter", () =
     if (old === undefined) delete process.env.TZ;
     else process.env.TZ = old;
   }
+});
+
+const output = { enabled: false, logicalPath: "", role: "", mediaType: "", maxMiB: 1 };
+
+test("parameters are sent only when there are some", () => {
+  const without = buildJobSubmission("Run", "img@sha256:" + "a".repeat(64), 7200, output);
+  assert.equal("parameters" in without, false);
+  assert.equal(without.timeout_seconds, 7200);
+  assert.equal("parameters" in buildJobSubmission("Run", "img", 60, output, [], "", {}), false);
+  const withParameters = buildJobSubmission("Run", "img", 60, output, [], "", { epochs: 12, lr: 0.0003 });
+  assert.deepEqual(withParameters.parameters, { epochs: 12, lr: 0.0003 });
+});
+
+test("the parameters box accepts what the control plane accepts", () => {
+  assert.deepEqual(parseJobParameters(""), { ok: true, value: null });
+  assert.deepEqual(parseJobParameters("  {}  "), { ok: true, value: null });
+  assert.deepEqual(parseJobParameters('{"learning_rate": 0.0003, "epochs": 12, "model.name": "smolvla", "_amp": true}'),
+    { ok: true, value: { learning_rate: 0.0003, epochs: 12, "model.name": "smolvla", _amp: true } });
+});
+
+test("the parameters box refuses, with a reason, what the control plane would refuse", () => {
+  const tooMany = JSON.stringify(Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`p${i}`, i])));
+  for (const bad of ["{", "[1, 2]", "null", '"text"', '{"nested": {"a": 1}}', '{"list": [1]}', '{"none": null}',
+    '{"1digit": 1}', '{"has space": 1}', JSON.stringify({ ["x".repeat(65)]: 1 }), tooMany,
+    JSON.stringify({ big: "x".repeat(4_100) })]) {
+    const parsed = parseJobParameters(bad);
+    assert.equal(parsed.ok, false, bad.slice(0, 40));
+    assert.ok(parsed.error.length > 0);
+  }
+});
+
+test("a whole number the browser cannot hold exactly is refused rather than rounded", () => {
+  const parsed = parseJobParameters('{"seed": 12345678901234567890}');
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /as a string/);
+  assert.equal(parseJobParameters('{"seed": "12345678901234567890"}').ok, true);
+  assert.equal(parseJobParameters('{"seed": 9007199254740991}').ok, true);
 });

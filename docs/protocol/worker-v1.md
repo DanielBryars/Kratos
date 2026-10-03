@@ -447,3 +447,29 @@ spool after the attempt is terminal, and the control plane SHALL accept late ide
 a stream that already exists. Delivery failures after the result is reported therefore do not
 appear in `observation_counters`; they remain visible in the agent's own logs until a later
 protocol version can update counters after a result.
+
+## Job parameters and longer runtimes (protocol 1.4)
+
+Protocol 1.4 adds two things to an assignment, and the control plane SHALL send either one only to
+a worker whose current heartbeat reports `1.4` or later.
+
+**`timeout_seconds` up to 86,400.** Before 1.4 the bound was 3,600. A 1.3 agent validates the bound
+and forbids unknown or out-of-range fields, so it would reject the whole assignment rather than run a
+longer job; the scheduler therefore treats `timeout_seconds > 3600` as requiring 1.4. The attempt
+lease remains the job's timeout plus 120 seconds from assignment and is not renewed by heartbeats, so
+a worker that is lost during a long job is recovered only when that lease expires.
+
+**`parameters`**, an optional object of named strings, numbers and booleans, at most 64 keys
+matching `[A-Za-z_][A-Za-z0-9_.-]{0,63}` and at most 4 KiB as compact JSON. It is omitted when a job
+has none. The agent SHALL deliver it to the workload as the environment variable
+`KRATOS_PARAMETERS`, holding the object as compact JSON with sorted keys, and SHALL NOT set that
+variable for a job without parameters. An agent below 1.4 does not know the field and would run the
+job without it, so the scheduler treats a parameterised job as requiring 1.4 for that reason too.
+
+Parameters are not secret. The control plane stores them with the job, shows them to project members
+and records them on the job's `MLflow` run as the `kratos.parameters` tag, so they SHALL NOT be used to
+deliver credentials.
+
+The parameters SHALL be included in every delivery of an assignment, including a re-delivery after a
+lost heartbeat response. An agent that restarted mid-attempt receives its assignment from the
+re-delivery path, and an assignment arriving there without its parameters would run the wrong job.

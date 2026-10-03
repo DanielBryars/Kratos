@@ -19,7 +19,14 @@ from pydantic import (
 # 1.2 adds observation streaming. The agent advertises it only when it can collect a job's
 # records and deliver them, because a control plane that allocated a stream for an agent
 # that never sends to it would show a run with telemetry that never arrives.
-PROTOCOL_VERSION = "1.3"
+#
+# 1.4 adds job parameters, delivered to the workload as `KRATOS_PARAMETERS`, and lifts this
+# agent's runtime bound from one hour to 24. The control plane withholds both kinds of job from
+# anything below 1.4: a 1.3 agent rejects an assignment over an hour outright, and would run a
+# parameterised job without its parameters.
+PROTOCOL_VERSION = "1.4"
+# 1.3 receives dataset inputs but not parameters, and runs for at most an hour.
+PROTOCOL_VERSION_WITH_DATASET_INPUTS = "1.3"
 # 1.2 streams observations but cannot receive dataset inputs. The control plane withholds a job
 # with dataset inputs from anything below 1.3, so advertising 1.3 is what makes this agent
 # eligible for one.
@@ -30,6 +37,7 @@ PROTOCOL_VERSION_WITH_OUTPUTS = "1.1"
 # What an agent advertises when it cannot deliver durable outputs. The control plane never
 # assigns a job with output requirements to a 1.0 worker, which is the point.
 PROTOCOL_VERSION_WITHOUT_OUTPUTS = "1.0"
+MAX_JOB_TIMEOUT_SECONDS = 86_400
 MAX_OUTPUT_FILES = 100
 MAX_OUTPUT_FILE_BYTES = 5 * 1024**3
 MAX_OUTPUT_TOTAL_BYTES = 10 * 1024**3
@@ -304,7 +312,8 @@ class JobAssignment(StrictModel):
     name: str = Field(min_length=1, max_length=120)
     image_reference: str = Field(pattern=r"^[^\s@]+@sha256:[0-9a-f]{64}$")
     gpu_index: int = Field(ge=0)
-    timeout_seconds: int = Field(ge=30, le=3600)
+    # Exactly the control plane's bound, so a job it accepts is never one this agent refuses.
+    timeout_seconds: int = Field(ge=30, le=MAX_JOB_TIMEOUT_SECONDS)
     lease_expires_at: datetime
     output_requirements: tuple[JobOutputRequirement, ...] = Field(
         default=(), max_length=MAX_OUTPUT_FILES
@@ -322,6 +331,10 @@ class JobAssignment(StrictModel):
     dataset_inputs: tuple[DatasetInputAssignment, ...] = Field(
         default=(), max_length=MAX_DATASET_INPUTS
     )
+
+    # Omitted by the server when a job has none, and never sent below 1.4. The control plane has
+    # already validated keys, value types and size; this only has to accept what it sends.
+    parameters: dict[str, bool | int | float | str] | None = None
 
     @model_validator(mode="after")
     def dataset_input_aliases_are_distinct(self) -> "JobAssignment":

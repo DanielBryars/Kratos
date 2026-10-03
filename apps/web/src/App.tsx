@@ -25,7 +25,7 @@ import {
   type Artifact,
   type OutputRequirement,
 } from "./artifactPresentation";
-import { buildJobSubmission, DURABLE_TRAINING_PRESET } from "./jobSubmission";
+import { buildJobSubmission, DURABLE_TRAINING_PRESET, MAX_TIMEOUT_SECONDS, parseJobParameters } from "./jobSubmission";
 import { SubmissionRetry, definitiveSubmissionRejection, type SubmissionAttempt, type SubmissionOutcome } from "./submissionRetry";
 import {
   buildPolicyUpdate,
@@ -97,6 +97,7 @@ type Job = {
   stdout: string | null;
   stderr: string | null;
   failure_message: string | null;
+  parameters?: Record<string, string | number | boolean>;
   output_requirements: OutputRequirement[];
   dataset_inputs: JobDatasetInput[];
   current_attempt: {
@@ -252,6 +253,7 @@ export function App() {
   const [jobName, setJobName] = useState("RTX 5090 matrix check");
   const [jobImage, setJobImage] = useState(DEMO_WORKLOAD_IMAGE);
   const [jobTimeout, setJobTimeout] = useState(120);
+  const [jobParameters, setJobParameters] = useState("");
   const [jobEarliestStart, setJobEarliestStart] = useState("");
   const [jobDatasetAlias, setJobDatasetAlias] = useState("training");
   const [jobDatasetVersionId, setJobDatasetVersionId] = useState("");
@@ -938,6 +940,11 @@ export function App() {
   async function submitJob() {
     if (!user) return;
     let attempt: SubmissionAttempt | null;
+    const parameters = parseJobParameters(jobParameters);
+    if (!parameters.ok) {
+      setMessage(parameters.error);
+      return;
+    }
     try {
       attempt = submissionRetry.current.begin(() => buildJobSubmission(jobName, jobImage, jobTimeout, {
         enabled: durableOutputEnabled,
@@ -949,7 +956,7 @@ export function App() {
         alias: jobDatasetAlias,
         dataset_version_id: jobDatasetVersionId,
         dataset_view_id: jobDatasetViewId || null,
-      }] : [], jobEarliestStart));
+      }] : [], jobEarliestStart, parameters.value));
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Check the job details.");
       return;
@@ -1006,6 +1013,7 @@ export function App() {
     setJobName(DURABLE_TRAINING_PRESET.name);
     setJobImage(DURABLE_TRAINING_PRESET.imageReference);
     setJobTimeout(DURABLE_TRAINING_PRESET.timeoutSeconds);
+    setJobParameters("");
     setDurableOutputPath(DURABLE_TRAINING_PRESET.output.logicalPath);
     setDurableOutputRole(DURABLE_TRAINING_PRESET.output.role);
     setDurableOutputMediaType(DURABLE_TRAINING_PRESET.output.mediaType);
@@ -1214,12 +1222,13 @@ export function App() {
                 <div className="job-form">
                   <label>Job name<input value={jobName} maxLength={120} onChange={(event) => setJobName(event.target.value)} /><small>Make it easy to recognise later.</small></label>
                   <label>Immutable image<input value={jobImage} spellCheck={false} onChange={(event) => setJobImage(event.target.value)} /><small>Public registry image pinned with <code>@sha256</code>.</small></label>
-                  <label>Runtime limit<input type="number" min={30} max={3600} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /><small>30–3,600 seconds.</small></label>
+                  <label>Runtime limit<input type="number" min={30} max={MAX_TIMEOUT_SECONDS} value={jobTimeout} onChange={(event) => setJobTimeout(Number(event.target.value))} /><small>Seconds, from 30 up to 86,400 (24 hours){jobTimeout > 3600 ? ` · ${(jobTimeout / 3600).toFixed(1)} h` : ""}.</small></label>
+                  <label className="job-parameters">Parameters (optional)<textarea rows={3} spellCheck={false} placeholder='{"learning_rate": 0.0003, "epochs": 12}' value={jobParameters} onChange={(event) => setJobParameters(event.target.value)} /><small>{(() => { const parsed = parseJobParameters(jobParameters); return parsed.ok ? <>A flat JSON object, given to the job as <code>KRATOS_PARAMETERS</code>. Not secret: shown here and in MLflow.</> : <span className="job-failure">{parsed.error}</span>; })()}</small></label>
                   <label>Dataset version<select value={jobDatasetVersionId} onChange={(event) => { setJobDatasetVersionId(event.target.value); setJobDatasetViewId(""); }}><option value="">No dataset</option>{datasets.flatMap((dataset) => dataset.versions.filter((version) => version.status === "ready").map((version) => <option key={version.id} value={version.id}>{dataset.name} · v{version.version_number}</option>))}</select><small>Only storage-verified immutable versions are available.</small></label>
                   {selectedJobDatasetVersion && <><label>Curated view<select value={jobDatasetViewId} onChange={(event) => setJobDatasetViewId(event.target.value)}><option value="">Complete version</option>{selectedJobDatasetVersion.version.views.map((view) => <option key={view.id} value={view.id}>{view.name} · {view.included_episode_count} episodes</option>)}</select><small>Choose a published episode set or use every episode.</small></label><label>Mount alias<input value={jobDatasetAlias} maxLength={32} onChange={(event) => setJobDatasetAlias(event.target.value)} /><small>Available inside the container at <code>/kratos/inputs/{jobDatasetAlias || "…"}</code>.</small></label></>}
                 <label>Earliest start (your local time, optional)<input type="datetime-local" value={jobEarliestStart} onChange={(event) => setJobEarliestStart(event.target.value)} /></label>
                 <p>Leave blank to queue immediately. A future time makes the job eligible then; it does not reserve a GPU.</p>
-                  <button className="queue-button" type="button" disabled={jobAction || jobSubmitting || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid} onClick={() => void submitJob()}>{jobSubmitting ? "Submitting…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
+                  <button className="queue-button" type="button" disabled={jobAction || jobSubmitting || !jobName.trim() || !jobImage.trim() || !durableOutputValid || !datasetInputValid || !parseJobParameters(jobParameters).ok} onClick={() => void submitJob()}>{jobSubmitting ? "Submitting…" : <>Queue job <span aria-hidden="true">→</span></>}</button>
                 </div>
                 <div className="output-contract">
                   <div className="output-contract-heading">
@@ -1259,6 +1268,7 @@ export function App() {
                       <p className="job-identity">Run {job.job_id}</p>
                       <p className="job-image">{job.image_reference}</p>
                       <p>1 GPU · {job.timeout_seconds}s limit{job.assigned_worker_id ? ` · worker ${job.assigned_worker_id.slice(0, 8)}` : ""}</p>
+                      {job.parameters && <p className="job-identity">Parameters <code>{JSON.stringify(job.parameters)}</code></p>}
                       {job.dataset_inputs.map((input) => <p className="job-identity" key={input.alias}>Input <strong>{input.alias}</strong>: {input.dataset_name} v{input.version_number}{input.dataset_view_name ? ` · ${input.dataset_view_name}` : " · complete version"} · <code>{input.dataset_manifest_sha256.slice(0, 12)}</code></p>)}
                       <p>{jobTiming(job, schedulingPolicy)}</p>
                       {job.failure_message && <p className="job-failure">{job.failure_message}</p>}
