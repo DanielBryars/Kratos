@@ -36,6 +36,19 @@ IMMUTABLE_IMAGE = re.compile(r"^(?:[^\s@]+@)?sha256:[0-9a-f]{64}$")
 MAX_RESULT_BYTES = 64 * 1024
 MAX_FAILURE_MESSAGE_CHARS = 1_000
 OUTPUT_MOUNT_TARGET = "/kratos/outputs"
+# The job's slice of the machine. THESHED2 is a dedicated 32-thread, ~31 GiB host, so a job gets
+# most of it while the agent, its Docker daemon and the local observability stack keep enough to
+# stay responsive. These are limits rather than reservations: on a smaller host the kernel's own
+# limits apply first.
+JOB_MEMORY_LIMIT = "24g"
+JOB_CPU_LIMIT_NANOS = 16_000_000_000
+# Docker's default /dev/shm is 64 MiB, which crashes a PyTorch DataLoader using worker processes
+# with a bus error. Shared memory is tmpfs and counts against JOB_MEMORY_LIMIT as it is used.
+JOB_SHM_SIZE = "8g"
+# The whole parameter object as compact JSON, keys sorted, for the workload to parse. Parameters
+# are never secret -- the control plane stores and displays them -- so an environment variable is
+# an appropriate place for them.
+PARAMETERS_ENVIRONMENT_VARIABLE = "KRATOS_PARAMETERS"
 ATTEMPT_DIRECTORY = "attempts"
 # A little above the classifier's own bound, so a line truncated here is still over that
 # bound once its timestamp prefix is removed and is refused rather than silently shortened.
@@ -312,8 +325,6 @@ class DockerExecutor:
             raise ExecutorError("job image must use an immutable sha256 reference")
         container_name = _container_name(assignment.attempt_id)
         logical_name = f"attempt {assignment.attempt_id}"
-        job_id = str(assignment.job_id)
-        attempt_id = str(assignment.attempt_id)
         try:
             container = self._client.containers.get(container_name)
             if container.status == "created":
@@ -343,19 +354,14 @@ class DockerExecutor:
                     read_only=True,
                     cap_drop=["ALL"],
                     security_opt=["no-new-privileges"],
-                    mem_limit="8g",
-                    nano_cpus=4_000_000_000,
+                    mem_limit=JOB_MEMORY_LIMIT,
+                    nano_cpus=JOB_CPU_LIMIT_NANOS,
+                    shm_size=JOB_SHM_SIZE,
                     pids_limit=512,
                     tmpfs={"/tmp": "rw,noexec,nosuid,size=1g"},
                     log_config=JOB_LOG_CONFIG,
                     mounts=self._output_mounts(assignment) + self._input_mounts(assignment),
-                    environment={
-                        "KRATOS_JOB_ID": job_id,
-                        "KRATOS_ATTEMPT_ID": attempt_id,
-                        "OTEL_RESOURCE_ATTRIBUTES": (
-                            f"kratos.job.id={job_id},kratos.attempt.id={attempt_id}"
-                        ),
-                    },
+                    environment=job_environment(assignment),
                     device_requests=[
                         docker.types.DeviceRequest(
                             device_ids=[str(assignment.gpu_index)], capabilities=[["gpu"]]
@@ -708,6 +714,26 @@ class DockerExecutor:
             # without returning malformed UTF-8.
             text = encoded[:MAX_RESULT_BYTES].decode("utf-8", errors="ignore")
         return text
+
+
+def job_environment(assignment: JobAssignment) -> dict[str, str]:
+    """The environment a job's container starts with.
+
+    `KRATOS_PARAMETERS` is present only when the job has parameters, so a workload can tell "no
+    parameters" from "an empty set" without the control plane having to send either.
+    """
+    job_id = str(assignment.job_id)
+    attempt_id = str(assignment.attempt_id)
+    environment = {
+        "KRATOS_JOB_ID": job_id,
+        "KRATOS_ATTEMPT_ID": attempt_id,
+        "OTEL_RESOURCE_ATTRIBUTES": f"kratos.job.id={job_id},kratos.attempt.id={attempt_id}",
+    }
+    if assignment.parameters:
+        environment[PARAMETERS_ENVIRONMENT_VARIABLE] = json.dumps(
+            assignment.parameters, separators=(",", ":"), sort_keys=True, allow_nan=False
+        )
+    return environment
 
 
 def _container_name(attempt_id: UUID) -> str:

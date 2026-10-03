@@ -7,7 +7,55 @@ export type JobSubmission = {
   earliest_start_at?: string;
   output_requirements: OutputRequirement[];
   dataset_inputs: JobDatasetInputDraft[];
+  parameters?: JobParameters;
 };
+
+export type JobParameters = Record<string, string | number | boolean>;
+
+/** The control plane's bounds, so the form refuses exactly what the server would. */
+export const MAX_TIMEOUT_SECONDS = 86_400;
+const MAX_PARAMETERS = 64;
+const MAX_PARAMETER_BYTES = 4_096;
+const PARAMETER_KEY = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
+
+export type ParsedParameters = { ok: true; value: JobParameters | null } | { ok: false; error: string };
+
+/**
+ * The parameters box, as typed: empty means none; otherwise one flat JSON object of named strings,
+ * numbers and booleans. Whole numbers beyond 2^53 are refused rather than sent, because the browser
+ * would silently round them -- a seed off by one is a different experiment.
+ */
+export function parseJobParameters(text: string): ParsedParameters {
+  if (text.trim() === "") return { ok: true, value: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "Parameters must be a JSON object, for example {\"learning_rate\": 0.0003, \"epochs\": 12}." };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "Parameters must be a JSON object of names and values." };
+  }
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length > MAX_PARAMETERS) return { ok: false, error: `At most ${MAX_PARAMETERS} parameters.` };
+  for (const [key, value] of entries) {
+    if (!PARAMETER_KEY.test(key)) {
+      return { ok: false, error: `"${key}" is not a valid name: start with a letter or _, then letters, digits, _ . or -, up to 64 characters.` };
+    }
+    if (typeof value === "number") {
+      if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+        return { ok: false, error: `"${key}" is too large to send exactly from a browser. Send it as a string instead.` };
+      }
+    } else if (typeof value !== "string" && typeof value !== "boolean") {
+      return { ok: false, error: `"${key}" must be a string, number or true/false, not a list, object or null.` };
+    }
+  }
+  if (entries.length === 0) return { ok: true, value: null };
+  if (new TextEncoder().encode(JSON.stringify(parsed)).length > MAX_PARAMETER_BYTES) {
+    return { ok: false, error: "Parameters are limited to 4 KiB." };
+  }
+  return { ok: true, value: parsed as JobParameters };
+}
 
 export type JobDatasetInputDraft = {
   alias: string;
@@ -43,6 +91,7 @@ export function buildJobSubmission(
   output: DurableOutputDraft,
   datasetInputs: JobDatasetInputDraft[] = [],
   earliestStartLocal = "",
+  parameters: JobParameters | null = null,
 ): JobSubmission {
   const earliest = earliestStartLocal ? new Date(earliestStartLocal) : null;
   if (earliest && (Number.isNaN(earliest.getTime()) || earliest.getUTCFullYear() < 1 || earliest.getUTCFullYear() > 9999)) {
@@ -59,6 +108,7 @@ export function buildJobSubmission(
     : [];
   return {
     ...(earliest ? { earliest_start_at: earliest.toISOString() } : {}),
+    ...(parameters && Object.keys(parameters).length > 0 ? { parameters } : {}),
     name: name.trim(),
     image_reference: imageReference.trim(),
     timeout_seconds: timeoutSeconds,

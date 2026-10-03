@@ -9,7 +9,7 @@ use axum::{
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::{FromRow, Postgres, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -119,6 +119,61 @@ pub struct CreateJobRequest {
     /// Immutable, project-scoped dataset versions mounted read-only for the workload.
     #[serde(default)]
     pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputRequest>,
+    /// Named values for the workload, delivered as the `KRATOS_PARAMETERS` environment variable
+    /// holding this object as JSON. **Never secret**: they are stored, shown in the console and
+    /// recorded in `MLflow`. Up to 64 keys matching `[A-Za-z_][A-Za-z0-9_.-]{0,63}`; each value a
+    /// string, number or boolean; at most 4 KiB serialised. An empty object is the same as
+    /// none. A job with parameters runs only on a protocol 1.4 worker.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub parameters: Option<serde_json::Map<String, Value>>,
+}
+
+/// The longest a job may run: 24 hours. Raised from one hour with protocol 1.4, which is also
+/// what a job over an hour requires of its worker.
+pub(crate) const MAX_TIMEOUT_SECONDS: i32 = 86_400;
+const MAX_PARAMETERS: usize = 64;
+/// Comfortably under `MLflow`'s 8,000-character tag limit, since the whole object is recorded as one tag:
+/// an object over it would make run creation fail and the projector retry that stream forever.
+const MAX_PARAMETER_BYTES: usize = 4_096;
+
+impl CreateJobRequest {
+    /// The parameters that count: none for an omitted or empty object, so that sending `{}` neither
+    /// changes the job's fingerprint nor needlessly demands a protocol 1.4 worker.
+    pub(crate) fn effective_parameters(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.parameters
+            .as_ref()
+            .filter(|parameters| !parameters.is_empty())
+    }
+}
+
+fn valid_parameter_key(key: &str) -> bool {
+    let mut characters = key.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && key.len() <= 64
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-')
+        })
+}
+
+fn validate_parameters(parameters: Option<&serde_json::Map<String, Value>>) -> Result<(), ()> {
+    let Some(parameters) = parameters else {
+        return Ok(());
+    };
+    let scalars = parameters
+        .values()
+        .all(|value| matches!(value, Value::String(_) | Value::Number(_) | Value::Bool(_)));
+    let size = serde_json::to_vec(parameters).map_err(|_| ())?.len();
+    if parameters.len() > MAX_PARAMETERS
+        || !parameters.keys().all(|key| valid_parameter_key(key))
+        || !scalars
+        || size > MAX_PARAMETER_BYTES
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -141,6 +196,10 @@ pub struct OperatorJobResponse {
     pub failure_message: Option<String>,
     pub output_requirements: Vec<JobOutputRequirement>,
     pub dataset_inputs: Vec<crate::dataset_inputs::JobDatasetInputResponse>,
+    /// The job's parameters as submitted; omitted when it has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub parameters: Option<Value>,
     pub current_attempt: Option<OperatorAttemptIdentity>,
     pub artifacts: Vec<OperatorArtifactResponse>,
 }
@@ -256,6 +315,7 @@ struct JobRecord {
     stdout: Option<String>,
     stderr: Option<String>,
     failure_message: Option<String>,
+    parameters: Option<Value>,
 }
 
 #[derive(FromRow)]
@@ -374,6 +434,7 @@ impl JobRecord {
             failure_message: record.failure_message,
             output_requirements,
             dataset_inputs,
+            parameters: record.parameters,
             current_attempt: visibility.current_attempt,
             artifacts: visibility.artifacts,
         }
@@ -1183,7 +1244,7 @@ pub(crate) async fn revoke_worker(
 }
 
 const JOB_COLUMNS: &str = "id, name, image_reference, gpu_count, timeout_seconds, earliest_start_at, status, assigned_worker_id, \
-     submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message";
+     submitted_at, started_at, finished_at, exit_code, stdout, stderr, failure_message, parameters";
 
 async fn job_output_requirements(
     database: &sqlx::PgPool,
@@ -1308,7 +1369,7 @@ fn validate_job_request(request: &CreateJobRequest) -> Result<(), OperatorError>
     let name = request.name.trim();
     if name.is_empty()
         || name.chars().count() > 120
-        || !(30..=3600).contains(&request.timeout_seconds)
+        || !(30..=MAX_TIMEOUT_SECONDS).contains(&request.timeout_seconds)
         || request
             .earliest_start_at
             .is_some_and(|time| !(1..=9999).contains(&time.year()))
@@ -1318,6 +1379,8 @@ fn validate_job_request(request: &CreateJobRequest) -> Result<(), OperatorError>
     }
     validate_output_requirements(&request.output_requirements)
         .map_err(|_| OperatorError::invalid_request())?;
+    validate_parameters(request.effective_parameters())
+        .map_err(|()| OperatorError::invalid_request())?;
     Ok(())
 }
 
@@ -1392,8 +1455,8 @@ async fn queue_job(
     let query = format!(
         "INSERT INTO jobs \
          (id, owner_identity_id, project_id, name, image_reference, timeout_seconds, earliest_start_at, \
-          submission_idempotency_key, submission_fingerprint) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+          submission_idempotency_key, submission_fingerprint, parameters) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (project_id, owner_identity_id, submission_idempotency_key) \
              WHERE submission_idempotency_key IS NOT NULL DO NOTHING \
          RETURNING {JOB_COLUMNS}"
@@ -1410,6 +1473,11 @@ async fn queue_job(
         .bind(request.earliest_start_at)
         .bind(idempotency_key)
         .bind(fingerprint.as_deref())
+        .bind(
+            request
+                .effective_parameters()
+                .map(|parameters| Value::Object(parameters.clone())),
+        )
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| OperatorError::internal())?;
@@ -1465,6 +1533,7 @@ async fn queue_job(
         "earliest_start_at": request.earliest_start_at,
         "output_count": request.output_requirements.len(),
         "dataset_input_count": request.dataset_inputs.len(),
+        "parameter_count": request.effective_parameters().map_or(0, serde_json::Map::len),
         // Whether a key was sent, never the key: the audit trail records the submission, and the
         // key is the client's retry handle rather than something anyone needs to read back.
         "idempotency_key_supplied": idempotency_key.is_some()

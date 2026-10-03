@@ -411,3 +411,67 @@ async fn peer_worker_row_lock_does_not_block_fairness_decision(pool: PgPool) {
     holder.commit().await.unwrap();
     assert_eq!(assigned(&pool, f.peer).await, Some(oldest));
 }
+
+/// Protocol 1.4 work: a parameterised job, or one allowed more than an hour.
+async fn protocol_1_4_job(
+    pool: &PgPool,
+    f: &Fixture,
+    timeout: i32,
+    parameters: Option<Value>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs (id, owner_identity_id, name, image_reference, timeout_seconds, \
+        project_id, parameters) VALUES ($1, $2, 'Protocol 1.4 job', $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(f.owner)
+    .bind(format!("example.test/work@sha256:{}", "a".repeat(64)))
+    .bind(timeout)
+    .bind(f.project)
+    .bind(parameters)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn parameterised_and_long_jobs_go_only_to_protocol_1_4_workers(pool: PgPool) {
+    // A 1.3 agent bounds `timeout_seconds` at 3600 and forbids unknown fields, so a long job would
+    // make it reject the assignment outright; and it has no idea what parameters are, so a
+    // parameterised job would run without them. Neither may ever be handed to it.
+    let parameters =
+        json!({"learning_rate": 0.0003, "epochs": 12, "model": "smolvla", "amp": true});
+    for (timeout, job_parameters) in [(120, Some(parameters.clone())), (7_200, None)] {
+        let f = fixture(&pool, None, "1.3").await;
+        let current = worker(&pool, f.owner, f.project, "1.4").await;
+        let id = protocol_1_4_job(&pool, &f, timeout, job_parameters.clone()).await;
+
+        for _ in 0..3 {
+            assert_eq!(
+                assigned(&pool, f.peer).await,
+                None,
+                "a 1.3 worker took a 1.4 job"
+            );
+            assert_eq!(assigned(&pool, f.legacy).await, None);
+        }
+
+        let first = current_or_assign_job(&pool, current, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.job_id, id);
+        assert_eq!(first.timeout_seconds, u32::try_from(timeout).unwrap());
+        assert_eq!(first.parameters, job_parameters);
+
+        // A re-delivery of the same assignment must carry them too: an agent that restarted
+        // mid-attempt gets its assignment from this path, not the first.
+        let replay = current_or_assign_job(&pool, current, true, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.attempt_id, first.attempt_id);
+        assert_eq!(replay.parameters, job_parameters);
+    }
+}

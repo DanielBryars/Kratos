@@ -14,17 +14,37 @@ GPU and starts its entry point with:
 - a writable temporary filesystem at `/tmp`;
 - a writable, per-attempt durable-output directory at `/kratos/outputs`;
 - `KRATOS_JOB_ID` and `KRATOS_ATTEMPT_ID` environment variables;
-- `OTEL_RESOURCE_ATTRIBUTES` containing the same two identifiers.
+- `OTEL_RESOURCE_ATTRIBUTES` containing the same two identifiers;
+- `KRATOS_PARAMETERS`, when the job was submitted with parameters (see below);
+- each selected dataset version, read-only, at `/kratos/inputs/<alias>`;
+- up to 24 GiB of memory, 16 CPUs and 8 GiB of shared memory at `/dev/shm`, enough for a PyTorch
+  `DataLoader` with worker processes.
 
 The process SHALL exit with code zero only after its required outputs are complete. It SHOULD emit
 one compact JSON line on standard output. Kratos retains at most 64 KiB from each output stream, so
 large logs, models and reports belong under `/kratos/outputs`.
 
-The current release does not mount datasets, pass arbitrary job parameters or inject secrets. Code,
-fixed configuration and data needed during execution therefore SHALL be copied into the image at
-build time. Images may be public and workloads run without cloud credentials, so the image SHALL
-contain no secrets. Dataset references, parameterised jobs and scoped secret delivery need explicit
-control-plane contracts before they can be used safely.
+Code, dependencies and any pretrained weights SHALL be copied into the image at build time, because
+the job has no network. Data arrives through the dataset catalogue: register a version, then select it
+when queueing the job. Images may be public and workloads run without cloud credentials, so the image
+SHALL contain no secrets, and the current release does not inject them.
+
+### Parameters
+
+A job may carry named values — a learning rate, an epoch count, a model variant — so one image can
+run many configurations. They arrive as one environment variable holding a JSON object:
+
+```python
+import json, os
+
+parameters = json.loads(os.environ.get("KRATOS_PARAMETERS", "{}"))
+learning_rate = float(parameters.get("learning_rate", 3e-4))
+```
+
+Values are strings, numbers or booleans; up to 64 of them, 4 KiB in all. The variable is absent when
+a job has no parameters. **Parameters are not secret**: they are stored with the job, shown in the
+console and recorded on the job's MLflow run as the `kratos.parameters` tag, which is also what
+makes runs comparable afterwards. Never put a credential in one.
 
 ## Adapt the starter
 
@@ -60,9 +80,9 @@ mkdir -p .tmp/workload-outputs
 docker build --file workers/workload-template/Dockerfile --tag my-kratos-workload .
 docker run --rm --gpus device=0 --network none --read-only \
   --cap-drop ALL --security-opt no-new-privileges \
-  --memory 8g --cpus 4 --pids-limit 512 \
+  --memory 24g --cpus 16 --shm-size 8g --pids-limit 512 \
   --env KRATOS_JOB_ID=22222222-2222-4222-8222-222222222222 \
-  --env KRATOS_ATTEMPT_ID=11111111-1111-4111-8111-111111111111 \
+  --env KRATOS_ATTEMPT_ID=11111111-1111-4111-8111-111111111111   --env 'KRATOS_PARAMETERS={"epochs":2}' \
   --mount type=bind,source="$PWD/.tmp/workload-outputs",target=/kratos/outputs \
   --tmpfs /tmp:rw,noexec,nosuid,size=1g my-kratos-workload
 ```
@@ -94,9 +114,14 @@ Open **Schedule GPU work** in the web interface and enter:
 
 1. a name that identifies the experiment;
 2. the complete digest-pinned image reference;
-3. a maximum runtime between 30 and 3,600 seconds;
-4. **Require a durable output** when the workload writes an output;
-5. the exact relative output path, role, media type and maximum size.
+3. a maximum runtime between 30 seconds and 24 hours (86,400 seconds);
+4. optionally, parameters as a JSON object, for example `{"learning_rate": 0.0003, "epochs": 12}`;
+5. **Require a durable output** when the workload writes an output;
+6. the exact relative output path, role, media type and maximum size.
+
+A job over an hour, or with parameters, runs only on a worker at protocol 1.4 or later. Choose the
+runtime limit with some care: if the worker is lost mid-job, Kratos recovers the job only when its
+limit (plus two minutes) has passed, so a 24-hour limit is also a 24-hour wait after a crash.
 
 For the unchanged starter, declare `result.json`, role `result`, media type `application/json`, and
 1 MiB. A declared output is mandatory: a missing file, a file over its limit or an upload that

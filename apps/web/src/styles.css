@@ -154,6 +154,9 @@ details[open] > summary::after { content: " −"; }
 .job-form { display: grid; grid-template-columns: 1fr 2fr .7fr auto; gap: 11px; align-items: start; padding: 17px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
 .job-form label, .output-fields label { display: grid; gap: 7px; color: var(--muted); font-size: 0.78rem; }
 .job-form label small { color: var(--subtle); font-size: .68rem; line-height: 1.35; }
+.job-form .job-parameters { grid-column: 1 / -1; }
+.job-form textarea { width: 100%; min-height: 64px; border: 1px solid var(--line-bright); border-radius: 8px; padding: 9px 11px; color: var(--text); background: #121c29; font-family: var(--mono, ui-monospace, monospace); font-size: .82rem; resize: vertical; outline: none; }
+.job-form textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(102, 171, 255, .11); }
 .job-form label small code { color: #9fb4ca; }
 input { width: 100%; min-height: 42px; border: 1px solid var(--line-bright); border-radius: 8px; padding: 0 11px; color: var(--text); background: #121c29; outline: none; }
 input:hover { border-color: #465c76; }

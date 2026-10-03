@@ -17,6 +17,7 @@ from kratos_agent.executor import (
     DockerExecutor,
     EnforcementError,
     ExecutorError,
+    job_environment,
 )
 from kratos_agent.models import (
     DatasetInputAssignment,
@@ -296,6 +297,11 @@ def test_job_uses_immutable_image_and_constrained_gpu_container() -> None:
     assert options["cap_drop"] == ["ALL"]
     assert options["device_requests"][0].device_ids == ["0"]
     assert options["labels"]["com.kratos.role"] == "job"
+    # Most of a dedicated host, and shared memory large enough for PyTorch DataLoader workers:
+    # Docker's 64 MiB default crashes them with a bus error.
+    assert options["mem_limit"] == "24g"
+    assert options["nano_cpus"] == 16_000_000_000
+    assert options["shm_size"] == "8g"
     assert options["environment"] == {
         "KRATOS_JOB_ID": "22222222-2222-4222-8222-222222222222",
         "KRATOS_ATTEMPT_ID": "11111111-1111-4111-8111-111111111111",
@@ -925,3 +931,56 @@ def test_dataset_inputs_need_the_state_volume_name() -> None:
 
     with pytest.raises(ExecutorError, match="state volume"):
         executor.run_job(dataset_input_assignment())
+
+
+def test_parameters_reach_the_job_as_one_compact_sorted_json_variable() -> None:
+    assignment = job_assignment().model_copy(
+        update={
+            "parameters": {"model": "smolvla", "learning_rate": 0.0003, "epochs": 12, "amp": True}
+        }
+    )
+    clock = FakeClock()
+    client = JobClient(clock)
+    executor = job_executor(clock, client)
+
+    assert executor.prepare_job(assignment) is None
+    executor.run_job(assignment)
+
+    options = client.containers.options
+    assert options is not None
+    encoded = options["environment"]["KRATOS_PARAMETERS"]
+    assert encoded == '{"amp":true,"epochs":12,"learning_rate":0.0003,"model":"smolvla"}'
+    # Types survive the trip: a workload reads back exactly what was submitted.
+    assert json.loads(encoded) == {
+        "amp": True,
+        "epochs": 12,
+        "learning_rate": 0.0003,
+        "model": "smolvla",
+    }
+
+
+def test_a_job_without_parameters_has_no_parameters_variable() -> None:
+    no_parameters: tuple[dict[str, bool | int | float | str] | None, ...] = (None, {})
+    for parameters in no_parameters:
+        environment = job_environment(
+            job_assignment().model_copy(update={"parameters": parameters})
+        )
+        assert "KRATOS_PARAMETERS" not in environment
+
+
+def test_the_agent_accepts_every_runtime_and_parameter_the_control_plane_does() -> None:
+    # Exactly the control plane's bounds. An agent stricter than the server rejects an assignment
+    # the server has already handed it, which is how a 1.3 agent would fail on a two-hour job.
+    base = job_assignment().model_dump()
+    assert (
+        JobAssignment.model_validate({**base, "timeout_seconds": 86_400}).timeout_seconds == 86_400
+    )
+    for too_long in (86_401, 29):
+        with pytest.raises(ValidationError):
+            JobAssignment.model_validate({**base, "timeout_seconds": too_long})
+    accepted = JobAssignment.model_validate(
+        {**base, "parameters": {"a": "x", "b": 1, "c": 1.5, "d": False}}
+    )
+    assert accepted.parameters == {"a": "x", "b": 1, "c": 1.5, "d": False}
+    assert type(accepted.parameters["d"]) is bool
+    assert type(accepted.parameters["b"]) is int
